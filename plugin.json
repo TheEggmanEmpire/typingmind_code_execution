@@ -1,0 +1,55 @@
+{
+  "uuid": "fa4fdbb3-3f30-49d4-9171-40480971642d",
+  "id": "fa4fdbb3-3f30-49d4-9171-40480971642d",
+  "emoji": "🧪",
+  "title": "Code Runner",
+  "iconURL": "https://custom.typingmind.com/assets/plugins/javascript.webp",
+  "authenticationType": "AUTH_TYPE_NONE",
+  "oauthConfig": null,
+  "userSettings": null,
+  "dynamicContextEndpoints": [],
+  "implementationType": "javascript",
+  "openaiSpec": {
+    "name": "run_code",
+    "description": "Execute code and return its printed output. Supported languages: python, javascript, sql (SQLite), c, c++, rust, go, ruby, java, csharp, haskell, lua. Use this whenever a result should be computed rather than guessed. Always print/puts/println the values you want returned. For Java, do NOT declare the class public.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "language": {
+          "type": "string",
+          "enum": [
+            "python",
+            "javascript",
+            "sql",
+            "c",
+            "c++",
+            "rust",
+            "go",
+            "ruby",
+            "java",
+            "csharp",
+            "haskell",
+            "lua"
+          ],
+          "description": "Language to execute the code in."
+        },
+        "code": {
+          "type": "string",
+          "description": "Complete source code. Must print its own output."
+        },
+        "packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Python only. PyPI packages to install via micropip first, e.g. ['pandas']. Slow - omit unless genuinely needed. numpy/pandas/scipy also auto-load from imports without this."
+        }
+      },
+      "required": [
+        "language",
+        "code"
+      ]
+    }
+  },
+  "outputType": "respond_to_ai"
+}
