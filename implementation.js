@@ -5,9 +5,9 @@ const CE = {
   "c":       { id: "cg142",              lang: "c"       },
   "c++":     { id: "g142",               lang: "c++"     },
   "rust":    { id: "r1820",              lang: "rust"    },
-  "go":      { id: "gl194",              lang: "go"      },
+  "go":      { id: "gl1260",             lang: "go"      },
   "ruby":    { id: "ruby405",            lang: "ruby"    },
-  "java":    { id: "java904",            lang: "java"    },
+  "java":    { id: "java2501",           lang: "java"    },
   "csharp":  { id: "dotnet90csharpmono", lang: "csharp"  },
   "haskell": { id: "ghc984",             lang: "haskell" },
   "lua":     { id: "lua550",             lang: "lua"     }
@@ -48,7 +48,7 @@ async function runPython(code, packages) {
   py.setStderr({ batched: (s) => out.push(s) });
   let v;
   try { v = await py.runPythonAsync(code); }
-  catch (e) { return "Python error:\n" + (e.message || e); }
+  catch (e) { out.push("Python error:\n" + (e.message || e)); return out.join("\n").trim(); }
   if (v !== undefined && v !== null) out.push(String(v));
   return out.join("\n").trim();
 }
@@ -61,7 +61,7 @@ async function runJavaScript(code) {
     const fn = new Function("console", "return (async () => {" + code + "\n})()");
     const v = await fn({ log, info: log, warn: log, error: log });
     if (v !== undefined) out.push(String(v));
-  } catch (e) { return "JavaScript error:\n" + (e.message || e); }
+  } catch (e) { out.push("JavaScript error:\n" + (e.message || e)); }
   return out.join("\n").trim();
 }
 
@@ -104,7 +104,8 @@ async function runRemote(language, code) {
   const txt = (a) => (a || []).map((x) => strip(x.text)).join("\n");
   const output = [txt(d.stdout), txt(d.stderr), txt(d.buildResult && d.buildResult.stderr)]
     .filter((s) => s && s.trim()).join("\n").trim();
-  return output || "(compiled and ran, no output)";
+  const exit = d.didExecute && d.code ? "\n(exit code " + d.code + ")" : "";
+  return (output || "(compiled and ran, no output)") + exit;
 }
 
 async function run_code(params) {
