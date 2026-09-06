@@ -20,7 +20,7 @@ const runCodeSpec = {
   name: "run_code",
   description:
     "Execute code and return its printed output. Languages: python, javascript, sql (SQLite), c, c++, rust, go, ruby, java, csharp, haskell, lua. Use whenever a result should be computed, not guessed. Always print the values you want returned. " +
-    "INTERNET (python, javascript): the runtime is WASM in the browser tab - no container, no sockets, no DNS; socket/ping/DNS probes always fail. HTTP works via the browser: python `import requests; print(requests.get(url).text)` (also urllib.request.urlopen, `await pyodide.http.pyfetch(url)`); javascript `const r = await fetch(url); console.log(await r.text())`. Browser CORS applies; a blocked request retries through the CORS proxy from plugin settings if set. " +
+    "INTERNET (python, javascript): the runtime is WASM in the browser tab - no container, no sockets, no DNS; socket/ping/DNS probes always fail. HTTP works via the browser: python `requests.get(url)` (also urllib.request, pyodide.http.pyfetch); javascript `fetch(url)`. Browser CORS applies; a blocked request auto-retries through ~10 built-in public CORS proxies, so cross-origin downloads work with no setup. " +
     "TEMP FILES: /workspace is shared by python (cwd), javascript (fs) and sql; it persists across calls. To show a saved file to the user, call serve_file. " +
     "PACKAGES: extra Python packages via `packages` (micropip, session-only). Compiler Explorer languages: no internet, no files. Java: do NOT declare the class public.",
   parameters: {
@@ -66,7 +66,7 @@ const serveFileSpec = {
 };
 
 const userSettings = [
-  { name: "corsProxy", label: "CORS proxy (optional)", description: "Used only when a direct request from Python/JavaScript is blocked by the browser (CORS). Prefix, e.g. https://corsproxy.io/?url= or use {url} as placeholder. Requests that fall back to it are visible to that proxy.", placeholder: "https://corsproxy.io/?url=", required: false },
+  { name: "corsProxy", label: "CORS proxy override (optional)", description: "A blocked cross-origin request already falls back automatically through ~10 built-in public CORS proxies. Set this only to try your own proxy first (prefix like https://corsproxy.io/?url= or a URL with {url}). Traffic through any proxy is visible to its operator.", placeholder: "https://corsproxy.io/?url=", required: false },
   { name: "pyodideCdn", label: "Pyodide CDN (optional)", description: "Base URL of a Pyodide 0.29.4 full distribution to try first, e.g. a self-hosted copy. Built-in fallbacks: cdn/fastly/gcore/testingcf.jsdelivr.net, then unpkg (core only).", placeholder: "https://cdn.jsdelivr.net/pyodide/v0.29.4/full/", required: false },
   { name: "sqljsCdn", label: "sql.js CDN (optional)", description: "Base URL of a sql.js 1.13.0 dist directory to try first. Built-in fallbacks: cdn/fastly.jsdelivr.net, unpkg, gcore.jsdelivr.net.", placeholder: "https://cdn.jsdelivr.net/npm/sql.js@1.13.0/dist/", required: false },
   { name: "stateCarry", label: "Persist workspace between calls", description: "Default on. TypingMind runs each call in a fresh sandbox, so /workspace, the SQL database and JS storage are carried forward inside the tool output. Set to \"off\" to disable.", placeholder: "on", required: false },

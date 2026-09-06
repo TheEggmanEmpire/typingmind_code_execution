@@ -76,47 +76,93 @@ function cdnCandidates(defaults, custom) {
 }
 
 // ---------------------------------------------------------------------------
-// Network. Requests go direct first. If the browser blocks one (CORS / network
-// error) and the user configured a CORS proxy in the plugin settings, the same
-// request is retried through the proxy. Nothing is proxied unless it failed.
+// Network. Requests go direct first. If the browser blocks one (CORS) the same
+// request is retried through public CORS proxies so it works out of the box -
+// a user-configured proxy (plugin settings) is tried first, then the built-in
+// list below. Nothing is proxied unless the direct request actually failed, and
+// credentialed requests are never proxied.
 // ---------------------------------------------------------------------------
 
+// enc: how the target URL is attached. "q" = encodeURIComponent appended,
+// "raw" = appended as-is, "tpl" = replace {url} (encoded) in the template.
+const BUILTIN_PROXIES = [
+  { u: "https://corsproxy.io/?url=",                 enc: "q" },
+  { u: "https://api.allorigins.win/raw?url=",         enc: "q" },
+  { u: "https://api.codetabs.com/v1/proxy/?quest=",   enc: "q" },
+  { u: "https://proxy.corsfix.com/?",                 enc: "q" },
+  { u: "https://cors.eu.org/",                        enc: "raw" },
+  { u: "https://thingproxy.freeboard.io/fetch/",      enc: "raw" },
+  { u: "https://proxy.cors.sh/",                      enc: "raw" },
+  { u: "https://yacdn.org/proxy/",                    enc: "raw" },
+  { u: "https://test.cors.workers.dev/?",             enc: "raw" },
+  { u: "https://whateverorigin.org/get?url=",         enc: "q", wrap: "json" }
+];
+
+function applyProxy(spec, url) {
+  if (spec.enc === "tpl" || spec.u.includes("{url}")) return spec.u.replace("{url}", encodeURIComponent(url));
+  return spec.u + (spec.enc === "raw" ? url : encodeURIComponent(url));
+}
+
+// Ordered proxy candidates for a URL: the user's custom proxy first, then the
+// built-ins. Only http(s) URLs are proxied.
+function proxyCandidates(url) {
+  if (!/^https?:\/\//i.test(url)) return [];
+  const list = [];
+  const custom = globalThis.__crCorsProxy;
+  if (custom) list.push({ u: custom, enc: custom.includes("{url}") ? "tpl" : "q" });
+  return list.concat(BUILTIN_PROXIES).map((spec) => ({ url: applyProxy(spec, url), wrap: spec.wrap }));
+}
+
+// Back-compat single-proxy helper (custom proxy only), still used by the sync
+// XHR path's simplest case.
 function proxyUrl(url) {
-  const p = globalThis.__crCorsProxy;
-  if (!p || !/^https?:\/\//i.test(url)) return null;
-  return p.includes("{url}") ? p.replace("{url}", encodeURIComponent(url)) : p + encodeURIComponent(url);
+  const c = proxyCandidates(url);
+  return c.length ? c[0].url : null;
 }
 
 function fetchTimeoutMs() {
   const n = Number(globalThis.__crFetchTimeout);
   return n > 0 ? n : 30000;
 }
+// Proxy hops get a shorter timeout so trying several never hangs the run.
+function proxyTimeoutMs() { return Math.min(fetchTimeoutMs(), 20000); }
 
 // fetch with an AbortController timeout. Leaves a caller-supplied signal alone.
-async function timedFetch(real, input, init) {
+async function timedFetch(real, input, init, ms) {
   init = init || {};
   if (init.signal || typeof AbortController !== "function") return real(input, init);
   const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), fetchTimeoutMs());
+  const t = setTimeout(() => ac.abort(), ms || fetchTimeoutMs());
   try { return await real(input, { ...init, signal: ac.signal }); }
   finally { clearTimeout(t); }
 }
 
-// Direct first (with timeout); on a network-level failure retry once, then fall
-// back to the configured CORS proxy. Never retries a request that got a real
-// HTTP response (even 4xx/5xx) - only genuine transport failures.
-async function netFetch(input, init) {
-  const real = globalThis.__crRealFetch || fetch;
+// Direct first (with timeout + one retry on transport failure). If that throws
+// - a CORS block throws - walk the proxy candidates and return the first that
+// answers with a 2xx. A real HTTP response (even 4xx/5xx) is returned as-is and
+// never triggers a proxy hop.
+async function fetchDirectThenProxies(real, input, init) {
   const url = typeof input === "string" ? input : (input && input.url) || String(input);
   try { return await timedFetch(real, input, init); }
   catch (e1) {
     try { return await timedFetch(real, input, init); }
     catch (e2) {
-      const pu = proxyUrl(url);
-      if (!pu) throw e2;
-      return timedFetch(real, pu, init);
+      let last = e2;
+      for (const cand of proxyCandidates(url)) {
+        try {
+          const r = await timedFetch(real, cand.url, init, proxyTimeoutMs());
+          if (r && (r.ok || (r.status >= 200 && r.status < 300))) return r;
+          last = new Error("proxy returned HTTP " + (r && r.status));
+        } catch (e) { last = e; }
+      }
+      throw last;
     }
   }
+}
+
+async function netFetch(input, init) {
+  const real = globalThis.__crRealFetch || fetch;
+  return fetchDirectThenProxies(real, input, init);
 }
 
 // Python's urllib3 (behind `requests`) calls the global fetch when the browser
@@ -146,16 +192,7 @@ function patchFetch() {
   globalThis.fetch = async function (input, init) {
     // Outside a run, or for credentialed requests, stay out of the way entirely.
     if (!globalThis.__crRunning || carriesCredentials(input, init)) return real(input, init);
-    try { return await timedFetch(real, input, init); }
-    catch (e1) {
-      try { return await timedFetch(real, input, init); }
-      catch (e2) {
-        const url = typeof input === "string" ? input : (input && input.url) || String(input);
-        const pu = proxyUrl(url);
-        if (!pu) throw e2;
-        return timedFetch(real, pu, init);
-      }
-    }
+    return fetchDirectThenProxies(real, input, init);
   };
   globalThis.__crFetchPatched = true;
 }
@@ -177,12 +214,17 @@ function patchXHR() {
     if (!r || !r.sync || !globalThis.__crRunning) return send.call(this, body);
     let err = null;
     try { send.call(this, body); } catch (e) { err = e; }
-    if (!err && this.status !== 0) return;
-    const pu = proxyUrl(r.url);
-    if (!pu) { if (err) throw err; return; }
-    open.call(this, r.method, pu, false, r.user, r.pw);
-    for (const [k, v] of r.headers) setHeader.call(this, k, v);
-    return send.call(this, body);
+    if (!err && this.status !== 0) return;   // direct request already answered
+    const cands = proxyCandidates(r.url);
+    for (const cand of cands) {
+      try {
+        open.call(this, r.method, cand.url, false, r.user, r.pw);
+        for (const [k, v] of r.headers) setHeader.call(this, k, v);
+        send.call(this, body);
+        if (this.status >= 200 && this.status < 300) return;   // a proxy answered
+      } catch (e) { err = e; }
+    }
+    if (err) throw err;   // nothing worked: surface the original failure
   };
   P.__crPatched = true;
 }

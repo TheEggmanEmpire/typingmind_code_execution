@@ -34,9 +34,13 @@ Toolchains (Compiler Explorer): gcc 14.2, rustc 1.82, Go 1.26, Ruby 4.0, JDK 25,
 
 - **python**: `requests`, `urllib.request` (via pyodide-http) and `pyodide.http.pyfetch` all work.
 - **javascript**: `fetch` works.
-- Requests go straight from the browser, so the target must allow CORS. If it does not, set the optional
-  **CORS proxy** plugin setting (e.g. `https://corsproxy.io/?url=`, or any URL containing `{url}`).
-  The proxy is only used for requests that failed directly. Traffic through it is visible to the proxy operator.
+- Requests go straight from the browser. If the target does not allow CORS, the request is **automatically
+  retried through a list of ~10 built-in public CORS proxies** (corsproxy.io, allorigins, codetabs, cors.eu.org,
+  thingproxy, cors.sh, ...), so cross-origin downloads work with no configuration. The first proxy that answers wins.
+- Proxies are used **only** for a request that failed directly, never for requests carrying credentials
+  (Authorization/cookie), and only while a run is executing. Traffic through any proxy is visible to its operator.
+- The optional **CORS proxy override** setting puts your own proxy first (prefix like `https://corsproxy.io/?url=`,
+  or any URL containing `{url}`); the built-ins remain as further fallbacks.
 - There is no container behind the runner: Python runs as WASM inside the browser tab. Raw sockets, DNS and ping
   do not exist there. Emscripten hands out fake `172.29.x.x` addresses and every `connect()` fails with
   `Host is unreachable`, so socket-level probes prove nothing. HTTP through the browser is the only path.
