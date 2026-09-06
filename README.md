@@ -9,6 +9,17 @@ Runs code in 12 languages and returns the output to the AI. No API key. No serve
 
 First Python call takes ~5-15 s while the runtime downloads. Java: do not declare the class `public`.
 
+### CDN fallback
+
+Runtimes are fetched from a list of CDNs in order; the first one that answers wins. A CDN that fails or
+stalls (30 s for the loader script, 180 s for the runtime download) is skipped.
+
+- Pyodide: `cdn.jsdelivr.net` → `fastly.jsdelivr.net` → `gcore.jsdelivr.net` → `testingcf.jsdelivr.net` →
+  `unpkg.com` (core runtime only; wheels are still fetched from jsDelivr).
+- sql.js: `cdn.jsdelivr.net` → `fastly.jsdelivr.net` → `unpkg.com` → `gcore.jsdelivr.net`.
+- The optional **Pyodide CDN** / **sql.js CDN** plugin settings put a self-hosted or regional mirror first.
+- Works in a plain page and in a Web Worker (no DOM), so the same code runs in desktop, mobile and headless browsers.
+
 Toolchains (Compiler Explorer): gcc 14.2, rustc 1.82, Go 1.26, Ruby 4.0, JDK 25, .NET 9 (Mono), GHC 9.8, Lua 5.5.
 
 ### Python packages

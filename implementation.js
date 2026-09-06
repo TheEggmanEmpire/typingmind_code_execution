@@ -1,5 +1,26 @@
-const PYODIDE_CDN = "https://cdn.jsdelivr.net/pyodide/v0.29.4/full/";
-const SQLJS_CDN   = "https://cdn.jsdelivr.net/npm/sql.js@1.13.0/dist/";
+// CDNs are tried in order; the first one that serves the runtime wins.
+// The jsDelivr endpoints are separate providers (multi-CDN, Fastly, Gcore,
+// Cloudflare) that all carry the full Pyodide distribution including wheels.
+// unpkg mirrors only the npm package (core runtime), so wheels still come
+// from a full distribution when it is used.
+const PYODIDE_VERSION = "0.29.4";
+const PYODIDE_CDNS = [
+  { index: "https://cdn.jsdelivr.net/pyodide/v" + PYODIDE_VERSION + "/full/" },
+  { index: "https://fastly.jsdelivr.net/pyodide/v" + PYODIDE_VERSION + "/full/" },
+  { index: "https://gcore.jsdelivr.net/pyodide/v" + PYODIDE_VERSION + "/full/" },
+  { index: "https://testingcf.jsdelivr.net/pyodide/v" + PYODIDE_VERSION + "/full/" },
+  { index: "https://unpkg.com/pyodide@" + PYODIDE_VERSION + "/",
+    packages: "https://fastly.jsdelivr.net/pyodide/v" + PYODIDE_VERSION + "/full/" }
+];
+const SQLJS_VERSION = "1.13.0";
+const SQLJS_CDNS = [
+  "https://cdn.jsdelivr.net/npm/sql.js@" + SQLJS_VERSION + "/dist/",
+  "https://fastly.jsdelivr.net/npm/sql.js@" + SQLJS_VERSION + "/dist/",
+  "https://unpkg.com/sql.js@" + SQLJS_VERSION + "/dist/",
+  "https://gcore.jsdelivr.net/npm/sql.js@" + SQLJS_VERSION + "/dist/"
+];
+const SCRIPT_TIMEOUT_MS  = 30000;
+const RUNTIME_TIMEOUT_MS = 180000;   // wasm + stdlib download can be slow on mobile
 
 // Session-scoped scratch space inside the Pyodide (Emscripten MEMFS) filesystem.
 // Shared by Python, JavaScript (via `fs`) and SQL (data.sqlite). Lives until the page reloads.
@@ -19,13 +40,39 @@ const CE = {
 };
 
 function loadScript(src) {
+  if (typeof document === "undefined") {
+    // Web Worker (no DOM): importScripts is synchronous.
+    if (typeof importScripts === "function") {
+      try { importScripts(src); return Promise.resolve(); }
+      catch (e) { return Promise.reject(new Error("Could not load " + src + ": " + (e.message || e))); }
+    }
+    return Promise.reject(new Error("No document or importScripts to load " + src));
+  }
   return new Promise((res, rej) => {
     const s = document.createElement("script");
     s.src = src;
     s.onload = res;
-    s.onerror = () => rej(new Error("Could not load " + src));
+    s.onerror = () => { s.remove(); rej(new Error("Could not load " + src)); };
     document.head.appendChild(s);
   });
+}
+
+function withTimeout(promise, ms, what) {
+  let timer;
+  const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(what + " timed out after " + ms / 1000 + " s")), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function normalizeBase(u) {
+  u = String(u || "").trim();
+  if (!u) return "";
+  return u.endsWith("/") ? u : u + "/";
+}
+
+// Custom CDN from plugin settings goes first, then the built-in list.
+function cdnCandidates(defaults, custom) {
+  const c = normalizeBase(custom);
+  return c ? [typeof defaults[0] === "string" ? c : { index: c }, ...defaults] : defaults;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,12 +166,30 @@ function patchXHR() {
 // Python (Pyodide)
 // ---------------------------------------------------------------------------
 
+async function loadPyodideWithFallback() {
+  const errors = [];
+  for (const cdn of cdnCandidates(PYODIDE_CDNS, globalThis.__crPyodideCdn)) {
+    try {
+      if (!globalThis.loadPyodide) {
+        await withTimeout(loadScript(cdn.index + "pyodide.js"), SCRIPT_TIMEOUT_MS, "pyodide.js from " + cdn.index);
+      }
+      const opts = { indexURL: cdn.index };
+      if (cdn.packages) opts.packageBaseUrl = cdn.packages;
+      const py = await withTimeout(globalThis.loadPyodide(opts), RUNTIME_TIMEOUT_MS, "Pyodide runtime from " + cdn.index);
+      globalThis.__crPyodideCdnUsed = cdn.index;
+      return py;
+    } catch (e) {
+      errors.push(cdn.index + " -> " + (e.message || e));
+    }
+  }
+  throw new Error("Could not load the Python runtime from any CDN:\n" + errors.join("\n"));
+}
+
 async function getPyodide() {
   if (globalThis.__py) return globalThis.__py;
   if (!globalThis.__pyLoading) {
     globalThis.__pyLoading = (async () => {
-      if (!globalThis.loadPyodide) await loadScript(PYODIDE_CDN + "pyodide.js");
-      const py = await globalThis.loadPyodide({ indexURL: PYODIDE_CDN });
+      const py = await loadPyodideWithFallback();
       py.FS.mkdirTree(WORKDIR);
       // requests/urllib3 work natively in Pyodide; pyodide-http adds urllib.request.
       try {
@@ -146,7 +211,9 @@ async function getPyodide() {
 
 async function runPython(code, packages) {
   const py = await getPyodide();
-  try { await py.loadPackagesFromImports(code); } catch (e) {}
+  let pkgNote = "";
+  try { await py.loadPackagesFromImports(code); }
+  catch (e) { pkgNote = "(note: could not download Python packages for the imports in this code: " + (e.message || e) + ")"; }
   if (Array.isArray(packages) && packages.length) {
     await py.loadPackage("micropip");
     const micropip = py.pyimport("micropip");
@@ -156,6 +223,7 @@ async function runPython(code, packages) {
   const out = [];
   py.setStdout({ batched: (s) => out.push(s) });
   py.setStderr({ batched: (s) => out.push(s) });
+  if (pkgNote) out.push(pkgNote);
   if (globalThis.__pyHttpNote && /urllib/.test(code)) out.push(globalThis.__pyHttpNote);
   let v;
   try { v = await py.runPythonAsync(code); }
@@ -241,11 +309,22 @@ async function runJavaScript(code) {
 // ---------------------------------------------------------------------------
 
 async function getSqlJs() {
-  if (!globalThis.__sqljs) {
-    if (!globalThis.initSqlJs) await loadScript(SQLJS_CDN + "sql-wasm.js");
-    globalThis.__sqljs = await globalThis.initSqlJs({ locateFile: (f) => SQLJS_CDN + f });
+  if (globalThis.__sqljs) return globalThis.__sqljs;
+  const errors = [];
+  for (const base of cdnCandidates(SQLJS_CDNS, globalThis.__crSqljsCdn)) {
+    try {
+      if (!globalThis.initSqlJs) {
+        await withTimeout(loadScript(base + "sql-wasm.js"), SCRIPT_TIMEOUT_MS, "sql-wasm.js from " + base);
+      }
+      globalThis.__sqljs = await withTimeout(
+        globalThis.initSqlJs({ locateFile: (f) => base + f }), RUNTIME_TIMEOUT_MS, "sql.js runtime from " + base);
+      globalThis.__crSqljsCdnUsed = base;
+      return globalThis.__sqljs;
+    } catch (e) {
+      errors.push(base + " -> " + (e.message || e));
+    }
   }
-  return globalThis.__sqljs;
+  throw new Error("Could not load the SQL runtime from any CDN:\n" + errors.join("\n"));
 }
 
 function loadDbImage() {
@@ -319,6 +398,8 @@ async function run_code(params, userSettings) {
   const { language, code, packages } = params;
   if (!code || !code.trim()) throw new Error("No code was provided.");
   globalThis.__crCorsProxy = String((userSettings && userSettings.corsProxy) || "").trim();
+  globalThis.__crPyodideCdn = (userSettings && userSettings.pyodideCdn) || "";
+  globalThis.__crSqljsCdn = (userSettings && userSettings.sqljsCdn) || "";
   patchFetch();
   patchXHR();
   globalThis.__crRunning = (globalThis.__crRunning || 0) + 1;

@@ -4,7 +4,8 @@
 const results = {};
 const run = (language, code, extra = {}, settings = {}) => run_code({ language, code, ...extra }, settings);
 (async () => {
-  const t = async (name, fn) => { try { results[name] = await fn(); } catch (e) { results[name] = "THREW: " + (e.message || e); } };
+  const show = () => { document.getElementById("out").textContent = "PROGRESS " + JSON.stringify(results, null, 1); };
+  const t = async (name, fn) => { try { results[name] = await fn(); } catch (e) { results[name] = "THREW: " + (e.message || e); } show(); };
   await t("js_fetch", () => run("javascript", "const r = await fetch('https://httpbin.org/get?x=1'); console.log((await r.json()).args.x)"));
   await t("py_requests", () => run("python", "import requests\nr = requests.get('https://httpbin.org/get?x=2')\nprint(r.status_code, r.json()['args']['x'])"));
   await t("py_requests_post", () => run("python", "import requests\nprint(requests.post('https://httpbin.org/post', json={'a':1}).json()['json'])"));
@@ -25,6 +26,7 @@ const run = (language, code, extra = {}, settings = {}) => run_code({ language, 
   await t("global_fetch_auth_not_proxied", () => run("javascript", "try { await globalThis.fetch('https://example.com', { headers: { Authorization: 'Bearer x' } }); console.log('proxied?!') } catch (e) { console.log('blocked: ' + e.message) }", {}, PX));
   await t("global_fetch_outside_run", () => globalThis.fetch('https://example.com').then(() => "proxied?!", (e) => "blocked: " + e.message));
   await t("py_socket_probe", () => run("python", "import socket\nprint(socket.gethostbyname('example.com'))"));
+  results.pyodide_cdn = globalThis.__crPyodideCdnUsed; results.sqljs_cdn = globalThis.__crSqljsCdnUsed;
   document.getElementById("out").textContent = "RESULTS " + JSON.stringify(results, null, 1);
 })();
 </script></body></html>
