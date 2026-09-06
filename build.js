@@ -33,7 +33,7 @@ const runCodeSpec = {
           "Complete source code. Must print its own output. " +
           "Temp files: python starts in /workspace, so open('data.csv','w') writes there and later calls can read it; use /tmp for throwaway files. " +
           "javascript has `await fs.writeFile(name, textOrBytes)`, `await fs.readFile(name)` (`'binary'` as 2nd arg for bytes), `fs.appendFile`, `fs.readdir('/workspace')`, `fs.exists`, `fs.unlink`, `fs.mkdir`, `fs.stat`, plus `storage.set(key,value)`/`storage.get(key)` for values between calls. " +
-          "Files, the SQL database and JS storage persist across separate calls (carried inside the tool output, since each call runs in a fresh sandbox); keep the total small (default 24 KB compressed) or finish multi-step work in one call. " +
+          "Any number of files is fine; within one call /workspace is limited only by browser memory (tens-hundreds of MB). Files, the SQL database and JS storage also persist across separate calls (carried in the tool output, or offloaded to an ephemeral bin when large); for heavy multi-file work prefer a single call. " +
           "sql keeps its tables between calls; python can open the same database with `sqlite3.connect('/workspace/data.sqlite')`. Delete data.sqlite to reset it. " +
           "Internet: python `requests.get/post`, `urllib.request.urlopen`, `await pyodide.http.pyfetch`; javascript `fetch`. Binary download example (js): `const b=new Uint8Array(await (await fetch(url)).arrayBuffer()); await fs.writeFile('f.bin', b)`. " +
           "Install Python packages inline: `import micropip; await micropip.install('pkg')` (top-level await allowed)."
@@ -52,7 +52,7 @@ const runCodeSpec = {
 const serveFileSpec = {
   name: "serve_file",
   description:
-    "Serve a file from /workspace to the user - it is rendered directly in the chat, so the bytes do not pass through your context. Use this to hand the user a file that run_code fetched, generated or edited (a report, an image, a CSV, an HTML page, a converted document). Call run_code first to create the file, then serve_file with its /workspace path. Images display inline; other files show as a download link. Only works for files already in /workspace this session.",
+    "Serve a file from /workspace to the user - it is rendered directly in the chat, so the bytes do not pass through your context. Use this to hand the user a file that run_code fetched, generated or edited (a report, an image, a CSV, an HTML page, a converted document). Call run_code first to create the file, then serve_file with its /workspace path. Images display inline; other files show as a download link. serve_file uploads nothing - the file is embedded in the message as a data: URI. Only works for files already in /workspace this session.",
   parameters: {
     type: "object",
     properties: {

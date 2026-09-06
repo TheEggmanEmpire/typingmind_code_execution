@@ -87,6 +87,25 @@ call downloads it and rebuilds the workspace.
   endpoint is tried before the public bins.
 - Small workspaces still travel inline with no upload.
 
+### Limits & how files move
+
+`/workspace` holds **as many files as you want** - there is no file-count limit. What varies is scope:
+
+- **Within one `run_code` call:** limited only by the browser tab's memory (WASM MEMFS) - tens to a few
+  hundred MB on desktop, less on mobile, on top of Pyodide's ~30 MB. Nothing is uploaded. Heavy multi-file
+  work (download several files, edit, zip) is best done inside a single call.
+- **Persisting between separate calls:** the whole workspace is snapshotted (compressed). ≤ the inline limit
+  (default 24 KB compressed) rides in the output as tokens; larger snapshots are offloaded to an ephemeral
+  bin whose own upload cap then applies (public bins allow roughly a few hundred KB to a couple MB; your own
+  `workspaceStore` endpoint lifts that).
+
+**Two separate "uploads" - don't confuse them:**
+
+- **`serve_file` uploads nothing.** It embeds the file as a `data:` URI directly in the chat message. That is
+  the only "serving" path.
+- **The bin offload is not serving.** It uploads the workspace snapshot solely to carry it from one tool call
+  to the next (the sandbox is destroyed between calls), and only when the snapshot exceeds the inline limit.
+
 ### Serving files back to the user
 
 The plugin has a second function, **`serve_file`**, that renders a `/workspace` file straight into the chat
