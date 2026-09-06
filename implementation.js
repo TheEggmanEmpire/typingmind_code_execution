@@ -98,7 +98,10 @@ async function getPyodide() {
           "import pyodide_http\n" +
           "getattr(pyodide_http, 'patch_urllib', pyodide_http.patch_all)()"
         );
-      } catch (e) {}
+      } catch (e) {
+        globalThis.__pyHttpNote = "(note: urllib.request could not be enabled: " + (e.message || e) +
+          ". Use requests or pyodide.http.pyfetch instead.)";
+      }
       globalThis.__py = py;
       return py;
     })().catch((e) => { globalThis.__pyLoading = null; throw e; });
@@ -118,6 +121,7 @@ async function runPython(code, packages) {
   const out = [];
   py.setStdout({ batched: (s) => out.push(s) });
   py.setStderr({ batched: (s) => out.push(s) });
+  if (globalThis.__pyHttpNote && /urllib/.test(code)) out.push(globalThis.__pyHttpNote);
   let v;
   try { v = await py.runPythonAsync(code); }
   catch (e) { out.push("Python error:\n" + (e.message || e)); return out.join("\n").trim(); }

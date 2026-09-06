@@ -26,6 +26,9 @@ Toolchains (Compiler Explorer): gcc 14.2, rustc 1.82, Go 1.26, Ruby 4.0, JDK 25,
 - Requests go straight from the browser, so the target must allow CORS. If it does not, set the optional
   **CORS proxy** plugin setting (e.g. `https://corsproxy.io/?url=`, or any URL containing `{url}`).
   The proxy is only used for requests that failed directly. Traffic through it is visible to the proxy operator.
+- There is no container behind the runner: Python runs as WASM inside the browser tab. Raw sockets, DNS and ping
+  do not exist there. Emscripten hands out fake `172.29.x.x` addresses and every `connect()` fails with
+  `Host is unreachable`, so socket-level probes prove nothing. HTTP through the browser is the only path.
 - Compiler Explorer languages run in godbolt's sandbox: no network.
 
 ### Temporary storage
