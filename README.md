@@ -2,7 +2,7 @@
 
 Runs code in 12 languages and returns the output to the AI. No API key. No server.
 
-- **python** - Pyodide (WASM, in-browser). numpy/pandas auto-load from imports; other PyPI packages via `packages`.
+- **python** - Pyodide (WASM, in-browser). numpy/pandas auto-load from imports; other PyPI packages via `packages` (see below).
 - **javascript** - runs in the plugin sandbox.
 - **sql** - SQLite via sql.js (WASM, in-browser).
 - **c, c++, rust, go, ruby, java, csharp, haskell, lua** - Compiler Explorer (godbolt.org) public API.
@@ -10,6 +10,14 @@ Runs code in 12 languages and returns the output to the AI. No API key. No serve
 First Python call takes ~5-15 s while the runtime downloads. Java: do not declare the class `public`.
 
 Toolchains (Compiler Explorer): gcc 14.2, rustc 1.82, Go 1.26, Ruby 4.0, JDK 25, .NET 9 (Mono), GHC 9.8, Lua 5.5.
+
+### Python packages
+
+- numpy, pandas, scipy, matplotlib, requests and other packages Pyodide ships auto-load from `import` lines.
+- Anything else: pass `packages: ["beautifulsoup4", "pyyaml"]` (micropip) or install inline with
+  `import micropip; await micropip.install("pkg")`.
+- Installs are temporary: they live in the in-browser runtime for the session and vanish on page reload.
+- Pure-Python wheels and Pyodide-prebuilt packages only. Packages with native code that Pyodide does not build cannot be installed.
 
 ### Internet access
 
