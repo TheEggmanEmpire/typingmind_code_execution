@@ -56,3 +56,16 @@ cd test && npm i pyodide@0.29.4 sql.js@1.13.0 && node node-harness.js
 ```
 
 (The browser harness above is the authoritative end-to-end test; this one is faster for logic checks.)
+
+
+### Large-workspace offload test
+
+`offload-harness.html` (served by `serve.js`, which also mocks a paste bin at `/store`) drives the real
+sandbox with `stateLimitKB=1` and a local `workspaceStore`, proving a big file is uploaded to the bin,
+only a small pointer is carried, the previous blob is superseded (bin count stays 1), and the workspace is
+restored across a fresh sandbox.
+
+```sh
+node test/serve.js &
+chromium --headless=new --disable-gpu "http://127.0.0.1:8080/test/offload-harness.html"
+```

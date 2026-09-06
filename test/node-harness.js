@@ -93,7 +93,8 @@ function freshSandbox() {
   check("js storage set", await run("javascript", "storage.set('k', {v: 42}); console.log('ok')"), "ok");
   check("js storage get later", await run("javascript", "console.log(storage.get('k').v)"), "42");
   check("js fetch direct", await run("javascript", "const r = await fetch('https://api.example/x'); console.log(await r.text())"), "fetched:https://api.example/x");
-  check("js fetch blocked, no proxy -> error", await run("javascript", "await fetch('https://blocked.example/y')"), (s) => s.includes("Failed to fetch"));
+  check("js fetch blocked, no custom proxy -> built-in used", await run("javascript", "const r = await fetch('https://blocked.example/y'); console.log(await r.text())"),
+    "fetched:https://corsproxy.io/?url=" + encodeURIComponent("https://blocked.example/y"));
   check("js fetch blocked, proxy fallback", await run("javascript", "const r = await fetch('https://blocked.example/y'); console.log(await r.text())", {}, { corsProxy: "https://proxy.example/?url=" }),
     "fetched:https://proxy.example/?url=" + encodeURIComponent("https://blocked.example/y"));
   check("js fetch proxy with {url} placeholder", await run("javascript", "const r = await fetch('https://blocked.example/z'); console.log(await r.text())", {}, { corsProxy: "https://p.example/{url}/raw" }),
@@ -106,8 +107,9 @@ function freshSandbox() {
     {}, { corsProxy: "https://proxy.example/?url=" }),
     "xhr:https://proxy.example/?url=" + encodeURIComponent("https://blocked.example/q"));
   check("xhr headers replayed on proxied retry", xhrLog[xhrLog.length - 1].headers["X-A"], "1");
-  check("xhr sync fallback without proxy throws", await run("javascript",
-    "const x = new XMLHttpRequest(); x.open('GET', 'https://blocked.example/q', false); x.send(null);"), (s) => s.includes("NetworkError"));
+  check("xhr sync without custom proxy uses built-in", await run("javascript",
+    "const x = new XMLHttpRequest(); x.open('GET', 'https://blocked.example/q', false); x.send(null); console.log(x.responseText)"),
+    "xhr:https://corsproxy.io/?url=" + encodeURIComponent("https://blocked.example/q"));
   check("xhr async untouched", await run("javascript",
     "const x = new XMLHttpRequest(); x.open('GET', 'https://blocked.example/q', true); try { x.send(null) } catch (e) { console.log('direct-only') }", {}, { corsProxy: "https://proxy.example/?url=" }), "direct-only");
   check("xhr outside a run untouched", (() => { const x = new XMLHttpRequest(); x.open("GET", "https://blocked.example/o", false); try { x.send(null); return "threw"; } catch (e) { return "threw"; } })(), "threw");
@@ -193,8 +195,8 @@ function freshSandbox() {
   check("deleted db (file path) stays gone", await run("sql", "SELECT name FROM sqlite_master;"), "(statement ran, no rows returned)");
 
   run._prev = undefined; freshSandbox();
-  const big = await run("python", "import os; open('big.bin','wb').write(os.urandom(60000)); print('wrote')", {}, { stateLimitKB: 8 });
-  check("oversized workspace warns instead of carrying", big, (s) => s.includes("wrote") && s.includes("not carried"));
+  const big = await run("python", "import os; open('big.bin','wb').write(os.urandom(60000)); print('wrote')", {}, { stateLimitKB: 8, bigWorkspace: "off" });
+  check("oversized workspace warns instead of carrying", big, (s) => s.includes("wrote") && s.includes("not carried") && s.includes("offload is off"));
   check("no trailer when over limit", lastState, null);
 
   run._prev = undefined; freshSandbox();
@@ -239,6 +241,63 @@ function freshSandbox() {
   check("fetch retries once then succeeds", await run("javascript", "const r = await fetch('https://flaky.example/x'); console.log(await r.text())"), "recovered");
   check("fetch retried exactly twice", attempts, 2);
   globalThis.fetch = origFetch;
+
+  // multi-proxy: direct + first built-in fail, second built-in (allorigins) answers
+  run._prev = undefined; freshSandbox();
+  const of2 = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (url.startsWith("https://corsproxy.io/")) throw new TypeError("proxy 1 down");
+    if (url.startsWith("https://api.allorigins.win/")) return { ok: true, status: 200, text: async () => "via-allorigins" };
+    if (url.startsWith("https://wall.example/")) throw new TypeError("Failed to fetch");
+    return of2(input, init);
+  };
+  delete globalThis.__crFetchPatched; delete globalThis.__crRealFetch;
+  check("walks proxy list to a working one", await run("javascript", "const r = await fetch('https://wall.example/x'); console.log(await r.text())"), "via-allorigins");
+  globalThis.fetch = of2;
+
+  // 13. Large-workspace offload to an ephemeral bin (mocked paste.rs)
+  const bin = {};        // id -> payload
+  let binSeq = 0, uploads = 0, deletes = 0;
+  const realFetch0 = globalThis.fetch;
+  function mockBin(input, init) {
+    const url = typeof input === "string" ? input : input.url;
+    const method = (init && init.method) || "GET";
+    if (url === "https://paste.rs/" && method === "POST") { uploads++; const id = "b" + (++binSeq); bin[id] = String(init.body); return { ok: true, status: 201, text: async () => "https://paste.rs/" + id }; }
+    const m = url.match(/^https:\/\/paste\.rs\/(b\d+)$/);
+    if (m) {
+      if (method === "DELETE") { deletes++; delete bin[m[1]]; return { ok: true, status: 200, text: async () => "" }; }
+      if (bin[m[1]] === undefined) return { ok: false, status: 404, text: async () => "gone" };
+      return { ok: true, status: 200, text: async () => bin[m[1]] };
+    }
+    return realFetch0(input, init);   // built-in proxies/dpaste/sprunge not needed
+  }
+  const smallLimit = { stateLimitKB: "1" };   // force offload for a few-KB workspace
+
+  run._prev = undefined; freshSandbox();
+  globalThis.fetch = mockBin; delete globalThis.__crFetchPatched; delete globalThis.__crRealFetch;
+  const offOut = await run("python", "import os; open('big.bin','wb').write(os.urandom(6000)); print('wrote')", {}, smallLimit);
+  check("large workspace offloaded (note shown)", offOut, (s) => s.includes("stored on paste.rs") && s.includes("wrote"));
+  check("offload trailer is a tiny pointer", String(run._prev).length < 400 && /cr-state/.test(String(run._prev)), true);
+  check("one blob uploaded", Object.keys(bin).length, 1);
+
+  freshSandbox();
+  globalThis.fetch = mockBin; delete globalThis.__crFetchPatched; delete globalThis.__crRealFetch;
+  check("workspace restored from bin across sandbox", await run("python", "import os; print(os.path.getsize('big.bin'))", {}, smallLimit), (s) => s.startsWith("6000"));
+  check("supersede deleted the previous blob", deletes >= 1, true);
+  check("still exactly one blob after supersede", Object.keys(bin).length, 1);
+
+  // 14. An expired pointer (>10 min old) is ignored: workspace is gone
+  run._prev = undefined; freshSandbox();
+  globalThis.fetch = mockBin; delete globalThis.__crFetchPatched; delete globalThis.__crRealFetch;
+  await run("python", "import os; open('exp.bin','wb').write(os.urandom(6000)); print('wrote')", {}, smallLimit);   // offloaded pointer, exp = now+10min
+  const realNow = Date.now;
+  Date.now = () => realNow() + 11 * 60 * 1000;   // jump 11 minutes forward
+  freshSandbox();
+  globalThis.fetch = mockBin; delete globalThis.__crFetchPatched; delete globalThis.__crRealFetch;
+  check("expired pointer is not restored", await run("python", "import os; print(os.path.exists('exp.bin'))", {}, smallLimit), (s) => s.startsWith("False"));
+  Date.now = realNow;
+  globalThis.fetch = realFetch0;
 
   console.log(failures ? `\n${failures} FAILED` : "\nALL PASSED");
   process.exit(failures ? 1 : 0);

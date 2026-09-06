@@ -1,0 +1,28 @@
+<!doctype html><html><body><pre id="out">pending</pre>
+<script>
+const PLUGIN_URL="/implementation.js"; let pluginCode=null;
+async function runPlugin({id,name,params,userSettings,authorizedResources}){
+  if(pluginCode===null)pluginCode=await(await fetch(PLUGIN_URL)).text();
+  const code=`${pluginCode}\n(async()=>{try{var r=await ${name}(${JSON.stringify(params)},${JSON.stringify(userSettings)},${JSON.stringify(authorizedResources)});parent.postMessage(JSON.stringify({r,id:${JSON.stringify(id)}}),"*")}catch(e){parent.postMessage(JSON.stringify({e:e.message,id:${JSON.stringify(id)}}),"*")}})()`;
+  return new Promise((res)=>{const s=document.createElement("iframe");s.sandbox="allow-scripts allow-modals";s.style.display="none";
+    s.srcdoc=`<script>onmessage=async(e)=>{try{await eval(e.data)}catch(x){parent.postMessage(JSON.stringify({e:x.message,id:${JSON.stringify(id)}}),"*")}}<\/script>`;
+    const on=(t)=>{if(t.source!==s.contentWindow)return;let n;try{n=JSON.parse(t.data)}catch(x){return}if(n.id!==id)return;window.removeEventListener("message",on);try{document.body.removeChild(s)}catch(x){}res(n)};
+    window.addEventListener("message",on);document.body.appendChild(s);s.onload=function(){this.contentWindow.postMessage(code,"*")}});
+}
+const out={}; let prev, n=0;
+const settings={ stateLimitKB:"1", workspaceStore:"http://127.0.0.1:8080/store" };  // force offload to local mock bin
+const call=async(label,name,params)=>{const r=await runPlugin({id:"c"+(++n),name,params,userSettings:settings,authorizedResources:{previousRunOutput:prev}});
+  if(r.e){out[label]="ERR:"+r.e;} else {prev=r.r; out[label]=String(r.r).replace(/\[\[cr-state:[^\]]*\]\]/,"[trailer]").slice(0,120);} 
+  document.getElementById("out").textContent=JSON.stringify(out,null,1);};
+(async()=>{
+  await call("1_write_big","run_code",{language:"javascript",code:"const b=new Uint8Array(9000);crypto.getRandomValues(b);await fs.writeFile('big.bin',b);console.log('wrote '+b.length)"});
+  out.bincount_after_write=await (await fetch("/__bincount")).text();
+  await call("2_restore_read","run_code",{language:"python",code:"import os;print(os.path.getsize('big.bin'))"});
+  out.bincount_after_restore=await (await fetch("/__bincount")).text();
+  await call("3_edit_and_serve_still_works","run_code",{language:"javascript",code:"await fs.writeFile('note.txt','hello');console.log('ok')"});
+  await call("4_serve","serve_file",{path:"note.txt"});
+  out.trailer_len=String(prev).length;
+  document.getElementById("out").textContent="RESULT "+JSON.stringify(out,null,1);
+  fetch("/report",{method:"POST",body:JSON.stringify(out)}).catch(()=>{});
+})();
+</script></body></html>

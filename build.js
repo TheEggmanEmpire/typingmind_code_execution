@@ -21,7 +21,7 @@ const runCodeSpec = {
   description:
     "Execute code and return its printed output. Languages: python, javascript, sql (SQLite), c, c++, rust, go, ruby, java, csharp, haskell, lua. Use whenever a result should be computed, not guessed. Always print the values you want returned. " +
     "INTERNET (python, javascript): the runtime is WASM in the browser tab - no container, no sockets, no DNS; socket/ping/DNS probes always fail. HTTP works via the browser: python `requests.get(url)` (also urllib.request, pyodide.http.pyfetch); javascript `fetch(url)`. Browser CORS applies; a blocked request auto-retries through ~10 built-in public CORS proxies, so cross-origin downloads work with no setup. " +
-    "TEMP FILES: /workspace is shared by python (cwd), javascript (fs) and sql; it persists across calls. To show a saved file to the user, call serve_file. " +
+    "TEMP FILES: /workspace is shared by python (cwd), javascript (fs) and sql; it persists across calls (large workspaces auto-offload to an ephemeral bin, ~10 min). To show a saved file to the user, call serve_file. " +
     "PACKAGES: extra Python packages via `packages` (micropip, session-only). Compiler Explorer languages: no internet, no files. Java: do NOT declare the class public.",
   parameters: {
     type: "object",
@@ -71,7 +71,9 @@ const userSettings = [
   { name: "sqljsCdn", label: "sql.js CDN (optional)", description: "Base URL of a sql.js 1.13.0 dist directory to try first. Built-in fallbacks: cdn/fastly.jsdelivr.net, unpkg, gcore.jsdelivr.net.", placeholder: "https://cdn.jsdelivr.net/npm/sql.js@1.13.0/dist/", required: false },
   { name: "stateCarry", label: "Persist workspace between calls", description: "Default on. TypingMind runs each call in a fresh sandbox, so /workspace, the SQL database and JS storage are carried forward inside the tool output. Set to \"off\" to disable.", placeholder: "on", required: false },
   { name: "stateLimitKB", label: "Max carried workspace size (KB)", description: "Default 24. If the compressed workspace exceeds this, it is not carried and a note is shown. Keep well under your model's token budget.", type: "number", required: false },
-  { name: "fetchTimeoutMs", label: "HTTP request timeout (ms)", description: "Default 30000. Per-request timeout for fetch/requests from Python and JavaScript.", type: "number", required: false }
+  { name: "fetchTimeoutMs", label: "HTTP request timeout (ms)", description: "Default 30000. Per-request timeout for fetch/requests from Python and JavaScript.", type: "number", required: false },
+  { name: "bigWorkspace", label: "Offload large workspaces to an ephemeral bin", description: "Default on. When the carried workspace is bigger than the inline limit, it is uploaded to a public ephemeral paste bin (paste.rs -> dpaste.com -> sprunge.us) and only a small pointer travels in the tool output; the next call downloads it. A 10-minute logical expiry is enforced and each new snapshot deletes the previous blob. Your workspace bytes leave the browser to that public service - set \"off\" to keep everything inline, or set your own endpoint below.", placeholder: "on", required: false },
+  { name: "workspaceStore", label: "Workspace store endpoint (optional)", description: "Your own paste-style endpoint for large-workspace offload, tried before the public bins. Contract: POST the payload as the body, respond with the read URL as plain text; GET that URL returns the payload; DELETE that URL removes it. Keeps large workspaces private to your own server.", placeholder: "https://your-worker.example/blob", required: false }
 ];
 
 const plugin = {

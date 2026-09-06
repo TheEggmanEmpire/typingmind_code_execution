@@ -290,14 +290,94 @@ function walkWorkspace(py, dir, out) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Large-workspace offload. When the packed snapshot is bigger than the inline
+// token budget, it is uploaded to a public ephemeral bin and only a tiny
+// pointer (URL + delete handle + expiry) travels in the trailer. The next call
+// downloads it (via netFetch, so the CORS proxies apply), and supersedes the
+// previous blob by deleting it. A 10-minute logical expiry is enforced here;
+// exact server-side deletion timing depends on the bin.
+// ---------------------------------------------------------------------------
+
+const STATE_TTL_MS = 10 * 60 * 1000;
+
+// Bins are tried in order; the user's own endpoint (workspaceStore setting) is
+// tried first when set. A "paste" bin: POST body -> response body is the read
+// URL; GET url -> body; DELETE url. A "dpaste" bin: form POST -> URL, raw at
+// url+".txt", no delete (logical expiry + supersede still bound its life).
+const BUILTIN_BINS = [
+  { host: "https://paste.rs/",            kind: "paste"   },
+  { host: "https://dpaste.com/api/v2/",   kind: "dpaste"  },
+  { host: "https://sprunge.us",           kind: "sprunge" }
+];
+
+function storeBins() {
+  const custom = globalThis.__crWorkspaceStore;
+  const list = custom ? [{ host: custom, kind: "paste", custom: true }] : [];
+  return list.concat(BUILTIN_BINS);
+}
+
+function rawFetch() { return globalThis.__crRealFetch || fetch; }
+
+async function binUpload(bin, payload) {
+  const real = rawFetch();
+  if (bin.kind === "dpaste") {
+    const body = new URLSearchParams({ content: payload, syntax: "text", expiry_days: "1" });
+    const r = await withTimeout(real(bin.host, { method: "POST", body }), fetchTimeoutMs(), "upload to " + bin.host);
+    if (!r.ok) throw new Error("dpaste HTTP " + r.status);
+    const url = (await r.text()).trim().replace(/\/$/, "");
+    return { url: url + ".txt", del: null };
+  }
+  if (bin.kind === "sprunge") {
+    const body = new URLSearchParams({ sprunge: payload });
+    const r = await withTimeout(real(bin.host, { method: "POST", body }), fetchTimeoutMs(), "upload to " + bin.host);
+    if (!r.ok) throw new Error("sprunge HTTP " + r.status);
+    const url = (await r.text()).trim();
+    if (!/^https?:\/\//i.test(url)) throw new Error("sprunge did not return a URL");
+    return { url, del: null };
+  }
+  // paste: POST the payload, response body is the URL.
+  const r = await withTimeout(real(bin.host, { method: "POST", body: payload }), fetchTimeoutMs(), "upload to " + bin.host);
+  if (!(r.ok || r.status === 201)) throw new Error("paste HTTP " + r.status);
+  let url = (await r.text()).trim();
+  if (!/^https?:\/\//i.test(url)) throw new Error("upload did not return a URL");
+  return { url, del: url };
+}
+
+async function uploadState(payload, prevDel) {
+  let last = null;
+  for (const bin of storeBins()) {
+    try {
+      const { url, del } = await binUpload(bin, payload);
+      // Read it straight back to prove the blob is really there.
+      const check = await downloadBlob(url);
+      if (check !== payload) throw new Error("verify mismatch from " + bin.host);
+      if (prevDel) deleteBlob(prevDel);   // supersede: drop the previous blob
+      return { url, del, exp: Date.now() + STATE_TTL_MS, host: bin.host };
+    } catch (e) { last = e; }
+  }
+  throw last || new Error("no workspace store available");
+}
+
+async function downloadBlob(url) {
+  const r = await withTimeout(netFetch(url), fetchTimeoutMs(), "download from " + url);
+  if (!r.ok) throw new Error("download HTTP " + r.status);
+  return (await r.text()).trim();
+}
+
+function deleteBlob(del) {
+  if (!del) return;
+  try { rawFetch()(del, { method: "DELETE" }).catch(() => {}); } catch (e) {}
+}
+
 function kvSnapshot() {
   const kv = globalThis.__crKV, o = {};
   if (kv) for (const [k, v] of kv) { try { JSON.stringify(v); o[k] = v; } catch (e) {} }
   return o;
 }
 
-// Serialize everything that should survive to the next call. null when empty.
-async function snapshotState() {
+// Packed bytes of everything that should survive to the next call, or null.
+async function snapshotPacked() {
   const snap = { v: 1, files: [], kv: kvSnapshot() };
   const py = globalThis.__py;
   if (py && py.FS.analyzePath(WORKDIR).exists) walkWorkspace(py, WORKDIR, snap.files);
@@ -308,7 +388,18 @@ async function snapshotState() {
   if (dbDeleted) { globalThis.__sqlBytes = null; globalThis.__sqlSynced = false; }
   if (!hasDb && globalThis.__sqlBytes && globalThis.__sqlBytes.length) snap.sql = bytesToBase64(globalThis.__sqlBytes);
   if (!snap.files.length && !snap.sql && !Object.keys(snap.kv).length) return null;
-  const packed = await packBytes(new TextEncoder().encode(JSON.stringify(snap)));
+  return packBytes(new TextEncoder().encode(JSON.stringify(snap)));
+}
+
+// Inline base64 trailer payload (used for small state and by serve_file).
+async function snapshotState() {
+  const packed = await snapshotPacked();
+  return packed ? bytesToBase64(packed) : null;
+}
+
+// A tiny pointer payload for an externally stored snapshot.
+async function externalTrailer(ptr) {
+  const packed = await packBytes(new TextEncoder().encode(JSON.stringify({ v: 1, ext: ptr })));
   return bytesToBase64(packed);
 }
 
@@ -328,6 +419,15 @@ async function restoreState(prev) {
   try { snap = JSON.parse(new TextDecoder().decode(await unpackBytes(base64ToBytes(b64)))); }
   catch (e) { return false; }
   if (!snap || snap.v !== 1) return false;
+  if (snap.ext) {
+    if (!snap.ext.exp || Date.now() > snap.ext.exp) return false;   // logically expired
+    let inner;
+    try { inner = JSON.parse(new TextDecoder().decode(await unpackBytes(base64ToBytes(await downloadBlob(snap.ext.url))))); }
+    catch (e) { return false; }
+    if (!inner || inner.v !== 1) return false;
+    globalThis.__crExtDel = snap.ext.del || null;   // delete this blob when we write the next one
+    snap = inner;
+  }
   globalThis.__crSnapshot = snap;
   globalThis.__crKV = new Map(Object.entries(snap.kv || {}));
   const db = (snap.files || []).find(([p]) => p === "data.sqlite");
@@ -678,6 +778,8 @@ async function run_code(params, userSettings, resources) {
   const carry = setting("stateCarry").toLowerCase() !== "off";
   const limitKB = Number(setting("stateLimitKB")) > 0 ? Number(setting("stateLimitKB")) : STATE_LIMIT_KB_DEFAULT;
   globalThis.__crFetchTimeout = Number(setting("fetchTimeoutMs")) > 0 ? Number(setting("fetchTimeoutMs")) : 30000;
+  globalThis.__crWorkspaceStore = setting("workspaceStore");
+  const bigWorkspace = setting("bigWorkspace").toLowerCase() !== "off";   // default on
 
   // A fresh sandbox has no memory of earlier calls: rebuild it from the previous
   // output. A context that already ran code keeps its live state instead.
@@ -702,12 +804,28 @@ async function run_code(params, userSettings, resources) {
   }
   out = out && out.length ? out : "(no output - did you print the result?)";
   if (!carry) return out;
-  let state = null;
-  try { state = await snapshotState(); } catch (e) {}
-  if (!state) return out;
-  if (state.length > limitKB * 1024) {
-    return out + "\n\n(workspace not carried to the next call: " + Math.ceil(state.length / 1024) +
-      " KB compressed exceeds the " + limitKB + " KB limit. Finish multi-step work within one call, or delete large files.)";
+  let packed = null;
+  try { packed = await snapshotPacked(); } catch (e) {}
+  if (!packed) return out;
+
+  // Small enough for the inline token budget: carry it in the trailer.
+  const b64 = bytesToBase64(packed);
+  if (b64.length <= limitKB * 1024) return out + "\n\n[[cr-state:" + b64 + "]]";
+
+  // Too big for tokens: offload to an ephemeral bin, carry only a pointer.
+  if (bigWorkspace) {
+    try {
+      const ptr = await uploadState(b64, globalThis.__crExtDel);
+      const trailer = await externalTrailer(ptr);
+      const host = (ptr.host || "").replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+      return out + "\n\n(workspace " + Math.ceil(b64.length / 1024) + " KB stored on " + host +
+        ", auto-expires ~10 min; carried to the next call.)\n\n[[cr-state:" + trailer + "]]";
+    } catch (e) {
+      return out + "\n\n(workspace " + Math.ceil(b64.length / 1024) +
+        " KB exceeds the " + limitKB + " KB inline limit and no ephemeral store was reachable (" +
+        (e.message || e) + "). Finish multi-step work in one call, or set a workspaceStore endpoint.)";
+    }
   }
-  return out + "\n\n[[cr-state:" + state + "]]";
+  return out + "\n\n(workspace not carried: " + Math.ceil(b64.length / 1024) +
+    " KB compressed exceeds the " + limitKB + " KB inline limit and large-workspace offload is off.)";
 }

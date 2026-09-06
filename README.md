@@ -69,6 +69,24 @@ trailer back from `previousRunOutput` and rebuilds the workspace before running.
 - Turn it off with the **Persist workspace between calls** setting, or raise the cap with **Max carried workspace size (KB)**.
 - The trailer counts against the model's token budget, so keep scratch data small.
 
+### Large workspaces (ephemeral bin offload)
+
+The inline trailer is capped (default 24 KB compressed) because it costs tokens. When the workspace is bigger
+and **Offload large workspaces** is on (default), the plugin uploads the compressed snapshot to a public
+ephemeral paste bin and carries only a small pointer (URL + delete handle + expiry) in the output; the next
+call downloads it and rebuilds the workspace.
+
+- **Three built-in bins, tried in order:** `paste.rs` → `dpaste.com` → `sprunge.us`. The first that accepts the
+  upload (and reads back identically) wins.
+- **~10-minute lifetime:** a 10-minute logical expiry is enforced (an older pointer is ignored), and every new
+  snapshot deletes the previous blob, so at most one blob exists during an active chain. Exact server-side
+  deletion timing depends on the bin.
+- **Privacy:** your `/workspace` bytes leave the browser to that public service. Set **Offload large workspaces**
+  to `off` to keep everything inline, or set **Workspace store endpoint** to your own paste-style server
+  (POST body → returns read URL; GET returns it; DELETE removes it) to keep large state private. Your own
+  endpoint is tried before the public bins.
+- Small workspaces still travel inline with no upload.
+
 ### Serving files back to the user
 
 The plugin has a second function, **`serve_file`**, that renders a `/workspace` file straight into the chat
