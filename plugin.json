@@ -6,12 +6,20 @@
   "iconURL": "https://custom.typingmind.com/assets/plugins/javascript.webp",
   "authenticationType": "AUTH_TYPE_NONE",
   "oauthConfig": null,
-  "userSettings": null,
+  "userSettings": [
+    {
+      "name": "corsProxy",
+      "label": "CORS proxy (optional)",
+      "description": "Used only when a direct request from Python/JavaScript is blocked by the browser (CORS). Prefix, e.g. https://corsproxy.io/?url= or use {url} as placeholder. Requests that fall back to it are visible to that proxy.",
+      "placeholder": "https://corsproxy.io/?url=",
+      "required": false
+    }
+  ],
   "dynamicContextEndpoints": [],
   "implementationType": "javascript",
   "openaiSpec": {
     "name": "run_code",
-    "description": "Execute code and return its printed output. Supported languages: python, javascript, sql (SQLite), c, c++, rust, go, ruby, java, csharp, haskell, lua. Use this whenever a result should be computed rather than guessed. Always print/puts/println the values you want returned. For Java, do NOT declare the class public.",
+    "description": "Execute code and return its printed output. Languages: python, javascript, sql (SQLite), c, c++, rust, go, ruby, java, csharp, haskell, lua. Use whenever a result should be computed rather than guessed. Always print/puts/println the values you want returned. INTERNET: python has requests, urllib.request and pyodide.http.pyfetch; javascript has fetch. Browser CORS applies unless the user set a CORS proxy in the plugin settings. STORAGE: /workspace is a temporary in-memory directory shared by python (its cwd), javascript (await fs.readFile/writeFile/appendFile/readdir/exists/unlink/mkdir/stat; storage.get/set for values) and sql. Files and the SQL database persist across calls until page reload. Python can open the SQL database as /workspace/data.sqlite with sqlite3. Compiler Explorer languages (c, c++, rust, go, ruby, java, csharp, haskell, lua) have no internet and no persistent files. For Java, do NOT declare the class public.",
     "parameters": {
       "type": "object",
       "properties": {
