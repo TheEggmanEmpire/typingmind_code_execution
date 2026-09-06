@@ -45,7 +45,7 @@ Toolchains (Compiler Explorer): gcc 14.2, rustc 1.82, Go 1.26, Ruby 4.0, JDK 25,
 ### Temporary storage
 
 `/workspace` is an in-memory (WASM MEMFS) scratch directory that lives until the page reloads.
-It is shared by all three in-browser runtimes:
+It is shared by all three in-browser runtimes and, by default, is **carried across separate tool calls**:
 
 - **python** starts in `/workspace`; anything written there is available in later calls.
 - **javascript** gets `fs` (`await fs.readFile / writeFile / appendFile / readdir / exists / unlink / mkdir / stat`)
@@ -53,5 +53,16 @@ It is shared by all three in-browser runtimes:
 - **sql** keeps its database across calls. Once Python has loaded, the database is mirrored to
   `/workspace/data.sqlite`, so `sqlite3.connect('data.sqlite')` in Python sees the same tables and SQL sees Python's writes.
   Deleting `data.sqlite` resets the SQL database.
+
+### How persistence works
+
+TypingMind runs every plugin call in a brand-new sandboxed iframe, so nothing in memory survives on its own.
+To keep `/workspace`, the SQL database and JS `storage` alive between calls, the plugin serializes them
+(deflate-compressed) and appends a hidden `[[cr-state:...]]` trailer to its output; the next call reads that
+trailer back from `previousRunOutput` and rebuilds the workspace before running.
+
+- Default budget is 24 KB compressed. Larger workspaces are not carried; a note tells the model to finish in one call or delete big files.
+- Turn it off with the **Persist workspace between calls** setting, or raise the cap with **Max carried workspace size (KB)**.
+- The trailer counts against the model's token budget, so keep scratch data small.
 
 Example: *Use run_code to compute the first 20 primes in Rust.*

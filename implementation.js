@@ -163,6 +163,114 @@ function patchXHR() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-call state. TypingMind runs every call in a brand-new sandboxed iframe
+// with an opaque origin: nothing in memory, IndexedDB or localStorage survives
+// from one call to the next. The one channel between calls is the plugin's own
+// previous output (resources.previousRunOutput), so the workspace, the SQL
+// database and the JS storage map travel as a compressed trailer on the output.
+// ---------------------------------------------------------------------------
+
+const STATE_RE = /\n\n\[\[cr-state:([A-Za-z0-9+/=]+)\]\]\s*$/;
+const STATE_LIMIT_KB_DEFAULT = 24;
+
+function bytesToBase64(u8) {
+  let s = "";
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function base64ToBytes(b64) {
+  const s = atob(b64), u8 = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+  return u8;
+}
+async function pipeBytes(u8, stream) {
+  const r = new Blob([u8]).stream().pipeThrough(stream);
+  return new Uint8Array(await new Response(r).arrayBuffer());
+}
+// Prefix byte: 1 = deflate-raw, 0 = stored.
+async function packBytes(u8) {
+  if (typeof CompressionStream === "function") {
+    try {
+      const z = await pipeBytes(u8, new CompressionStream("deflate-raw"));
+      const out = new Uint8Array(z.length + 1); out[0] = 1; out.set(z, 1); return out;
+    } catch (e) {}
+  }
+  const out = new Uint8Array(u8.length + 1); out[0] = 0; out.set(u8, 1); return out;
+}
+async function unpackBytes(u8) {
+  const body = u8.subarray(1);
+  if (u8[0] === 1) return pipeBytes(body, new DecompressionStream("deflate-raw"));
+  return body;
+}
+
+function walkWorkspace(py, dir, out) {
+  for (const name of py.FS.readdir(dir)) {
+    if (name === "." || name === "..") continue;
+    const p = dir + "/" + name, st = py.FS.stat(p);
+    if (py.FS.isDir(st.mode)) walkWorkspace(py, p, out);
+    else out.push([p.slice(WORKDIR.length + 1), bytesToBase64(py.FS.readFile(p))]);
+  }
+}
+
+function kvSnapshot() {
+  const kv = globalThis.__crKV, o = {};
+  if (kv) for (const [k, v] of kv) { try { JSON.stringify(v); o[k] = v; } catch (e) {} }
+  return o;
+}
+
+// Serialize everything that should survive to the next call. null when empty.
+async function snapshotState() {
+  const snap = { v: 1, files: [], kv: kvSnapshot() };
+  const py = globalThis.__py;
+  if (py && py.FS.analyzePath(WORKDIR).exists) walkWorkspace(py, WORKDIR, snap.files);
+  const hasDb = snap.files.some(([p]) => p === "data.sqlite");
+  // If Pyodide is up and we hold a db image but the file is gone, the user
+  // deleted it this call: drop the stale image so it is not resurrected.
+  const dbDeleted = py && globalThis.__sqlBytes && globalThis.__sqlBytes.length && !py.FS.analyzePath(DB_FILE).exists;
+  if (dbDeleted) { globalThis.__sqlBytes = null; globalThis.__sqlSynced = false; }
+  if (!hasDb && globalThis.__sqlBytes && globalThis.__sqlBytes.length) snap.sql = bytesToBase64(globalThis.__sqlBytes);
+  if (!snap.files.length && !snap.sql && !Object.keys(snap.kv).length) return null;
+  const packed = await packBytes(new TextEncoder().encode(JSON.stringify(snap)));
+  return bytesToBase64(packed);
+}
+
+function previousOutputText(prev) {
+  if (prev == null) return "";
+  if (typeof prev === "string") return prev;
+  if (Array.isArray(prev)) return prev.map((p) => (p && typeof p === "object" ? p.text || "" : String(p))).join("\n");
+  if (typeof prev === "object") return prev.content != null ? previousOutputText(prev.content) : JSON.stringify(prev);
+  return String(prev);
+}
+
+// Rehydrate memory-level state now; files are applied when Pyodide comes up.
+async function restoreState(prev) {
+  const m = STATE_RE.exec(previousOutputText(prev));
+  if (!m) return false;
+  let snap;
+  try { snap = JSON.parse(new TextDecoder().decode(await unpackBytes(base64ToBytes(m[1])))); }
+  catch (e) { return false; }
+  if (!snap || snap.v !== 1) return false;
+  globalThis.__crSnapshot = snap;
+  globalThis.__crKV = new Map(Object.entries(snap.kv || {}));
+  const db = (snap.files || []).find(([p]) => p === "data.sqlite");
+  if (db) globalThis.__sqlBytes = base64ToBytes(db[1]);
+  else if (snap.sql) globalThis.__sqlBytes = base64ToBytes(snap.sql);
+  if (globalThis.__py) applySnapshotFiles(globalThis.__py);
+  return true;
+}
+
+function applySnapshotFiles(py) {
+  const snap = globalThis.__crSnapshot;
+  if (!snap || snap.applied) return;
+  snap.applied = true;
+  for (const [rel, b64] of snap.files || []) {
+    const p = WORKDIR + "/" + rel, dir = p.slice(0, p.lastIndexOf("/"));
+    py.FS.mkdirTree(dir);
+    py.FS.writeFile(p, base64ToBytes(b64));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Python (Pyodide)
 // ---------------------------------------------------------------------------
 
@@ -191,6 +299,13 @@ async function getPyodide() {
     globalThis.__pyLoading = (async () => {
       const py = await loadPyodideWithFallback();
       py.FS.mkdirTree(WORKDIR);
+      applySnapshotFiles(py);
+      // A database carried from a SQL-only call lives in __sqlBytes, not as a
+      // file. Write it so Python's sqlite3 can open /workspace/data.sqlite.
+      if (globalThis.__sqlBytes && globalThis.__sqlBytes.length && !py.FS.analyzePath(DB_FILE).exists) {
+        py.FS.writeFile(DB_FILE, globalThis.__sqlBytes);
+        globalThis.__sqlSynced = true;
+      }
       // requests/urllib3 work natively in Pyodide; pyodide-http adds urllib.request.
       try {
         await py.loadPackage("pyodide-http");
@@ -394,12 +509,23 @@ async function runRemote(language, code) {
 
 // ---------------------------------------------------------------------------
 
-async function run_code(params, userSettings) {
+async function run_code(params, userSettings, resources) {
   const { language, code, packages } = params;
   if (!code || !code.trim()) throw new Error("No code was provided.");
-  globalThis.__crCorsProxy = String((userSettings && userSettings.corsProxy) || "").trim();
-  globalThis.__crPyodideCdn = (userSettings && userSettings.pyodideCdn) || "";
-  globalThis.__crSqljsCdn = (userSettings && userSettings.sqljsCdn) || "";
+  const setting = (k) => String((userSettings && userSettings[k]) || "").trim();
+  globalThis.__crCorsProxy = setting("corsProxy");
+  globalThis.__crPyodideCdn = setting("pyodideCdn");
+  globalThis.__crSqljsCdn = setting("sqljsCdn");
+  const carry = setting("stateCarry").toLowerCase() !== "off";
+  const limitKB = Number(setting("stateLimitKB")) > 0 ? Number(setting("stateLimitKB")) : STATE_LIMIT_KB_DEFAULT;
+
+  // A fresh sandbox has no memory of earlier calls: rebuild it from the previous
+  // output. A context that already ran code keeps its live state instead.
+  if (carry && !globalThis.__crLive) {
+    try { await restoreState(resources && resources.previousRunOutput); } catch (e) {}
+  }
+  globalThis.__crLive = true;
+
   patchFetch();
   patchXHR();
   globalThis.__crRunning = (globalThis.__crRunning || 0) + 1;
@@ -414,5 +540,14 @@ async function run_code(params, userSettings) {
   } finally {
     globalThis.__crRunning--;
   }
-  return out && out.length ? out : "(no output - did you print the result?)";
+  out = out && out.length ? out : "(no output - did you print the result?)";
+  if (!carry) return out;
+  let state = null;
+  try { state = await snapshotState(); } catch (e) {}
+  if (!state) return out;
+  if (state.length > limitKB * 1024) {
+    return out + "\n\n(workspace not carried to the next call: " + Math.ceil(state.length / 1024) +
+      " KB compressed exceeds the " + limitKB + " KB limit. Finish multi-step work within one call, or delete large files.)";
+  }
+  return out + "\n\n[[cr-state:" + state + "]]";
 }

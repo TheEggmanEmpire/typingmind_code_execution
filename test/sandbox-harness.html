@@ -1,0 +1,85 @@
+<!doctype html><html><body><pre id="out">pending</pre>
+<script>
+// Mimics TypingMind's plugin runner (chunk 3n_9yjdtwj6t6, function W): one sandboxed
+// srcdoc iframe per call (sandbox="allow-scripts allow-modals"), code eval'd via postMessage,
+// iframe removed when the response arrives. previousRunOutput = last response of this plugin.
+const PLUGIN_URL = "/implementation.js";   // resolved relative to this page
+let pluginCode = null;
+async function runPlugin({ id, name, params, userSettings, authorizedResources }) {
+  results.stage = "loading plugin code"; show();
+  const variant = new URLSearchParams(location.search).get("plugin");
+  if (pluginCode === null) pluginCode = variant === "trivial"
+    ? "async function run_code(p) { return 'trivial:' + p.language; }"
+    : variant === "diag"
+    ? `async function run_code(p) {
+        const r = { origin: location.origin, href: location.href, hasHead: !!document.head, csp: document.querySelector('meta[http-equiv]') ? 'meta' : 'none' };
+        const load = (src) => new Promise((res) => { const s = document.createElement('script'); s.src = src;
+          s.onload = () => res('loaded'); s.onerror = (e) => res('onerror type=' + e.type); (document.head || document.documentElement).appendChild(s); });
+        r.script_sqljs = await load('https://cdn.jsdelivr.net/npm/sql.js@1.13.0/dist/sql-wasm.js');
+        r.script_local = await load('/implementation.js');
+        try { const x = await fetch('https://httpbin.org/get?d=1'); r.fetch_httpbin = x.status; } catch (e) { r.fetch_httpbin = 'ERR ' + e.message; }
+        try { const x = await fetch('https://cdn.jsdelivr.net/npm/sql.js@1.13.0/package.json'); r.fetch_cdn = x.status; } catch (e) { r.fetch_cdn = 'ERR ' + e.message; }
+        try { const x = new XMLHttpRequest(); x.open('GET', 'https://httpbin.org/get?x=1', false); x.send(); r.xhr_sync = x.status; } catch (e) { r.xhr_sync = 'ERR ' + e.message; }
+        return JSON.stringify(r);
+      }`
+    : await (await fetch(PLUGIN_URL)).text();
+  results.stage = "plugin code loaded (" + pluginCode.length + " chars)"; show();
+  const code = `${pluginCode}
+    (async function() {
+      var response = await ${name}(${JSON.stringify(params)}, ${JSON.stringify(userSettings)}, ${JSON.stringify(authorizedResources)});
+      window.parent.postMessage(JSON.stringify({ response, id: ${JSON.stringify(id)} }, null, 2), "*");
+    })()`;
+  return new Promise((resolve) => {
+    const s = document.createElement("iframe");
+    s.id = "plugins-iframe-" + id;
+    s.sandbox = "allow-scripts allow-modals";
+    s.style.display = "none";
+    s.srcdoc = `TypingMind Plugin Sandbox <script>
+      window.onerror = (m, src, line, col, err) => { window.parent.postMessage(JSON.stringify({ error: "onerror: " + m + " @" + line + ":" + col, id: ${JSON.stringify(id)} }), "*"); };
+      window.addEventListener('unhandledrejection', (ev) => { window.parent.postMessage(JSON.stringify({ error: "unhandledrejection: " + (ev.reason && (ev.reason.stack || ev.reason.message) || ev.reason), id: ${JSON.stringify(id)} }), "*"); });
+      window.addEventListener('message', async (event) => {
+        try { var receivedCode = event.data; await eval(receivedCode); }
+        catch (e) { console.error(e); window.parent.postMessage(JSON.stringify({ error: e.message, id: ${JSON.stringify(id)} }), "*"); }
+      });<\/script>`;
+    document.body.appendChild(s);
+    results.stage = "iframe appended"; show();
+    const onMsg = (t) => {
+      if (t.source !== s.contentWindow) return;
+      results.stage = "message from iframe: " + String(t.data).slice(0, 200); show();
+      let n; try { n = JSON.parse(t.data); } catch (e) { return; }
+      if (n && n.id === id) { resolve(n); try { document.body.removeChild(s); } catch (e) {} window.removeEventListener("message", onMsg); }
+    };
+    window.addEventListener("message", onMsg);
+    s.onload = function () { results.stage = "iframe loaded, posting code"; show(); this.contentWindow.postMessage(code, "*"); };
+  });
+}
+
+const results = {};
+const show = (done) => { const txt = (done ? "RESULTS " : "PROGRESS ") + JSON.stringify(results, null, 1); document.getElementById("out").textContent = txt; fetch("/report", { method: "POST", body: txt }).catch(() => {}); };
+(async () => {
+  let previous = undefined, n = 0;
+  const settings = {};
+  const call = async (label, language, code, extra = {}) => {
+    const t0 = performance.now();
+    const r = await runPlugin({ id: "call-" + (++n), name: "run_code", params: { language, code, ...extra }, userSettings: settings,
+      authorizedResources: { previousRunOutput: previous } });
+    const ms = Math.round(performance.now() - t0);
+    if (r.error) { results[label] = "ERROR: " + r.error + " (" + ms + " ms)"; }
+    else { previous = r.response; results[label] = { ms, out: String(r.response).slice(0, 400) }; }
+    show();
+  };
+  await call("0_js_roundtrip", "javascript", "console.log(1 + 1)");
+  await call("1_py_write", "python", "open('a.txt','w').write('persist'); import os; print(os.getcwd(), os.listdir('/workspace'))");
+  await call("2_py_read_next_call", "python", "import os; print(os.listdir('/workspace')); print(open('a.txt').read())");
+  await call("3_sql_create", "sql", "CREATE TABLE t(a); INSERT INTO t VALUES (5),(6);");
+  await call("4_sql_select_next_call", "sql", "SELECT SUM(a) AS s FROM t;");
+  await call("5_py_reads_sql", "python", "import sqlite3; print(sqlite3.connect('data.sqlite').execute('select sum(a) from t').fetchone()[0])");
+  await call("6_js_storage_set", "javascript", "storage.set('k', 42); await fs.writeFile('b.txt', 'bee'); console.log('ok')");
+  await call("7_js_storage_get_next_call", "javascript", "console.log(storage.get('k'), await fs.readFile('b.txt'), (await fs.readdir('/workspace')).join(','))");
+  await call("8_py_requests", "python", "import requests; print(requests.get('https://httpbin.org/get?x=1').json()['args']['x'])");
+  await call("9_py_delete_all", "python", "import os, shutil; [os.remove(os.path.join('/workspace', f)) for f in os.listdir('/workspace')]; print(os.listdir('/workspace'))");
+  await call("10_py_after_delete", "python", "import os; print(os.listdir('/workspace'))");
+  results.last_response_tail = String(previous).slice(-200);
+  show(true);
+})();
+</script></body></html>

@@ -30,3 +30,16 @@ chromium --headless=new --disable-gpu --allow-file-access-from-files \
 Expected with only `cdn.jsdelivr.net` blocked: identical results, `*_cdn` show `fastly.jsdelivr.net`.
 With all four jsDelivr hosts blocked: runtimes come from `unpkg.com`; plain Python, files, SQL and JS
 work, and imports of wheel packages (requests, sqlite3, numpy, ...) fail with a note explaining why.
+
+### Sandbox model test (state carry)
+
+`sandbox-harness.html` reproduces TypingMind's real execution model: each call runs in a fresh
+`<iframe sandbox="allow-scripts allow-modals">` via srcdoc, and only the previous output is fed back as
+`previousRunOutput`. It proves files, the SQL database and JS storage survive between separate calls, and
+that a deleted `data.sqlite` stays gone.
+
+```sh
+node test/serve.js &     # static server on 127.0.0.1:8080 (+ /report sink)
+chromium --headless=new --disable-gpu --virtual-time-budget=240000 \
+  --dump-dom "http://127.0.0.1:8080/test/sandbox-harness.html"
+```
