@@ -77,6 +77,17 @@ const show = (done) => { const txt = (done ? "RESULTS " : "PROGRESS ") + JSON.st
   await call("6_js_storage_set", "javascript", "storage.set('k', 42); await fs.writeFile('b.txt', 'bee'); console.log('ok')");
   await call("7_js_storage_get_next_call", "javascript", "console.log(storage.get('k'), await fs.readFile('b.txt'), (await fs.readdir('/workspace')).join(','))");
   await call("8_py_requests", "python", "import requests; print(requests.get('https://httpbin.org/get?x=1').json()['args']['x'])");
+  // fetch -> edit -> serve, each in its own fresh sandbox
+  const serveCall = async (label, params) => {
+    const r = await runPlugin({ id: "call-" + (++n), name: "serve_file", params, userSettings: settings, authorizedResources: { previousRunOutput: previous } });
+    if (r.error) results[label] = "ERROR: " + r.error;
+    else { previous = r.response; results[label] = String(r.response).replace(/<!--\[\[cr-state:.*?\]\]-->/s, "").slice(0, 90); }
+    show();
+  };
+  await call("F1_fetch_bin", "javascript", "const b = new Uint8Array(await (await fetch('https://httpbin.org/image/png')).arrayBuffer()); await fs.writeFile('logo.png', b); console.log('bytes ' + b.length)");
+  await call("F2_edit_json", "python", "import json; json.dump({'edited': True, 'n': 3}, open('data.json','w')); print('edited')");
+  await serveCall("F3_serve_png", { path: "logo.png" });
+  await serveCall("F4_serve_json_text", { path: "data.json", as: "text" });
   await call("9_py_delete_all", "python", "import os, shutil; [os.remove(os.path.join('/workspace', f)) for f in os.listdir('/workspace')]; print(os.listdir('/workspace'))");
   await call("10_py_after_delete", "python", "import os; print(os.listdir('/workspace'))");
   results.last_response_tail = String(previous).slice(-200);

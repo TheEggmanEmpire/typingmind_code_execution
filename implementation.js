@@ -87,14 +87,35 @@ function proxyUrl(url) {
   return p.includes("{url}") ? p.replace("{url}", encodeURIComponent(url)) : p + encodeURIComponent(url);
 }
 
+function fetchTimeoutMs() {
+  const n = Number(globalThis.__crFetchTimeout);
+  return n > 0 ? n : 30000;
+}
+
+// fetch with an AbortController timeout. Leaves a caller-supplied signal alone.
+async function timedFetch(real, input, init) {
+  init = init || {};
+  if (init.signal || typeof AbortController !== "function") return real(input, init);
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), fetchTimeoutMs());
+  try { return await real(input, { ...init, signal: ac.signal }); }
+  finally { clearTimeout(t); }
+}
+
+// Direct first (with timeout); on a network-level failure retry once, then fall
+// back to the configured CORS proxy. Never retries a request that got a real
+// HTTP response (even 4xx/5xx) - only genuine transport failures.
 async function netFetch(input, init) {
   const real = globalThis.__crRealFetch || fetch;
-  try { return await real(input, init); }
-  catch (e) {
-    const url = typeof input === "string" ? input : (input && input.url) || String(input);
-    const pu = proxyUrl(url);
-    if (!pu) throw e;
-    return real(pu, init);
+  const url = typeof input === "string" ? input : (input && input.url) || String(input);
+  try { return await timedFetch(real, input, init); }
+  catch (e1) {
+    try { return await timedFetch(real, input, init); }
+    catch (e2) {
+      const pu = proxyUrl(url);
+      if (!pu) throw e2;
+      return timedFetch(real, pu, init);
+    }
   }
 }
 
@@ -120,16 +141,20 @@ function carriesCredentials(input, init) {
 
 function patchFetch() {
   if (globalThis.__crFetchPatched || typeof globalThis.fetch !== "function") return;
-  const real = globalThis.fetch;
+  const real = globalThis.fetch.bind(globalThis);
   globalThis.__crRealFetch = real;
   globalThis.fetch = async function (input, init) {
-    try { return await real.call(this, input, init); }
-    catch (e) {
-      if (!globalThis.__crRunning || carriesCredentials(input, init)) throw e;
-      const url = typeof input === "string" ? input : (input && input.url) || String(input);
-      const pu = proxyUrl(url);
-      if (!pu) throw e;
-      return real.call(this, pu, init);
+    // Outside a run, or for credentialed requests, stay out of the way entirely.
+    if (!globalThis.__crRunning || carriesCredentials(input, init)) return real(input, init);
+    try { return await timedFetch(real, input, init); }
+    catch (e1) {
+      try { return await timedFetch(real, input, init); }
+      catch (e2) {
+        const url = typeof input === "string" ? input : (input && input.url) || String(input);
+        const pu = proxyUrl(url);
+        if (!pu) throw e2;
+        return timedFetch(real, pu, init);
+      }
     }
   };
   globalThis.__crFetchPatched = true;
@@ -170,8 +195,19 @@ function patchXHR() {
 // database and the JS storage map travel as a compressed trailer on the output.
 // ---------------------------------------------------------------------------
 
-const STATE_RE = /\n\n\[\[cr-state:([A-Za-z0-9+/=]+)\]\]\s*$/;
+// Trailer that carries state to the next call. run_code emits the plain form at
+// the end of its output; serve_file emits it inside an HTML comment so it stays
+// invisible when the markdown is rendered. Both are parsed here.
 const STATE_LIMIT_KB_DEFAULT = 24;
+
+// Return the last [[cr-state:...]] payload in the text (plain or HTML-comment
+// form). A fresh regex each call - never a shared, stateful global one.
+function extractTrailer(text) {
+  const re = /\[\[cr-state:([A-Za-z0-9+/=]+)\]\]/g;
+  let m, last = null;
+  while ((m = re.exec(String(text))) !== null) last = m[1];
+  return last;
+}
 
 function bytesToBase64(u8) {
   let s = "";
@@ -244,10 +280,10 @@ function previousOutputText(prev) {
 
 // Rehydrate memory-level state now; files are applied when Pyodide comes up.
 async function restoreState(prev) {
-  const m = STATE_RE.exec(previousOutputText(prev));
-  if (!m) return false;
+  const b64 = extractTrailer(previousOutputText(prev));
+  if (!b64) return false;
   let snap;
-  try { snap = JSON.parse(new TextDecoder().decode(await unpackBytes(base64ToBytes(m[1])))); }
+  try { snap = JSON.parse(new TextDecoder().decode(await unpackBytes(base64ToBytes(b64)))); }
   catch (e) { return false; }
   if (!snap || snap.v !== 1) return false;
   globalThis.__crSnapshot = snap;
@@ -269,6 +305,49 @@ function applySnapshotFiles(py) {
     py.FS.writeFile(p, base64ToBytes(b64));
   }
 }
+
+const MIME_BY_EXT = {
+  txt: "text/plain", md: "text/markdown", csv: "text/csv", tsv: "text/tab-separated-values",
+  json: "application/json", xml: "application/xml", yaml: "text/yaml", yml: "text/yaml",
+  html: "text/html", htm: "text/html", js: "text/javascript", css: "text/css",
+  svg: "image/svg+xml", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  gif: "image/gif", webp: "image/webp", bmp: "image/bmp", ico: "image/x-icon",
+  pdf: "application/pdf", zip: "application/zip", wav: "audio/wav", mp3: "audio/mpeg",
+  ogg: "audio/ogg", mp4: "video/mp4", webm: "video/webm", sqlite: "application/x-sqlite3",
+  bin: "application/octet-stream"
+};
+function guessMime(name) {
+  const dot = name.lastIndexOf(".");
+  const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+  return MIME_BY_EXT[ext] || "application/octet-stream";
+}
+function relPath(path) {
+  path = String(path == null ? "" : path).trim();
+  if (path.startsWith(WORKDIR + "/")) return path.slice(WORKDIR.length + 1);
+  if (path.startsWith("/")) return path.replace(/^\/+/, "");
+  return path.replace(/^\.\//, "");
+}
+
+// Read one workspace file as bytes. Prefers the live Pyodide FS, then the
+// restored snapshot (so serving needs no Pyodide boot on mobile), then a
+// carried SQL image for data.sqlite.
+function readWorkspaceFile(path) {
+  const rel = relPath(path);
+  const py = globalThis.__py;
+  if (py) {
+    const abs = WORKDIR + "/" + rel;
+    if (py.FS.analyzePath(abs).exists && !py.FS.isDir(py.FS.stat(abs).mode)) return py.FS.readFile(abs);
+  }
+  const snap = globalThis.__crSnapshot;
+  if (snap) {
+    const hit = (snap.files || []).find(([p]) => p === rel);
+    if (hit) return base64ToBytes(hit[1]);
+  }
+  if (rel === "data.sqlite" && globalThis.__sqlBytes && globalThis.__sqlBytes.length) return globalThis.__sqlBytes;
+  throw new Error("File not found in /workspace: " + rel + ". Write it with run_code first, in the same session.");
+}
+
+function mdEscape(s) { return String(s).replace(/([\\`*_\[\]()])/g, "\\$1"); }
 
 // ---------------------------------------------------------------------------
 // Python (Pyodide)
@@ -509,6 +588,44 @@ async function runRemote(language, code) {
 
 // ---------------------------------------------------------------------------
 
+// Serve a workspace file to the human user. Rendered as markdown (outputType
+// render_markdown), so the file reaches the user directly without passing the
+// bytes through the AI's context. Images show inline; text can show as a code
+// block; everything gets a data-URL download link. State is passed through
+// unchanged (invisible HTML-comment trailer) so the next call keeps the workspace.
+async function serve_file(params, userSettings, resources) {
+  const path = params && (params.path || params.file || params.filename);
+  if (!path) throw new Error("serve_file needs a `path` to a file in /workspace.");
+  const carry = String((userSettings && userSettings.stateCarry) || "").trim().toLowerCase() !== "off";
+  const incoming = extractTrailer(previousOutputText(resources && resources.previousRunOutput));
+  if (carry) { try { await restoreState(resources && resources.previousRunOutput); } catch (e) {} }
+
+  const bytes = readWorkspaceFile(path);
+  const name = params.filename || relPath(path).split("/").pop() || "file";
+  const mime = params.mime || guessMime(name);
+  const b64 = bytesToBase64(bytes);
+  const dataURI = "data:" + mime + ";base64," + b64;
+  const kb = Math.ceil(bytes.length / 1024);
+
+  const mode = (params.as || "auto").toLowerCase();
+  const isImage = /^image\//.test(mime) && mime !== "image/svg+xml" || mime === "image/svg+xml";
+  const isText = /^text\//.test(mime) || mime === "application/json" || mime === "application/xml";
+  const link = "[Download " + mdEscape(name) + " (" + kb + " KB)](" + dataURI + ")";
+
+  let md;
+  if (mode === "link") md = link;
+  else if (mode === "image" || (mode === "auto" && isImage)) md = "![" + mdEscape(name) + "](" + dataURI + ")\n\n" + link;
+  else if (mode === "text" || (mode === "auto" && isText && bytes.length <= 64 * 1024)) {
+    const text = new TextDecoder().decode(bytes);
+    const fence = mime === "application/json" ? "json" : mime === "text/markdown" ? "markdown" : "";
+    md = "```" + fence + "\n" + text + "\n```\n\n" + link;
+  } else md = link;
+
+  if (!carry) return md;
+  const trailer = incoming || (await snapshotState());
+  return trailer ? md + "\n\n<!--[[cr-state:" + trailer + "]]-->" : md;
+}
+
 async function run_code(params, userSettings, resources) {
   const { language, code, packages } = params;
   if (!code || !code.trim()) throw new Error("No code was provided.");
@@ -518,6 +635,7 @@ async function run_code(params, userSettings, resources) {
   globalThis.__crSqljsCdn = setting("sqljsCdn");
   const carry = setting("stateCarry").toLowerCase() !== "off";
   const limitKB = Number(setting("stateLimitKB")) > 0 ? Number(setting("stateLimitKB")) : STATE_LIMIT_KB_DEFAULT;
+  globalThis.__crFetchTimeout = Number(setting("fetchTimeoutMs")) > 0 ? Number(setting("fetchTimeoutMs")) : 30000;
 
   // A fresh sandbox has no memory of earlier calls: rebuild it from the previous
   // output. A context that already ran code keeps its live state instead.

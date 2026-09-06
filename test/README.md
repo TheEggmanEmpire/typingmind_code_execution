@@ -43,3 +43,16 @@ node test/serve.js &     # static server on 127.0.0.1:8080 (+ /report sink)
 chromium --headless=new --disable-gpu --virtual-time-budget=240000 \
   --dump-dom "http://127.0.0.1:8080/test/sandbox-harness.html"
 ```
+
+
+### Node unit harness
+
+`node-harness.js` runs the plugin logic under Node against real Pyodide/sql.js, with a fake fetch/XHR
+and a simulated fresh-sandbox wipe. It covers persistence, the CDN fallback, fetch retry/proxy, and
+serve_file. Setup:
+
+```sh
+cd test && npm i pyodide@0.29.4 sql.js@1.13.0 && node node-harness.js
+```
+
+(The browser harness above is the authoritative end-to-end test; this one is faster for logic checks.)

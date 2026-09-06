@@ -65,4 +65,26 @@ trailer back from `previousRunOutput` and rebuilds the workspace before running.
 - Turn it off with the **Persist workspace between calls** setting, or raise the cap with **Max carried workspace size (KB)**.
 - The trailer counts against the model's token budget, so keep scratch data small.
 
+### Serving files back to the user
+
+The plugin has a second function, **`serve_file`**, that renders a `/workspace` file straight into the chat
+for the user, without the bytes passing through the model's context. Images show inline; anything else becomes
+a download link (a `data:` URL).
+
+Typical flow — *load from the internet → edit in temp → serve to the user*:
+
+1. `run_code` (python or javascript): fetch a file and save it to `/workspace`.
+2. `run_code`: edit it (crop the image, filter the CSV, rewrite the HTML, ...).
+3. `serve_file` with the file's path: the user sees/downloads the result.
+
+```
+run_code(javascript): const b = new Uint8Array(await (await fetch(url)).arrayBuffer());
+                      await fs.writeFile('photo.jpg', b);
+run_code(python):     from PIL import Image; im = Image.open('photo.jpg'); im.rotate(90).save('rotated.jpg')
+serve_file(path='rotated.jpg')     # rendered inline to the user
+```
+
+`serve_file` params: `path` (required), optional `filename`, `mime`, and `as` (`auto` | `image` | `link` | `text`).
+It reads the carried workspace, so it works right after the `run_code` call that produced the file.
+
 Example: *Use run_code to compute the first 20 primes in Rust.*
