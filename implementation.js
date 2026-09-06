@@ -41,18 +41,53 @@ function proxyUrl(url) {
 }
 
 async function netFetch(input, init) {
-  const url = typeof input === "string" ? input : (input && input.url) || String(input);
-  try { return await fetch(input, init); }
+  const real = globalThis.__crRealFetch || fetch;
+  try { return await real(input, init); }
   catch (e) {
+    const url = typeof input === "string" ? input : (input && input.url) || String(input);
     const pu = proxyUrl(url);
     if (!pu) throw e;
-    return fetch(pu, init);
+    return real(pu, init);
   }
 }
 
-// Python's `requests`, `urllib` (via pyodide-http) and urllib3 use synchronous
-// XMLHttpRequest. Give those the same direct-then-proxy behaviour. Only sync
-// requests issued while run_code is executing are touched.
+// Python's urllib3 (behind `requests`) calls the global fetch when the browser
+// supports JSPI, and pyodide-http / urllib3 without JSPI use synchronous
+// XMLHttpRequest. Both get the same direct-then-proxy behaviour, but only while
+// run_code is executing, and never for requests that carry credentials, so the
+// host app's own API traffic is never routed through the proxy.
+const AUTH_HEADER = /^(authorization|proxy-authorization|x-api-key|api-key|cookie)$/i;
+
+function carriesCredentials(input, init) {
+  if (init && init.credentials === "include") return true;
+  const scan = (h) => {
+    if (!h) return false;
+    if (typeof h.forEach === "function" && !Array.isArray(h)) { let hit = false; h.forEach((v, k) => { if (AUTH_HEADER.test(k)) hit = true; }); return hit; }
+    if (Array.isArray(h)) return h.some(([k]) => AUTH_HEADER.test(k));
+    return Object.keys(h).some((k) => AUTH_HEADER.test(k));
+  };
+  if (init && scan(init.headers)) return true;
+  if (input && typeof input === "object" && input.headers && scan(input.headers)) return true;
+  return false;
+}
+
+function patchFetch() {
+  if (globalThis.__crFetchPatched || typeof globalThis.fetch !== "function") return;
+  const real = globalThis.fetch;
+  globalThis.__crRealFetch = real;
+  globalThis.fetch = async function (input, init) {
+    try { return await real.call(this, input, init); }
+    catch (e) {
+      if (!globalThis.__crRunning || carriesCredentials(input, init)) throw e;
+      const url = typeof input === "string" ? input : (input && input.url) || String(input);
+      const pu = proxyUrl(url);
+      if (!pu) throw e;
+      return real.call(this, pu, init);
+    }
+  };
+  globalThis.__crFetchPatched = true;
+}
+
 function patchXHR() {
   const X = globalThis.XMLHttpRequest;
   if (!X || X.prototype.__crPatched) return;
@@ -284,6 +319,7 @@ async function run_code(params, userSettings) {
   const { language, code, packages } = params;
   if (!code || !code.trim()) throw new Error("No code was provided.");
   globalThis.__crCorsProxy = String((userSettings && userSettings.corsProxy) || "").trim();
+  patchFetch();
   patchXHR();
   globalThis.__crRunning = (globalThis.__crRunning || 0) + 1;
   let out;

@@ -1,0 +1,30 @@
+<!doctype html><html><body><pre id="out">pending</pre>
+<script src="../implementation.js"></script>
+<script>
+const results = {};
+const run = (language, code, extra = {}, settings = {}) => run_code({ language, code, ...extra }, settings);
+(async () => {
+  const t = async (name, fn) => { try { results[name] = await fn(); } catch (e) { results[name] = "THREW: " + (e.message || e); } };
+  await t("js_fetch", () => run("javascript", "const r = await fetch('https://httpbin.org/get?x=1'); console.log((await r.json()).args.x)"));
+  await t("py_requests", () => run("python", "import requests\nr = requests.get('https://httpbin.org/get?x=2')\nprint(r.status_code, r.json()['args']['x'])"));
+  await t("py_requests_post", () => run("python", "import requests\nprint(requests.post('https://httpbin.org/post', json={'a':1}).json()['json'])"));
+  await t("py_urllib", () => run("python", "import urllib.request, json\nprint(json.load(urllib.request.urlopen('https://httpbin.org/get?x=3'))['args']['x'])"));
+  await t("py_pyfetch", () => run("python", "from pyodide.http import pyfetch\nr = await pyfetch('https://httpbin.org/get?x=4')\nprint((await r.json())['args']['x'])"));
+  await t("py_write", () => run("python", "open('a.txt','w').write('persist'); import os; print(os.getcwd())"));
+  await t("py_read_later", () => run("python", "print(open('a.txt').read())"));
+  await t("sql_create", () => run("sql", "CREATE TABLE t(a); INSERT INTO t VALUES (5);"));
+  await t("sql_py_read", () => run("python", "import sqlite3; print(sqlite3.connect('data.sqlite').execute('select a from t').fetchone()[0])"));
+  await t("js_fs", () => run("javascript", "console.log(await fs.readFile('a.txt'), (await fs.readdir('/workspace')).join(','))"));
+  await t("py_cors_blocked_no_proxy", () => run("python", "import requests\ntry:\n    print(requests.get('https://example.com').status_code)\nexcept Exception as e:\n    print('ERR', type(e).__name__)"));
+  const PX = { corsProxy: "http://127.0.0.1:8787/?url=" };
+  await t("py_requests_via_proxy", () => run("python", "import requests\nprint(requests.get('https://example.com').text[:15])", {}, PX));
+  await t("py_urllib_via_proxy", () => run("python", "import urllib.request\nprint(urllib.request.urlopen('https://example.com').read()[:15])", {}, PX));
+  await t("py_pyfetch_via_proxy", () => run("python", "from pyodide.http import pyfetch\nr = await pyfetch('https://example.com')\nprint((await r.string())[:15])", {}, PX));
+  await t("js_fetch_via_proxy", () => run("javascript", "const r = await fetch('https://example.com'); console.log((await r.text()).slice(0, 15))", {}, PX));
+  await t("js_fetch_direct_not_proxied", () => run("javascript", "const r = await fetch('https://httpbin.org/get?x=9'); console.log((await r.json()).args.x)", {}, PX));
+  await t("global_fetch_auth_not_proxied", () => run("javascript", "try { await globalThis.fetch('https://example.com', { headers: { Authorization: 'Bearer x' } }); console.log('proxied?!') } catch (e) { console.log('blocked: ' + e.message) }", {}, PX));
+  await t("global_fetch_outside_run", () => globalThis.fetch('https://example.com').then(() => "proxied?!", (e) => "blocked: " + e.message));
+  await t("py_socket_probe", () => run("python", "import socket\nprint(socket.gethostbyname('example.com'))"));
+  document.getElementById("out").textContent = "RESULTS " + JSON.stringify(results, null, 1);
+})();
+</script></body></html>
