@@ -345,6 +345,45 @@ function freshSandbox() {
   check("caller abort mid-race: host not marked dead", globalThis.__crHostHealth && globalThis.__crHostHealth["wall3.example"], undefined);
   useFetch(rf3);
 
+  // a host that was BLOCKED (not silent) is re-probed through one short proxy wave
+  run._prev = undefined; freshSandbox();
+  let wallHits = 0, wallProxyHits = 0, proxiesUp = false;
+  useFetch((input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (url.startsWith("https://wall4.example/")) { wallHits++; throw new TypeError("Failed to fetch"); }
+    if (url.includes("wall4.example")) { wallProxyHits++; if (proxiesUp) return { ok: true, status: 200, text: async () => "via-proxy" }; throw new TypeError("proxy down"); }
+    return rf3(input, init);
+  });
+  const wallTry = "try { const r = await fetch('https://wall4.example/x'); console.log('got ' + await r.text()) } catch (e) { console.log(e.message) }";
+  check("blocked host, all proxies down: remembered", await run("javascript", wallTry, {}, fast), (s) => s.includes("Could not reach wall4.example") && s.includes("direct request failed"));
+  check("blocked host: memo kind is blocked", globalThis.__crHostHealth["wall4.example"].k, "b");
+  wallHits = 0; wallProxyHits = 0;
+  await run("javascript", wallTry, {}, fast);
+  check("blocked host re-probe: one direct + one proxy wave only", wallHits === 1 && wallProxyHits >= 1 && wallProxyHits <= 3, true);
+  proxiesUp = true;
+  check("blocked host: a proxy answering the re-probe recovers it", await run("javascript", wallTry, {}, fast), "got via-proxy");
+  check("blocked host: memo cleared after proxy recovery", globalThis.__crHostHealth["wall4.example"], undefined);
+  useFetch(rf3);
+
+  // urllib3 (behind Python requests) always passes an AbortSignal, even with no
+  // timeout set: the plugin's cap must still apply, and the proxies must still run
+  run._prev = undefined; freshSandbox(); useFetch(slowFetch);
+  directHits = 0; proxyHits = 0;
+  const t1 = Date.now();
+  const sigOut = await run("javascript", "const ac = new AbortController(); try { await fetch('https://slow.example/s.jpg', { signal: ac.signal }) } catch (e) { console.log(e.message) }", {}, fast);
+  check("caller signal (never aborted): plugin timeout still caps the direct request", Date.now() - t1 < 1500 && directHits === 1, true);
+  check("caller signal (never aborted): proxies still tried", proxyHits >= 3, true);
+  check("caller signal (never aborted): reported as a timeout", sigOut, (s) => s.includes("timed out after 0.1 s"));
+
+  // ...but a caller whose own signal fires first keeps its deadline: no proxies, no memo
+  run._prev = undefined; freshSandbox(); useFetch(slowFetch);
+  directHits = 0; proxyHits = 0;
+  const t2 = Date.now();
+  const ownOut = await run("javascript", "const ac = new AbortController(); setTimeout(() => ac.abort(), 120); try { await fetch('https://slow.example/t.jpg', { signal: ac.signal }) } catch (e) { console.log(e.name) }", {}, { fetchTimeoutMs: "5000" });
+  check("caller abort first: surfaces as AbortError quickly", ownOut === "AbortError" && Date.now() - t2 < 1500, true);
+  check("caller abort first: no proxies, no memo", proxyHits === 0 && !(globalThis.__crHostHealth && globalThis.__crHostHealth["slow.example"]), true);
+  useFetch(rf3);
+
   // a plain transport failure (CORS block) still gets its one direct retry
   run._prev = undefined; freshSandbox();
   let corsHits = 0;

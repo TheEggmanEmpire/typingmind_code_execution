@@ -154,7 +154,9 @@ function deadHost(host) {
   if (!(Date.now() - h.t < DEAD_HOST_TTL_MS)) { delete hostHealth()[host]; return null; }
   return h;
 }
-function markDead(host, why) { if (host) hostHealth()[host] = { t: Date.now(), why }; netNote(host, why); }
+// k: "t" = the host never answered (timeout), "b" = it was blocked (CORS/reset)
+// and the proxies failed too. A blocked host is re-probed through a proxy wave.
+function markDead(host, why, k) { if (host) hostHealth()[host] = { t: Date.now(), why, k: k || "t" }; netNote(host, why); }
 function markAlive(host) { if (host && hostHealth()[host]) delete hostHealth()[host]; }
 // Per-run log of hosts that could not be reached; appended to the output so
 // the model learns what failed even when its own code swallowed the error.
@@ -174,12 +176,15 @@ function hostHealthSnapshot() {
   return Object.keys(out).length ? out : null;
 }
 
-// fetch with an AbortController timeout. Leaves a caller-supplied signal alone
-// (its deadline is the caller's choice) unless `hard` is set, in which case the
-// cap applies on top of the caller's signal.
-async function timedFetch(real, input, init, ms, hard) {
+// fetch with an AbortController timeout. The cap applies on top of a
+// caller-supplied signal: urllib3's emscripten backend (behind `requests`)
+// always passes a signal, even when the Python code set no timeout, so leaving
+// such requests uncapped would let a silent host hang the run. A caller whose
+// own signal fires keeps its deadline: fetchDirectThenProxies checks
+// init.signal.aborted and stops there instead of walking the proxies.
+async function timedFetch(real, input, init, ms) {
   init = init || {};
-  if (typeof AbortController !== "function" || (init.signal && !hard)) return real(input, init);
+  if (typeof AbortController !== "function") return real(input, init);
   const ac = new AbortController(), parent = init.signal;
   const onAbort = () => ac.abort();
   if (parent) { if (parent.aborted) onAbort(); else parent.addEventListener("abort", onAbort); }
@@ -220,8 +225,8 @@ function proxyHop(real, cand, init, ms, stats) {
 // outlives it. Non-idempotent requests (POST, PUT, ...) go one proxy at a time
 // so the target never sees the same write twice. Returns the winning Response
 // or null; stops as soon as the caller's own signal aborts.
-async function raceProxies(real, cands, init, stats) {
-  const deadline = Date.now() + proxyPhaseMs();
+async function raceProxies(real, cands, init, stats, budgetMs) {
+  const deadline = Date.now() + (budgetMs || proxyPhaseMs());
   const width = /^(get|head)$/i.test(init.method || "GET") ? PROXY_PARALLEL : 1;
   for (let i = 0; i < cands.length; i += width) {
     const left = deadline - Date.now();
@@ -261,16 +266,25 @@ async function fetchDirectThenProxies(real, input, init) {
   const host = hostOf(url);
   const dead = deadHost(host);
   if (dead) {
-    try { const r = await timedFetch(real, input, init, deadHostProbeMs(), true); markAlive(host); return r; }
-    catch (e) {
-      if (init.signal && init.signal.aborted) throw e;
-      const age = Math.max(1, Math.round((Date.now() - dead.t) / 1000));
-      const left = Math.max(1, Math.ceil((DEAD_HOST_TTL_MS - (Date.now() - dead.t)) / 60000));
-      const why = "unreachable " + age + " s ago (" + dead.why + "); a " + (deadHostProbeMs() / 1000) +
-        " s re-probe also failed. Requests to it fail fast for ~" + left + " more min - use a different host or URL.";
-      netNote(host, why);
-      throw netError(host, why, e);
+    // Known-bad host: one short direct probe; a host that was blocked (not
+    // silent) also gets one short proxy wave, since the proxies were its only
+    // viable path. Anything answering clears the memo.
+    let probeErr;
+    try { const r = await timedFetch(real, input, init, deadHostProbeMs()); markAlive(host); return r; }
+    catch (e) { probeErr = e; }
+    if (init.signal && init.signal.aborted) throw probeErr;
+    if (dead.k === "b") {
+      const cands = proxyCandidates(url).slice(0, PROXY_PARALLEL);   // one wave, one probe budget
+      const r = cands.length && await raceProxies(real, cands, init, { tried: 0, timeouts: 0, http: 0, errors: 0, skipped: 0 }, deadHostProbeMs());
+      if (r) { markAlive(host); return r; }
+      if (init.signal && init.signal.aborted) throw probeErr;
     }
+    const age = Math.max(1, Math.round((Date.now() - dead.t) / 1000));
+    const left = Math.max(1, Math.ceil((DEAD_HOST_TTL_MS - (Date.now() - dead.t)) / 60000));
+    const why = "unreachable " + age + " s ago (" + dead.why + "); a " + (deadHostProbeMs() / 1000) +
+      " s re-probe also failed. Requests to it fail fast for ~" + left + " more min - use a different host or URL.";
+    netNote(host, why);
+    throw netError(host, why, probeErr);
   }
   let e1;
   try { return await timedFetch(real, input, init); } catch (e) { e1 = e; }
@@ -288,7 +302,7 @@ async function fetchDirectThenProxies(real, input, init) {
                         : "direct request failed (" + (e1 && e1.message || e1) + ")") +
     "; " + stats.tried + " CORS proxies failed (" + describeStats(stats) + "). Remembered for " +
     (DEAD_HOST_TTL_MS / 60000) + " min: further requests to this host fail fast - use a different host or URL.";
-  markDead(host, why);
+  markDead(host, why, timedOut ? "t" : "b");
   throw netError(host, why, e1);
 }
 
@@ -362,7 +376,7 @@ function patchXHR() {
         if (this.status >= 200 && this.status < 300) return;   // a proxy answered
       } catch (e) { err = e; }
     }
-    if (cands.length) markDead(host, "direct request failed; " + cands.length + " CORS proxies failed. Remembered for " + (DEAD_HOST_TTL_MS / 60000) + " min: further requests to this host fail fast - use a different host or URL.");
+    if (cands.length) markDead(host, "direct request failed; " + cands.length + " CORS proxies failed. Remembered for " + (DEAD_HOST_TTL_MS / 60000) + " min: further requests to this host fail fast - use a different host or URL.", "b");
     if (err) throw err;   // nothing worked: surface the original failure
     throw netError(host, "direct request and " + cands.length + " CORS proxies failed", null);
   };
@@ -575,7 +589,7 @@ async function restoreState(prev) {
   if (snap.net && snap.net.hosts && typeof snap.net.hosts === "object") {
     const hh = hostHealth();
     for (const [host, rec] of Object.entries(snap.net.hosts)) {
-      if (rec && typeof rec.t === "number" && Date.now() - rec.t < DEAD_HOST_TTL_MS) hh[host] = { t: rec.t, why: String(rec.why || "unreachable") };
+      if (rec && typeof rec.t === "number" && Date.now() - rec.t < DEAD_HOST_TTL_MS) hh[host] = { t: rec.t, why: String(rec.why || "unreachable"), k: rec.k === "b" ? "b" : "t" };
     }
   }
   const db = (snap.files || []).find(([p]) => p === "data.sqlite");

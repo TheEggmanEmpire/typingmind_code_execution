@@ -41,13 +41,17 @@ Toolchains (Compiler Explorer): gcc 14.2, rustc 1.82, Go 1.26, Ruby 4.0, JDK 25,
   (Authorization/cookie), and only while a run is executing. Traffic through any proxy is visible to its operator.
 - The optional **CORS proxy override** setting puts your own proxy first (prefix like `https://corsproxy.io/?url=`,
   or any URL containing `{url}`); the built-ins remain as further fallbacks.
-- **Unreachable hosts fail fast.** A request goes direct first (30 s timeout, configurable with the **HTTP request timeout (ms)** setting);
-  a timeout gets no second direct attempt (a CORS block or reset gets one immediate retry). Then the proxies are
-  raced three at a time with a 15 s per-hop timeout inside a 45 s budget, so the worst case for one URL is
-  ~75 s instead of minutes. A host that fails every path is remembered for 3 minutes (also across calls, in the
-  state trailer): later requests to it get one 5 s direct probe and no proxy walk, and the error says so. A probe
-  that answers clears the memo. Hosts that failed during a run are listed under the output as `(network: host - why)`,
-  even if the script caught the exception, so the model switches host instead of retrying.
+- **Unreachable hosts fail fast.** A request goes direct first (30 s cap, configurable with the **HTTP request
+  timeout (ms)** setting; it applies even when the caller passed its own signal, as Python `requests` always does).
+  A timeout gets no second direct attempt (a CORS block or reset gets one immediate retry). Then the proxies are
+  raced three at a time (one at a time for POST/PUT, so a write never reaches the target twice) with a 15 s per-hop
+  timeout under a hard 45 s deadline, so the worst case for one URL is ~75 s instead of minutes. A caller's own
+  timeout (`requests.get(url, timeout=15)`) ends the whole attempt, proxies included.
+- **Dead-host memo.** A host that fails every path is remembered for 3 minutes (also across calls, in the state
+  trailer). Later requests to it get one 5 s direct probe (plus one 5 s wave of three proxies if the host was
+  blocked rather than silent) and the error says so. A probe that answers clears the memo. Hosts that failed
+  during a run are listed under the output as `(network: host - why)`, even if the script caught the exception,
+  so the model switches host instead of retrying.
 - Write network code defensively: wrap each request in `try/except`, pass `timeout=15`, and fall through to the
   next candidate URL. A page whose images load via JavaScript has none in its raw HTML - look for `data-src`,
   `srcset`, `og:image` or JSON inside `<script>` first.
