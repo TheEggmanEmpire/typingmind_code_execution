@@ -41,6 +41,16 @@ Toolchains (Compiler Explorer): gcc 14.2, rustc 1.82, Go 1.26, Ruby 4.0, JDK 25,
   (Authorization/cookie), and only while a run is executing. Traffic through any proxy is visible to its operator.
 - The optional **CORS proxy override** setting puts your own proxy first (prefix like `https://corsproxy.io/?url=`,
   or any URL containing `{url}`); the built-ins remain as further fallbacks.
+- **Unreachable hosts fail fast.** A request goes direct first (30 s timeout, configurable with the **HTTP request timeout (ms)** setting);
+  a timeout gets no second direct attempt (a CORS block or reset gets one immediate retry). Then the proxies are
+  raced three at a time with a 15 s per-hop timeout inside a 45 s budget, so the worst case for one URL is
+  ~75 s instead of minutes. A host that fails every path is remembered for 3 minutes (also across calls, in the
+  state trailer): later requests to it get one 5 s direct probe and no proxy walk, and the error says so. A probe
+  that answers clears the memo. Hosts that failed during a run are listed under the output as `(network: host - why)`,
+  even if the script caught the exception, so the model switches host instead of retrying.
+- Write network code defensively: wrap each request in `try/except`, pass `timeout=15`, and fall through to the
+  next candidate URL. A page whose images load via JavaScript has none in its raw HTML - look for `data-src`,
+  `srcset`, `og:image` or JSON inside `<script>` first.
 - There is no container behind the runner: Python runs as WASM inside the browser tab. Raw sockets, DNS and ping
   do not exist there. Emscripten hands out fake `172.29.x.x` addresses and every `connect()` fails with
   `Host is unreachable`, so socket-level probes prove nothing. HTTP through the browser is the only path.
@@ -102,9 +112,16 @@ call downloads it and rebuilds the workspace.
 **Two separate "uploads" - don't confuse them:**
 
 - **`serve_file` uploads nothing.** It embeds the file as a `data:` URI directly in the chat message. That is
-  the only "serving" path.
+  the only "serving" path. Do not upload results to third-party file hosts (0x0.st, catbox.moe, ...): most reject
+  browser/CORS uploads or hang until the timeout, and the user cannot see what the model uploaded anyway.
 - **The bin offload is not serving.** It uploads the workspace snapshot solely to carry it from one tool call
   to the next (the sandbox is destroyed between calls), and only when the snapshot exceeds the inline limit.
+
+### Missing files
+
+A `FileNotFoundError` (Python) or `ENOENT` (JavaScript `fs`) on a `/workspace` path appends an inventory of the
+workspace to the error - which files exist and their sizes, or a note that it is empty. The usual cause is a
+download step that failed earlier: files exist only if the step that wrote them succeeded.
 
 ### Serving files back to the user
 

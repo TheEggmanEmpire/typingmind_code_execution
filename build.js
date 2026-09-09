@@ -36,7 +36,8 @@ const runCodeSpec = {
           "Any number of files is fine; within one call /workspace is limited only by browser memory (tens-hundreds of MB). Files, the SQL database and JS storage also persist across separate calls (carried in the tool output, or offloaded to an ephemeral bin when large); for heavy multi-file work prefer a single call. " +
           "sql keeps its tables between calls; python can open the same database with `sqlite3.connect('/workspace/data.sqlite')`. Delete data.sqlite to reset it. " +
           "Internet: python `requests.get/post`, `urllib.request.urlopen`, `await pyodide.http.pyfetch`; javascript `fetch`. Binary download example (js): `const b=new Uint8Array(await (await fetch(url)).arrayBuffer()); await fs.writeFile('f.bin', b)`. " +
-          "Install Python packages inline: `import micropip; await micropip.install('pkg')` (top-level await allowed)."
+          "Install Python packages inline: `import micropip; await micropip.install('pkg')` (top-level await allowed). " +
+          "Network failures: requests can time out or fail - wrap EVERY request in try/except, pass timeout=15 to requests.get, and move on to the next candidate URL/host instead of letting the script die. A host that fails direct + proxies is remembered for ~3 min and later requests to it fail within seconds (the output lists such hosts under `(network: ...)`): do not retry it, switch host. Raw HTML of a JS-rendered page has no content - check data-src/srcset/og:image/JSON in <script> before concluding a page has no images. A FileNotFoundError shows what /workspace really contains; a file exists only if the step that wrote it succeeded. To hand a file to the user call serve_file; never upload to third-party file hosts (0x0.st, catbox, ...) - the browser cannot reach them."
       },
       packages: {
         type: "array",

@@ -30,12 +30,13 @@ globalThis.fetch = async (input, init) => {
 
 // Fake XMLHttpRequest (sync) to exercise the proxy-fallback patch.
 const xhrLog = [];
+let xhrFailAll = false;   // when set, every sync XHR fails (host and all proxies dead)
 class FakeXHR {
   open(method, url, async, user, pw) { this.method = method; this.url = url; this.async = async; this.headers = {}; this.status = 0; }
   setRequestHeader(k, v) { this.headers[k] = v; }
   send(body) {
     xhrLog.push({ url: this.url, headers: { ...this.headers }, async: this.async });
-    if (this.url.startsWith("https://blocked.example/")) { this.status = 0; throw new Error("NetworkError"); }
+    if (xhrFailAll || this.url.startsWith("https://blocked.example/")) { this.status = 0; throw new Error("NetworkError"); }
     this.status = 200; this.responseText = "xhr:" + this.url;
   }
 }
@@ -248,6 +249,7 @@ function freshSandbox() {
   globalThis.fetch = async (input, init) => {
     const url = typeof input === "string" ? input : input.url;
     if (url.startsWith("https://corsproxy.io/")) throw new TypeError("proxy 1 down");
+    if (url.startsWith("https://api.codetabs.com/")) throw new TypeError("proxy 3 down");
     if (url.startsWith("https://api.allorigins.win/")) return { ok: true, status: 200, text: async () => "via-allorigins" };
     if (url.startsWith("https://wall.example/")) throw new TypeError("Failed to fetch");
     return of2(input, init);
@@ -255,6 +257,130 @@ function freshSandbox() {
   delete globalThis.__crFetchPatched; delete globalThis.__crRealFetch;
   check("walks proxy list to a working one", await run("javascript", "const r = await fetch('https://wall.example/x'); console.log(await r.text())"), "via-allorigins");
   globalThis.fetch = of2;
+
+  // 12b. Host timeouts. A direct timeout gets no second direct attempt; proxies
+  // are raced in parallel under a bounded budget; the host is remembered so the
+  // next request - even in a fresh sandbox - fails fast without a proxy walk.
+  run._prev = undefined; freshSandbox();
+  const hang = (init) => new Promise((_, rej) => {
+    const sig = init && init.signal;
+    if (!sig) return rej(new Error("no abort signal: request would hang forever"));
+    const abort = () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }));
+    if (sig.aborted) abort(); else sig.addEventListener("abort", abort);
+  });
+  let directHits = 0, proxyHits = 0, inflight = 0, maxInflight = 0;
+  const rf3 = globalThis.fetch;
+  const slowFetch = (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (url.startsWith("https://slow.example/")) { directHits++; return hang(init); }
+    if (url.includes("slow.example")) {   // any proxy form ("q" encoded or "raw")
+      proxyHits++; inflight++; maxInflight = Math.max(maxInflight, inflight);
+      return hang(init).finally(() => inflight--);
+    }
+    return rf3(input, init);
+  };
+  const useFetch = (f) => { globalThis.fetch = f; delete globalThis.__crFetchPatched; delete globalThis.__crRealFetch; };
+  useFetch(slowFetch);
+  const fast = { fetchTimeoutMs: "100" };   // direct 100 ms, proxy hop 100 ms, proxy phase 300 ms
+  const tryFetch = "try { const r = await fetch('https://slow.example/a.jpg'); console.log('got ' + await r.text()) } catch (e) { console.log(e.message) }";
+  const t0 = Date.now();
+  const slow1 = await run("javascript", tryFetch, {}, fast);
+  const dt = Date.now() - t0;
+  check("timeout: error names the host and the timeout", slow1, (s) => s.includes("Could not reach slow.example") && s.includes("timed out after 0.1 s"));
+  check("timeout: no second direct attempt after a timeout", directHits, 1);
+  check("timeout: proxies raced in parallel", maxInflight >= 2, true);
+  check("timeout: proxy phase stops when its budget is spent", proxyHits >= 3 && proxyHits <= 10, true);
+  check("timeout: whole request bounded (direct + proxy phase)", dt < 1500, true);
+  check("timeout: network note under the output", slow1, (s) => s.includes("(network: slow.example - direct request timed out"));
+  check("timeout: host remembered as dead", !!(globalThis.__crHostHealth && globalThis.__crHostHealth["slow.example"]), true);
+
+  directHits = 0; proxyHits = 0;
+  const slow2 = await run("javascript", tryFetch.replace("a.jpg", "b.jpg"), {}, fast);
+  check("dead host: one quick probe, no proxy walk", directHits + "/" + proxyHits, "1/0");
+  check("dead host: message explains the fail-fast", slow2, (s) => s.includes("re-probe also failed") && s.includes("use a different host"));
+
+  freshSandbox(); useFetch(slowFetch);
+  directHits = 0; proxyHits = 0;
+  await run("javascript", tryFetch.replace("a.jpg", "c.jpg"), {}, fast);
+  check("dead host memo survives a fresh sandbox (carried in trailer)", directHits + "/" + proxyHits, "1/0");
+
+  useFetch((input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (url.startsWith("https://slow.example/")) { directHits++; return { ok: true, status: 200, text: async () => "back" }; }
+    return rf3(input, init);
+  });
+  check("recovered host answers on the probe", await run("javascript", tryFetch.replace("a.jpg", "d.jpg"), {}, fast), "got back");
+  check("recovered host: memo cleared", globalThis.__crHostHealth["slow.example"], undefined);
+  check("recovered host: no network note", /\(network:/.test(String(run._prev)), false);
+
+  // memo expires after its TTL: the full direct-then-proxy path runs again
+  run._prev = undefined; freshSandbox(); useFetch(slowFetch);
+  await run("javascript", tryFetch, {}, fast);
+  const now0 = Date.now;
+  Date.now = () => now0() + 4 * 60 * 1000;
+  freshSandbox(); useFetch(slowFetch);
+  directHits = 0; proxyHits = 0;
+  await run("javascript", tryFetch, {}, fast);
+  check("expired memo: proxies tried again", directHits === 1 && proxyHits >= 3, true);
+  Date.now = now0;
+  useFetch(rf3);
+
+  // non-idempotent requests walk the proxies one at a time (never two POSTs in flight)
+  run._prev = undefined; freshSandbox(); useFetch(slowFetch);
+  directHits = 0; proxyHits = 0; inflight = 0; maxInflight = 0;
+  await run("javascript", "try { await fetch('https://slow.example/up', { method: 'POST', body: 'x=1' }) } catch (e) { console.log(e.message) }", {}, fast);
+  check("post: proxies tried sequentially", maxInflight, 1);
+  check("post: still bounded by the phase budget", proxyHits >= 2 && proxyHits <= 4, true);
+
+  // the caller's own abort mid-race is not the host's fault: no memo
+  run._prev = undefined; freshSandbox();
+  useFetch((input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (url.startsWith("https://wall3.example/")) throw new TypeError("Failed to fetch");
+    if (url.includes("wall3.example")) return hang(init);
+    return rf3(input, init);
+  });
+  const abortMsg = await run("javascript", "const ac = new AbortController(); setTimeout(() => ac.abort(), 150); try { await fetch('https://wall3.example/x', { signal: ac.signal }) } catch (e) { console.log(e.message) }", {}, { fetchTimeoutMs: "5000" });
+  check("caller abort mid-race: original error surfaces", abortMsg, "Failed to fetch");
+  check("caller abort mid-race: host not marked dead", globalThis.__crHostHealth && globalThis.__crHostHealth["wall3.example"], undefined);
+  useFetch(rf3);
+
+  // a plain transport failure (CORS block) still gets its one direct retry
+  run._prev = undefined; freshSandbox();
+  let corsHits = 0;
+  useFetch((input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (url.startsWith("https://cors.example/")) { corsHits++; throw new TypeError("Failed to fetch"); }
+    return rf3(input, init);
+  });
+  check("cors block: proxied", await run("javascript", "const r = await fetch('https://cors.example/x'); console.log(await r.text())"),
+    "fetched:https://corsproxy.io/?url=" + encodeURIComponent("https://cors.example/x"));
+  check("cors block: direct tried twice", corsHits, 2);
+  check("cors block: host not marked dead", globalThis.__crHostHealth && globalThis.__crHostHealth["cors.example"], undefined);
+  useFetch(rf3);
+
+  // sync XHR (pyodide-http / urllib3 without JSPI): capped proxy walk, dead-host memo
+  run._prev = undefined; freshSandbox();
+  xhrLog.length = 0; xhrFailAll = true;
+  const xhrTry = "const x = new XMLHttpRequest(); x.open('GET', 'https://wall2.example/q', false); try { x.send(null); console.log('ok') } catch (e) { console.log(e.message) }";
+  await run("javascript", xhrTry);
+  check("xhr sync: proxy walk capped", xhrLog.length, 1 + 4);
+  check("xhr sync: host remembered", !!globalThis.__crHostHealth["wall2.example"], true);
+  xhrLog.length = 0;
+  const xs2 = await run("javascript", xhrTry);
+  check("xhr sync: dead host skips the proxies", xhrLog.length, 1);
+  check("xhr sync: dead host message", xs2, (s) => s.includes("Could not reach wall2.example"));
+  xhrFailAll = false;
+
+  // 12c. Missing files: the error carries a workspace inventory
+  run._prev = undefined; freshSandbox();
+  await run("python", "open('have.txt','w').write('x'); print('w')");
+  check("python FileNotFoundError lists the workspace", await run("python", "print(open('page.html').read())"),
+    (s) => s.includes("FileNotFoundError") && s.includes("/workspace contains 1 file: have.txt (1 B)"));
+  check("js missing file lists the workspace", await run("javascript", "await fs.readFile('page.html')"),
+    (s) => s.startsWith("JavaScript error:") && s.includes("/workspace contains 1 file"));
+  run._prev = undefined; freshSandbox();
+  check("empty workspace explained", await run("python", "open('nope.html').read()"), (s) => s.includes("/workspace is empty") && s.includes("never written"));
 
   // 13. Large-workspace offload to an ephemeral bin (mocked paste.rs)
   const bin = {};        // id -> payload

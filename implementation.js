@@ -124,40 +124,172 @@ function fetchTimeoutMs() {
   const n = Number(globalThis.__crFetchTimeout);
   return n > 0 ? n : 30000;
 }
-// Proxy hops get a shorter timeout so trying several never hangs the run.
-function proxyTimeoutMs() { return Math.min(fetchTimeoutMs(), 20000); }
+// Time budget for one request, worst case: direct (fetchTimeoutMs, default
+// 30 s) + the proxy phase (at most proxyPhaseMs, default 45 s). Proxies are
+// raced PROXY_PARALLEL at a time with a short per-hop timeout, so a wall of
+// dead proxies costs seconds, not minutes.
+const PROXY_PARALLEL = 3;
+function proxyTimeoutMs() { return Math.min(fetchTimeoutMs(), 15000); }
+function proxyPhaseMs()   { return Math.min(45000, 3 * proxyTimeoutMs()); }
+// A host that failed direct + proxies is remembered for a few minutes (also
+// across calls, via the state trailer). Later requests to it get one short
+// direct probe and no proxy walk, so a dead image CDN costs seconds per URL
+// instead of a full timeout cycle per URL.
+const DEAD_HOST_TTL_MS = 3 * 60 * 1000;
+function deadHostProbeMs() { return Math.min(fetchTimeoutMs(), 5000); }
+const XHR_SYNC_PROXY_MAX = 4;   // sync XHR has no timeout on the main thread: keep the walk short
 
-// fetch with an AbortController timeout. Leaves a caller-supplied signal alone.
-async function timedFetch(real, input, init, ms) {
-  init = init || {};
-  if (init.signal || typeof AbortController !== "function") return real(input, init);
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), ms || fetchTimeoutMs());
-  try { return await real(input, { ...init, signal: ac.signal }); }
-  finally { clearTimeout(t); }
+function hostOf(url) { try { return new URL(String(url)).host; } catch (e) { return ""; } }
+function isAbort(e) { return !!e && (e.name === "AbortError" || e.name === "TimeoutError"); }
+
+function hostHealth() {
+  if (!globalThis.__crHostHealth || typeof globalThis.__crHostHealth !== "object") globalThis.__crHostHealth = {};
+  return globalThis.__crHostHealth;
+}
+// Live (non-expired) record for a host, or null.
+function deadHost(host) {
+  if (!host) return null;
+  const h = hostHealth()[host];
+  if (!h) return null;
+  if (!(Date.now() - h.t < DEAD_HOST_TTL_MS)) { delete hostHealth()[host]; return null; }
+  return h;
+}
+function markDead(host, why) { if (host) hostHealth()[host] = { t: Date.now(), why }; netNote(host, why); }
+function markAlive(host) { if (host && hostHealth()[host]) delete hostHealth()[host]; }
+// Per-run log of hosts that could not be reached; appended to the output so
+// the model learns what failed even when its own code swallowed the error.
+function netNote(host, why) {
+  if (!globalThis.__crNetLog) globalThis.__crNetLog = new Map();
+  if (host && !globalThis.__crNetLog.has(host)) globalThis.__crNetLog.set(host, why);
+}
+function netError(host, why, cause) {
+  const e = new TypeError("Could not reach " + (host || "host") + ": " + why);
+  if (cause) e.cause = cause;
+  return e;
+}
+// Snapshot of remembered-dead hosts for the state trailer (expired ones dropped).
+function hostHealthSnapshot() {
+  const out = {}, hh = hostHealth();
+  for (const host of Object.keys(hh)) if (deadHost(host)) out[host] = hh[host];
+  return Object.keys(out).length ? out : null;
 }
 
-// Direct first (with timeout + one retry on transport failure). If that throws
-// - a CORS block throws - walk the proxy candidates and return the first that
-// answers with a 2xx. A real HTTP response (even 4xx/5xx) is returned as-is and
-// never triggers a proxy hop.
+// fetch with an AbortController timeout. Leaves a caller-supplied signal alone
+// (its deadline is the caller's choice) unless `hard` is set, in which case the
+// cap applies on top of the caller's signal.
+async function timedFetch(real, input, init, ms, hard) {
+  init = init || {};
+  if (typeof AbortController !== "function" || (init.signal && !hard)) return real(input, init);
+  const ac = new AbortController(), parent = init.signal;
+  const onAbort = () => ac.abort();
+  if (parent) { if (parent.aborted) onAbort(); else parent.addEventListener("abort", onAbort); }
+  const t = setTimeout(onAbort, ms || fetchTimeoutMs());
+  try { return await real(input, { ...init, signal: ac.signal }); }
+  finally { clearTimeout(t); if (parent) parent.removeEventListener("abort", onAbort); }
+}
+
+// One proxy hop with its own timeout, linked to the caller's signal if any.
+// Resolves {r} on a 2xx, null otherwise (never rejects); `abort` cancels it.
+function proxyHop(real, cand, init, ms, stats) {
+  const ac = typeof AbortController === "function" ? new AbortController() : null;
+  const parent = init.signal;
+  const onAbort = () => ac && ac.abort();
+  if (parent && ac) { if (parent.aborted) onAbort(); else parent.addEventListener("abort", onAbort); }
+  const t = setTimeout(onAbort, ms);
+  let won = false;
+  // A winner stays linked to the caller's signal so a later caller abort still cancels its body.
+  const cleanup = () => { clearTimeout(t); if (!won && parent && ac) parent.removeEventListener("abort", onAbort); };
+  stats.tried++;
+  const promise = Promise.resolve()
+    .then(() => real(cand.url, ac ? { ...init, signal: ac.signal } : init))
+    .then(async (r) => {
+      if (!(r && r.status >= 200 && r.status < 300)) { stats.http++; return null; }
+      if (cand.wrap === "json") {   // e.g. whateverorigin: {"contents": "...", "status": {...}}
+        try { const j = await r.json(); if (j && typeof j.contents === "string") { won = true; return { r: new Response(j.contents, { status: 200 }) }; } } catch (e) {}
+        stats.errors++; return null;
+      }
+      won = true;
+      return { r };
+    }, (e) => { if (isAbort(e)) stats.timeouts++; else stats.errors++; return null; })
+    .finally(cleanup);
+  return { promise, abort: onAbort };
+}
+
+// Race the proxy candidates PROXY_PARALLEL at a time; the first 2xx wins and
+// the rest of its wave is aborted. The phase budget is a hard deadline: no hop
+// outlives it. Non-idempotent requests (POST, PUT, ...) go one proxy at a time
+// so the target never sees the same write twice. Returns the winning Response
+// or null; stops as soon as the caller's own signal aborts.
+async function raceProxies(real, cands, init, stats) {
+  const deadline = Date.now() + proxyPhaseMs();
+  const width = /^(get|head)$/i.test(init.method || "GET") ? PROXY_PARALLEL : 1;
+  for (let i = 0; i < cands.length; i += width) {
+    const left = deadline - Date.now();
+    if (left <= 0 || (init.signal && init.signal.aborted)) { stats.skipped = cands.length - i; break; }
+    const hops = cands.slice(i, i + width).map((c) => proxyHop(real, c, init, Math.min(proxyTimeoutMs(), left), stats));
+    const win = await new Promise((resolve) => {
+      let left = hops.length;
+      hops.forEach((h) => h.promise.then((v) => { if (v) resolve({ hop: h, r: v.r }); else if (--left === 0) resolve(null); }));
+    });
+    if (win) { for (const h of hops) if (h !== win.hop) h.abort(); return win.r; }
+  }
+  return null;
+}
+
+function describeStats(stats) {
+  const parts = [];
+  if (stats.timeouts) parts.push(stats.timeouts + " timed out");
+  if (stats.http) parts.push(stats.http + " returned an error status");
+  if (stats.errors) parts.push(stats.errors + " failed");
+  if (stats.skipped) parts.push(stats.skipped + " skipped, time budget spent");
+  return parts.join(", ");
+}
+
+// Direct first. A transport failure that is not a timeout (CORS block, DNS,
+// reset) gets one immediate retry; a timeout does not - waiting twice for a
+// host that does not answer only doubles the loss. If direct fails, the proxy
+// candidates are raced (see raceProxies). A real HTTP response (even 4xx/5xx)
+// is returned as-is and never triggers a proxy hop. A host that fails every
+// path is remembered (markDead) so the next request to it fails fast.
 async function fetchDirectThenProxies(real, input, init) {
   const url = typeof input === "string" ? input : (input && input.url) || String(input);
-  try { return await timedFetch(real, input, init); }
-  catch (e1) {
-    try { return await timedFetch(real, input, init); }
-    catch (e2) {
-      let last = e2;
-      for (const cand of proxyCandidates(url)) {
-        try {
-          const r = await timedFetch(real, cand.url, init, proxyTimeoutMs());
-          if (r && (r.ok || (r.status >= 200 && r.status < 300))) return r;
-          last = new Error("proxy returned HTTP " + (r && r.status));
-        } catch (e) { last = e; }
-      }
-      throw last;
+  init = init || {};
+  if (typeof Request === "function" && input instanceof Request) {
+    if (!init.method) init = { ...init, method: input.method };
+    if (!init.headers) init = { ...init, headers: input.headers };
+  }
+  const host = hostOf(url);
+  const dead = deadHost(host);
+  if (dead) {
+    try { const r = await timedFetch(real, input, init, deadHostProbeMs(), true); markAlive(host); return r; }
+    catch (e) {
+      if (init.signal && init.signal.aborted) throw e;
+      const age = Math.max(1, Math.round((Date.now() - dead.t) / 1000));
+      const left = Math.max(1, Math.ceil((DEAD_HOST_TTL_MS - (Date.now() - dead.t)) / 60000));
+      const why = "unreachable " + age + " s ago (" + dead.why + "); a " + (deadHostProbeMs() / 1000) +
+        " s re-probe also failed. Requests to it fail fast for ~" + left + " more min - use a different host or URL.";
+      netNote(host, why);
+      throw netError(host, why, e);
     }
   }
+  let e1;
+  try { return await timedFetch(real, input, init); } catch (e) { e1 = e; }
+  if (init.signal && init.signal.aborted) throw e1;   // the caller's own deadline: not ours to work around
+  const timedOut = isAbort(e1);
+  if (!timedOut) { try { return await timedFetch(real, input, init); } catch (e) { e1 = e; } }
+  const cands = proxyCandidates(url);
+  const streamBody = typeof ReadableStream === "function" && init.body instanceof ReadableStream;
+  if (!cands.length || streamBody) throw e1;
+  const stats = { tried: 0, timeouts: 0, http: 0, errors: 0, skipped: 0 };
+  const r = await raceProxies(real, cands, init, stats);
+  if (r) return r;
+  if (init.signal && init.signal.aborted) throw e1;   // caller gave up mid-race: not the host's fault
+  const why = (timedOut ? "direct request timed out after " + (fetchTimeoutMs() / 1000) + " s"
+                        : "direct request failed (" + (e1 && e1.message || e1) + ")") +
+    "; " + stats.tried + " CORS proxies failed (" + describeStats(stats) + "). Remembered for " +
+    (DEAD_HOST_TTL_MS / 60000) + " min: further requests to this host fail fast - use a different host or URL.";
+  markDead(host, why);
+  throw netError(host, why, e1);
 }
 
 async function netFetch(input, init) {
@@ -212,10 +344,16 @@ function patchXHR() {
   P.send = function (body) {
     const r = this.__cr;
     if (!r || !r.sync || !globalThis.__crRunning) return send.call(this, body);
+    const host = hostOf(r.url), dead = deadHost(host);
     let err = null;
     try { send.call(this, body); } catch (e) { err = e; }
-    if (!err && this.status !== 0) return;   // direct request already answered
-    const cands = proxyCandidates(r.url);
+    if (!err && this.status !== 0) { markAlive(host); return; }   // direct request already answered
+    if (dead) {   // known-bad host: no proxy walk, fail now
+      const why = "unreachable " + Math.max(1, Math.round((Date.now() - dead.t) / 1000)) + " s ago (" + dead.why + "); direct retry failed again - use a different host or URL.";
+      netNote(host, why);
+      throw netError(host, why, err);
+    }
+    const cands = proxyCandidates(r.url).filter((c) => !c.wrap).slice(0, XHR_SYNC_PROXY_MAX);
     for (const cand of cands) {
       try {
         open.call(this, r.method, cand.url, false, r.user, r.pw);
@@ -224,7 +362,9 @@ function patchXHR() {
         if (this.status >= 200 && this.status < 300) return;   // a proxy answered
       } catch (e) { err = e; }
     }
+    if (cands.length) markDead(host, "direct request failed; " + cands.length + " CORS proxies failed. Remembered for " + (DEAD_HOST_TTL_MS / 60000) + " min: further requests to this host fail fast - use a different host or URL.");
     if (err) throw err;   // nothing worked: surface the original failure
+    throw netError(host, "direct request and " + cands.length + " CORS proxies failed", null);
   };
   P.__crPatched = true;
 }
@@ -387,7 +527,9 @@ async function snapshotPacked() {
   const dbDeleted = py && globalThis.__sqlBytes && globalThis.__sqlBytes.length && !py.FS.analyzePath(DB_FILE).exists;
   if (dbDeleted) { globalThis.__sqlBytes = null; globalThis.__sqlSynced = false; }
   if (!hasDb && globalThis.__sqlBytes && globalThis.__sqlBytes.length) snap.sql = bytesToBase64(globalThis.__sqlBytes);
-  if (!snap.files.length && !snap.sql && !Object.keys(snap.kv).length) return null;
+  const hosts = hostHealthSnapshot();
+  if (hosts) snap.net = { hosts };
+  if (!snap.files.length && !snap.sql && !snap.net && !Object.keys(snap.kv).length) return null;
   return packBytes(new TextEncoder().encode(JSON.stringify(snap)));
 }
 
@@ -430,6 +572,12 @@ async function restoreState(prev) {
   }
   globalThis.__crSnapshot = snap;
   globalThis.__crKV = new Map(Object.entries(snap.kv || {}));
+  if (snap.net && snap.net.hosts && typeof snap.net.hosts === "object") {
+    const hh = hostHealth();
+    for (const [host, rec] of Object.entries(snap.net.hosts)) {
+      if (rec && typeof rec.t === "number" && Date.now() - rec.t < DEAD_HOST_TTL_MS) hh[host] = { t: rec.t, why: String(rec.why || "unreachable") };
+    }
+  }
   const db = (snap.files || []).find(([p]) => p === "data.sqlite");
   if (db) globalThis.__sqlBytes = base64ToBytes(db[1]);
   else if (snap.sql) globalThis.__sqlBytes = base64ToBytes(snap.sql);
@@ -490,6 +638,36 @@ function readWorkspaceFile(path) {
 }
 
 function mdEscape(s) { return String(s).replace(/([\\`*_\[\]()])/g, "\\$1"); }
+
+// One-line inventory of /workspace, appended to "file not found" errors so the
+// model sees at once which files really exist (a failed download in an earlier
+// step is the usual cause) instead of guessing.
+function workspaceListing(limit) {
+  const py = globalThis.__py, rows = [];
+  try {
+    if (py && py.FS.analyzePath(WORKDIR).exists) {
+      const walk = (dir) => {
+        for (const name of py.FS.readdir(dir)) {
+          if (name === "." || name === "..") continue;
+          const p = dir + "/" + name, st = py.FS.stat(p);
+          if (py.FS.isDir(st.mode)) walk(p);
+          else rows.push(p.slice(WORKDIR.length + 1) + " (" + (st.size < 1024 ? st.size + " B" : Math.ceil(st.size / 1024) + " KB") + ")");
+        }
+      };
+      walk(WORKDIR);
+    } else if (globalThis.__crSnapshot) {
+      for (const [rel, b64] of globalThis.__crSnapshot.files || []) rows.push(rel + " (" + Math.ceil(b64.length * 3 / 4 / 1024) + " KB)");
+    }
+  } catch (e) {}
+  if (!rows.length) return "(/workspace is empty. The file was never written - check that the earlier download/write step actually succeeded before reading its result.)";
+  const shown = rows.slice(0, limit || 40);
+  return "(/workspace contains " + rows.length + " file" + (rows.length === 1 ? "" : "s") + ": " + shown.join(", ") +
+    (rows.length > shown.length ? ", ..." : "") + ". Files are only there if the step that wrote them succeeded.)";
+}
+const FILE_MISSING_RE = /FileNotFoundError|No such file or directory|ENOENT/;
+function isMissingFileError(e) {
+  return FILE_MISSING_RE.test(String(e && e.message || e)) || (e && e.errno === 44);
+}
 
 // ---------------------------------------------------------------------------
 // Python (Pyodide)
@@ -563,7 +741,11 @@ async function runPython(code, packages) {
   if (globalThis.__pyHttpNote && /urllib/.test(code)) out.push(globalThis.__pyHttpNote);
   let v;
   try { v = await py.runPythonAsync(code); }
-  catch (e) { out.push("Python error:\n" + (e.message || e)); return out.join("\n").trim(); }
+  catch (e) {
+    out.push("Python error:\n" + (e.message || e));
+    if (isMissingFileError(e)) out.push(workspaceListing());
+    return out.join("\n").trim();
+  }
   if (v !== undefined && v !== null) out.push(String(v));
   return out.join("\n").trim();
 }
@@ -634,7 +816,10 @@ async function runJavaScript(code) {
     const fn = new Function("console", "fetch", "fs", "storage", "return (async () => {" + code + "\n})()");
     const v = await fn({ log, info: log, warn: log, error: log, debug: log }, netFetch, fsAsync, getStorage());
     if (v !== undefined) out.push(fmt(v));
-  } catch (e) { out.push("JavaScript error:\n" + (e.message || e)); }
+  } catch (e) {
+    out.push("JavaScript error:\n" + (e.message || e));
+    if (isMissingFileError(e)) out.push(workspaceListing());
+  }
   return out.join("\n").trim();
 }
 
@@ -768,6 +953,15 @@ async function serve_file(params, userSettings, resources) {
   return trailer ? md + "\n\n<!--[[cr-state:" + trailer + "]]-->" : md;
 }
 
+// Hosts that could not be reached during this run, as a note under the output.
+// The model's own try/except may have swallowed the error; this keeps the
+// failure (and the fail-fast memo) visible so it moves to another host.
+function networkNote() {
+  const log = globalThis.__crNetLog;
+  if (!log || !log.size) return "";
+  return "\n\n(network: " + [...log].map(([h, why]) => h + " - " + why).join("\n network: ") + ")";
+}
+
 async function run_code(params, userSettings, resources) {
   const { language, code, packages } = params;
   if (!code || !code.trim()) throw new Error("No code was provided.");
@@ -790,6 +984,7 @@ async function run_code(params, userSettings, resources) {
 
   patchFetch();
   patchXHR();
+  globalThis.__crNetLog = new Map();
   globalThis.__crRunning = (globalThis.__crRunning || 0) + 1;
   let out;
   try {
@@ -803,6 +998,7 @@ async function run_code(params, userSettings, resources) {
     globalThis.__crRunning--;
   }
   out = out && out.length ? out : "(no output - did you print the result?)";
+  out += networkNote();
   if (!carry) return out;
   let packed = null;
   try { packed = await snapshotPacked(); } catch (e) {}
