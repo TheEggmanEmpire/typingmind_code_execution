@@ -1,131 +1,108 @@
-## Code Runner (multi-language)
+## Code Runner
 
-Runs code in 12 languages and returns the output to the AI. No API key. No server.
+Lets the AI run code and hand files back to you. 34 languages, no API key, no server of your own required.
 
-- **python** - Pyodide (WASM, in-browser). numpy/pandas auto-load from imports; other PyPI packages via `packages` (see below).
-- **javascript** - runs in the plugin sandbox.
-- **sql** - SQLite via sql.js (WASM, in-browser).
-- **c, c++, rust, go, ruby, java, csharp, haskell, lua** - Compiler Explorer (godbolt.org) public API.
+| Where | Languages | Internet | Files (`/workspace`) |
+|---|---|---|---|
+| In your browser (WASM) | **python** (Pyodide, Python 3.13), **javascript**, **typescript**, **sql** (SQLite) | yes, over HTTP | yes, shared and kept between calls |
+| Compiler Explorer (godbolt.org) | c, c++, rust, go, java, kotlin, csharp, fsharp, swift, zig, d, haskell, ocaml, ruby, perl, lua, dart, fortran, pascal, crystal, julia, cobol, ada, objc | no | no |
+| Wandbox (best effort) | bash, php, r, scala, nim, elixir | no | no |
 
-First Python call takes ~5-15 s while the runtime downloads. Java: do not declare the class `public`.
+Two functions:
 
-### CDN fallback
+- **run_code** runs a program and returns its output to the AI.
+- **serve_file** shows a file from `/workspace` to you in the chat: images inline, small text as a code block,
+  anything else (PDF, XLSX, ZIP, ...) as a download link. The bytes never pass through the AI's context.
 
-Runtimes are fetched from a list of CDNs in order; the first one that answers wins. A CDN that fails or
-stalls (30 s for the loader script, 180 s for the runtime download) is skipped.
+### Recommended setup (5 minutes, free)
 
-- Pyodide: `cdn.jsdelivr.net` → `fastly.jsdelivr.net` → `gcore.jsdelivr.net` → `testingcf.jsdelivr.net` →
-  `unpkg.com` (core runtime only; wheels are still fetched from jsDelivr).
-- sql.js: `cdn.jsdelivr.net` → `fastly.jsdelivr.net` → `unpkg.com` → `gcore.jsdelivr.net`.
-- The optional **Pyodide CDN** / **sql.js CDN** plugin settings put a self-hosted or regional mirror first.
-- Works in a plain page and in a Web Worker (no DOM), so the same code runs in desktop, mobile and headless browsers.
+Browsers only let a page read other websites that explicitly allow it (CORS). Most don't, and the free public
+CORS proxies that used to work around this are nearly all gone. For reliable downloads, deploy the small
+companion Cloudflare Worker from the `worker/` folder of this plugin's repository (see `worker/README.md`),
+then set:
 
-Toolchains (Compiler Explorer): gcc 14.2, rustc 1.82, Go 1.26, Ruby 4.0, JDK 25, .NET 9 (Mono), GHC 9.8, Lua 5.5.
+- **Personal CORS proxy**: `https://<worker>.<account>.workers.dev/?key=<PROXY_KEY>&url=`
+- **Workspace store**: `https://<worker>.<account>.workers.dev/store?key=<PROXY_KEY>`
 
-### Python packages
+Without the Worker everything still runs; downloads from sites that block browsers fall back to a few public
+proxies (text usually works, binary files often don't), and large workspaces use public temporary stores.
 
-- numpy, pandas, scipy, matplotlib, requests and other packages Pyodide ships auto-load from `import` lines.
-- Anything else: pass `packages: ["beautifulsoup4", "pyyaml"]` (micropip) or install inline with
-  `import micropip; await micropip.install("pkg")`.
-- Installs are temporary: they live in the in-browser runtime for the session and vanish on page reload.
-- Pure-Python wheels and Pyodide-prebuilt packages only. Packages with native code that Pyodide does not build cannot be installed.
+### How it runs
+
+- Every call starts fresh (TypingMind runs each plugin call in a new sandbox). **Variables do not survive
+  between calls; files in `/workspace` do.**
+- Python, JavaScript, TypeScript and SQL run in a background worker. A run that exceeds its time limit
+  (default 120 s, **Run time limit** setting or a per-call `timeout`) is stopped cleanly: the output printed so far
+  is kept and `/workspace` is returned to its state before the call. The chat never freezes.
+- Output is capped at 40,000 characters (start and end are kept) so a runaway print cannot flood the AI's context.
+- Errors come back as short, actionable messages: cleaned Python tracebacks, JavaScript errors with line numbers,
+  compiler messages, the list of files that do exist when a file is missing, and a hint when a package or
+  input is missing.
+
+### Python
+
+- numpy, pandas, scipy, matplotlib, scikit-learn, pillow, requests, beautifulsoup4, lxml and the rest of
+  Pyodide's packages load automatically from the imports.
+- Common pure-Python packages (yaml, docx, pptx, openpyxl, tabulate, markdown, faker, ...) install automatically too;
+  anything else: `packages: ["name"]`. Packages with native code must be part of Pyodide.
+- Open matplotlib figures are saved as `/workspace/figure_N.png` after the run, ready for serve_file.
+- `input()` reads the `stdin` parameter. Top-level `await` works.
+
+### JavaScript and TypeScript
+
+- A browser worker, not Node.js: `fetch`, `fs` (async, paths relative to `/workspace`: `readFile`, `writeFile`,
+  `appendFile`, `readdir`, `exists`, `stat`, `mkdir`, `rm`, `rename`, `copyFile`, `list`, `download(url, name)`),
+  `storage.get/set` (JSON values kept between calls), `stdin`, `sleep(ms)`.
+- Libraries: `await import('https://cdn.jsdelivr.net/npm/<package>/+esm')` or `await importScripts(url)`.
+- TypeScript is compiled with Babel first (types are stripped, not checked).
+
+### SQL
+
+SQLite on `/workspace/data.sqlite`; Python sees the same database with `sqlite3.connect('data.sqlite')`.
+Delete the file to start over.
+
+### Compiled and remote languages
+
+Single-file programs with a normal `main`, input via `stdin`, a run-time limit of a few seconds, no network or files.
+Compile errors, runtime errors and exit codes are reported. A `public class` in Java is accepted as-is. If a pinned
+compiler is retired, a current one is picked automatically; if Compiler Explorer is down, Wandbox is tried.
 
 ### Internet access
 
-- **python**: `requests`, `urllib.request` (via pyodide-http) and `pyodide.http.pyfetch` all work.
-- **javascript**: `fetch` works.
-- Requests go straight from the browser. If the target does not allow CORS, the request is **automatically
-  retried through a list of ~10 built-in public CORS proxies** (corsproxy.io, allorigins, codetabs, cors.eu.org,
-  thingproxy, cors.sh, ...), so cross-origin downloads work with no configuration. The first proxy that answers wins.
-- Proxies are used **only** for a request that failed directly, never for requests carrying credentials
-  (Authorization/cookie), and only while a run is executing. Traffic through any proxy is visible to its operator.
-- The optional **CORS proxy override** setting puts your own proxy first (prefix like `https://corsproxy.io/?url=`,
-  or any URL containing `{url}`); the built-ins remain as further fallbacks.
-- There is no container behind the runner: Python runs as WASM inside the browser tab. Raw sockets, DNS and ping
-  do not exist there. Emscripten hands out fake `172.29.x.x` addresses and every `connect()` fails with
-  `Host is unreachable`, so socket-level probes prove nothing. HTTP through the browser is the only path.
-- Compiler Explorer languages run in godbolt's sandbox: no network.
+- Python: `requests`, `urllib.request`, `pyodide.http.pyfetch`. JavaScript: `fetch`, `fs.download`.
+- Requests go straight from the browser first. If the browser blocks one, it is retried through GitHub's raw file
+  mirror (for github.com links), your personal proxy, then public proxies. A host that fails every route is
+  remembered for 3 minutes so later requests fail fast, and the output names each unreachable host.
+- Requests carrying credentials (Authorization, API-key or cookie headers) are only ever sent through your own proxy.
+- No raw sockets, DNS or ping: the runtime lives inside the browser tab.
 
-### Temporary storage
+### Persistence between calls
 
-`/workspace` is an in-memory (WASM MEMFS) scratch directory that lives until the page reloads.
-It is shared by all three in-browser runtimes and, by default, is **carried across separate tool calls**:
+`/workspace` (including the SQLite database) and JavaScript `storage` are compressed and attached to the tool output
+as a hidden `[[cr-state:...]]` marker that the next call reads back.
 
-- **python** starts in `/workspace`; anything written there is available in later calls.
-- **javascript** gets `fs` (`await fs.readFile / writeFile / appendFile / readdir / exists / unlink / mkdir / stat`)
-  on the same directory, plus `storage.get/set/has/delete/keys/clear` for plain values.
-- **sql** keeps its database across calls. Once Python has loaded, the database is mirrored to
-  `/workspace/data.sqlite`, so `sqlite3.connect('data.sqlite')` in Python sees the same tables and SQL sees Python's writes.
-  Deleting `data.sqlite` resets the SQL database.
+- Up to 24 KB compressed travels inline (**Inline workspace limit**).
+- Larger workspaces are uploaded to the **Workspace store**; only a pointer travels. Without a store of your own,
+  public temporary stores are used (litterbox.catbox.moe for 24 h, pastes.dev, dpaste.com), which means anyone with
+  the link can read the data. Set **Offload large workspaces** to `off` to never upload.
+- An unchanged workspace is not uploaded again.
+- When something cannot be carried, the largest files are dropped first and the AI is told exactly which ones.
 
-### How persistence works
+### Settings
 
-TypingMind runs every plugin call in a brand-new sandboxed iframe, so nothing in memory survives on its own.
-To keep `/workspace`, the SQL database and JS `storage` alive between calls, the plugin serializes them
-(deflate-compressed) and appends a hidden `[[cr-state:...]]` trailer to its output; the next call reads that
-trailer back from `previousRunOutput` and rebuilds the workspace before running.
+| Setting | Default | Purpose |
+|---|---|---|
+| Personal CORS proxy | - | Reliable downloads from sites that block browsers |
+| Workspace store | - | Private carry of large workspaces |
+| Run time limit (seconds) | 120 | Stops runaway Python/JS/SQL |
+| Persist workspace between calls | on | Carry `/workspace` and `storage` |
+| Inline workspace limit (KB) | 24 | Size carried inside the output |
+| Offload large workspaces | on | Upload bigger workspaces to a store |
+| Offloaded workspace lifetime (minutes) | 1440 | Older offloaded workspaces are not restored |
+| HTTP request timeout (ms) | 30000 | Per request, before fallbacks |
+| Pyodide CDN / sql.js CDN | - | Put a mirror in front of the built-in CDN lists |
 
-- Default budget is 24 KB compressed. Larger workspaces are not carried; a note tells the model to finish in one call or delete big files.
-- Turn it off with the **Persist workspace between calls** setting, or raise the cap with **Max carried workspace size (KB)**.
-- The trailer counts against the model's token budget, so keep scratch data small.
+### Development
 
-### Large workspaces (ephemeral bin offload)
-
-The inline trailer is capped (default 24 KB compressed) because it costs tokens. When the workspace is bigger
-and **Offload large workspaces** is on (default), the plugin uploads the compressed snapshot to a public
-ephemeral paste bin and carries only a small pointer (URL + delete handle + expiry) in the output; the next
-call downloads it and rebuilds the workspace.
-
-- **Three built-in bins, tried in order:** `paste.rs` → `dpaste.com` → `sprunge.us`. The first that accepts the
-  upload (and reads back identically) wins.
-- **~10-minute lifetime:** a 10-minute logical expiry is enforced (an older pointer is ignored), and every new
-  snapshot deletes the previous blob, so at most one blob exists during an active chain. Exact server-side
-  deletion timing depends on the bin.
-- **Privacy:** your `/workspace` bytes leave the browser to that public service. Set **Offload large workspaces**
-  to `off` to keep everything inline, or set **Workspace store endpoint** to your own paste-style server
-  (POST body → returns read URL; GET returns it; DELETE removes it) to keep large state private. Your own
-  endpoint is tried before the public bins.
-- Small workspaces still travel inline with no upload.
-
-### Limits & how files move
-
-`/workspace` holds **as many files as you want** - there is no file-count limit. What varies is scope:
-
-- **Within one `run_code` call:** limited only by the browser tab's memory (WASM MEMFS) - tens to a few
-  hundred MB on desktop, less on mobile, on top of Pyodide's ~30 MB. Nothing is uploaded. Heavy multi-file
-  work (download several files, edit, zip) is best done inside a single call.
-- **Persisting between separate calls:** the whole workspace is snapshotted (compressed). ≤ the inline limit
-  (default 24 KB compressed) rides in the output as tokens; larger snapshots are offloaded to an ephemeral
-  bin whose own upload cap then applies (public bins allow roughly a few hundred KB to a couple MB; your own
-  `workspaceStore` endpoint lifts that).
-
-**Two separate "uploads" - don't confuse them:**
-
-- **`serve_file` uploads nothing.** It embeds the file as a `data:` URI directly in the chat message. That is
-  the only "serving" path.
-- **The bin offload is not serving.** It uploads the workspace snapshot solely to carry it from one tool call
-  to the next (the sandbox is destroyed between calls), and only when the snapshot exceeds the inline limit.
-
-### Serving files back to the user
-
-The plugin has a second function, **`serve_file`**, that renders a `/workspace` file straight into the chat
-for the user, without the bytes passing through the model's context. Images show inline; anything else becomes
-a download link (a `data:` URL).
-
-Typical flow — *load from the internet → edit in temp → serve to the user*:
-
-1. `run_code` (python or javascript): fetch a file and save it to `/workspace`.
-2. `run_code`: edit it (crop the image, filter the CSV, rewrite the HTML, ...).
-3. `serve_file` with the file's path: the user sees/downloads the result.
-
-```
-run_code(javascript): const b = new Uint8Array(await (await fetch(url)).arrayBuffer());
-                      await fs.writeFile('photo.jpg', b);
-run_code(python):     from PIL import Image; im = Image.open('photo.jpg'); im.rotate(90).save('rotated.jpg')
-serve_file(path='rotated.jpg')     # rendered inline to the user
-```
-
-`serve_file` params: `path` (required), optional `filename`, `mime`, and `as` (`auto` | `image` | `link` | `text`).
-It reads the carried workspace, so it works right after the `run_code` call that produced the file.
-
-Example: *Use run_code to compute the first 20 primes in Rust.*
+`implementation.js` is the plugin code; `node build.js` regenerates `plugin.json` (descriptions, schema, README).
+Tests live in `test/` (see `test/README.md`).

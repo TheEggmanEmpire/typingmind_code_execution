@@ -1,0 +1,77 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Code Runner e2e</title>
+<!-- Real browser, real Web Worker, real CDNs and services. Driven by run-e2e.js. -->
+<script>
+const params = new URLSearchParams(location.search);
+const settings = params.get("settings") ? JSON.parse(params.get("settings")) : {};
+const noWorker = params.get("noWorker") === "1";   // in-thread fallback: time limits cannot interrupt a loop there
+const report = (o) => fetch("/report", { method: "POST", body: JSON.stringify(o) });
+
+// [name, function, params, predicate on the output (state marker removed), live-network?]
+const STEPS = [
+  ["python runs in a worker", "run_code", { language: "python", code: "import sys\nopen('a.txt','w').write('hi')\nprint(sys.version.split()[0])" }, (s) => /^3\.13/.test(s)],
+  ["file carried to the next call", "run_code", { language: "python", code: "print(open('a.txt').read())" }, (s) => s === "hi"],
+  ["python requests (CORS-enabled host)", "run_code", { language: "python", code: "import requests\nr = requests.get('https://cdn.jsdelivr.net/pyodide/v0.29.4/full/pyodide-lock.json')\nprint(r.status_code, len(r.content) > 1000)" }, (s) => s === "200 True", true],
+  ["python requests (CORS-blocked host, fallback)", "run_code", { language: "python", code: "import requests\nr = requests.get('https://example.com/')\nprint(r.status_code, 'Example Domain' in r.text)" }, (s) => s === "200 True", true],
+  ["python urllib binary", "run_code", { language: "python", code: "import urllib.request\nb = urllib.request.urlopen('https://cdn.jsdelivr.net/npm/sql.js@1.13.0/dist/sql-wasm.wasm').read()\nprint(len(b) > 100000, b[:4])" }, (s) => s === "True b'\\x00asm'", true],
+  ["python infinite loop stopped", "run_code", { language: "python", code: "print('before', flush=True)\nwhile True:\n    pass", timeout: 6 }, (s) => /^before/.test(s) && /stopped after the 6 s time limit/.test(s)],
+  ["workspace intact after the stop", "run_code", { language: "python", code: "print(open('a.txt').read())" }, (s) => s === "hi"],
+  ["matplotlib figure saved", "run_code", { language: "python", code: "import matplotlib.pyplot as plt\nplt.bar(['a','b'], [3,5])\nprint('ok')" }, (s) => /^ok/.test(s) && /figure_1\.png/.test(s)],
+  ["serve_file shows the figure", "serve_file", { path: "figure_1.png" }, (s) => s.startsWith("![figure\\_1.png](data:image/png;base64,")],
+  ["js fetch (CORS-blocked host, fallback)", "run_code", { language: "javascript", code: "const r = await fetch('https://example.com/'); console.log(r.status, (await r.text()).includes('Example Domain'))" }, (s) => s === "200 true", true],
+  ["js dynamic import from jsDelivr", "run_code", { language: "javascript", code: "const { default: _ } = await import('https://cdn.jsdelivr.net/npm/lodash-es@4.17.21/+esm'); console.log(_.chunk([1,2,3,4], 2))" }, (s) => s === "[[1,2],[3,4]]", true],
+  ["js importScripts", "run_code", { language: "javascript", code: "await importScripts('https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js'); console.log(typeof dayjs(0).format)" }, (s) => s === "function", true],
+  ["js infinite loop stopped", "run_code", { language: "javascript", code: "for (;;) {}", timeout: 5 }, (s) => /stopped after the 5 s time limit/.test(s)],
+  ["js error line number", "run_code", { language: "javascript", code: "const a = 1;\nundefinedFn();" }, (s) => /ReferenceError/.test(s) && /line 2/.test(s)],
+  ["typescript", "run_code", { language: "typescript", code: "type N = number; const f = (a: N): N => a * 3; console.log(f(14))" }, (s) => s === "42", true],
+  ["sql", "run_code", { language: "sql", code: "CREATE TABLE t(x); INSERT INTO t VALUES (1),(2); SELECT count(*) AS n FROM t;" }, (s) => s === "n\n2"],
+  ["python reads the sql database", "run_code", { language: "python", code: "import sqlite3\nprint(sqlite3.connect('data.sqlite').execute('select sum(x) from t').fetchone()[0])" }, (s) => s === "3"],
+  ["remote c", "run_code", { language: "c", code: "#include <stdio.h>\nint main(void){ int a; scanf(\"%d\", &a); printf(\"%d\\n\", a * 2); return 0; }", stdin: "21" }, (s) => s === "42", true],
+  ["files still there after everything", "run_code", { language: "javascript", code: "console.log((await fs.list()).map(f => f.path).sort().join(','))" }, (s) => /a\.txt/.test(s) && /data\.sqlite/.test(s) && /figure_1\.png/.test(s)]
+];
+
+// Extra steps when a personal proxy / workspace store is configured (e.g. the companion Worker).
+if (settings.corsProxy) {
+  STEPS.push(
+    ["binary from a CORS-blocked host via personal proxy", "run_code", { language: "python", code: "import requests\nb = requests.get('https://www.python.org/static/favicon.ico').content\nprint(len(b) > 1000, b[:4] == b'\\x00\\x00\\x01\\x00')" }, (s) => s === "True True", true],
+    ["target 404 passed through the personal proxy", "run_code", { language: "javascript", code: "const r = await fetch('https://example.com/definitely-missing-page'); console.log(r.status)" }, (s) => s === "404", true]
+  );
+}
+if (settings.workspaceStore) {
+  STEPS.push(
+    ["large workspace written", "run_code", { language: "python", code: "import os\nopen('big.bin','wb').write(os.urandom(300000))\nprint('w')" }, (s) => s === "w"],
+    ["large workspace restored from the store", "run_code", { language: "python", code: "import os\nprint(os.path.getsize('big.bin'))" }, (s) => s === "300000"]
+  );
+}
+
+(async () => {
+  const impl = await (await fetch("/implementation.js")).text();
+  const inner = await (await fetch("/test/e2e-inner.js")).text();
+  let prev;
+  const call = (name, fn, p) => new Promise((resolve) => {
+    const f = document.createElement("iframe");
+    f.setAttribute("sandbox", "allow-scripts");
+    f.srcdoc = "<!doctype html><script>" + inner + "<\/script>";
+    const onMsg = (e) => {
+      if (e.source !== f.contentWindow || !e.data || e.data.name !== name) return;
+      window.removeEventListener("message", onMsg);
+      f.remove();
+      resolve(e.data);
+    };
+    window.addEventListener("message", onMsg);
+    f.onload = () => f.contentWindow.postMessage({ impl, fn, params: p, settings, prev, name, noWorker }, "*");
+    document.body.appendChild(f);
+  });
+  for (const [name, fn, p, pred, live] of STEPS) {
+    if (noWorker && /infinite loop/.test(name)) continue;
+    const r = await call(name, fn, p);
+    prev = r.out;
+    const clean = String(r.out).replace(/\s*(<!--)?\[\[cr-state:[A-Za-z0-9+/=]+\]\](-->)?\s*$/, "");
+    let ok = false;
+    try { ok = pred(clean); } catch (e) {}
+    await report({ name, ok, live: !!live, ms: r.ms, out: clean.replace(/data:[a-z/+.-]+;base64,[A-Za-z0-9+/=]{40,}/g, "data:...").slice(0, 800) });
+  }
+  await report({ done: true });
+})();
+</script>

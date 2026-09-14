@@ -1,0 +1,11 @@
+name = "code-runner-proxy"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+[vars]
+STORE_TTL = "86400"
+
+[[kv_namespaces]]
+binding = "STORE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
