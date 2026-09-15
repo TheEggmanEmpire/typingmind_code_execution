@@ -8,11 +8,27 @@ Lets the AI run code and hand files back to you. 34 languages, no API key, no se
 | Compiler Explorer (godbolt.org) | c, c++, rust, go, java, kotlin, csharp, fsharp, swift, zig, d, haskell, ocaml, ruby, perl, lua, dart, fortran, pascal, crystal, julia, cobol, ada, objc | no | no |
 | Wandbox (best effort) | bash, php, r, scala, nim, elixir | no | no |
 
-Two functions:
+Four functions:
 
 - **run_code** runs a program and returns its output to the AI.
 - **serve_file** shows a file from `/workspace` to you in the chat: images inline, small text as a code block,
   anything else (PDF, XLSX, ZIP, ...) as a download link. The bytes never pass through the AI's context.
+- **browser_run** runs JavaScript in one of *your own open browser tabs* and returns the value plus console output:
+  read the page, click, fill forms, scroll, change the view. Needs the companion extension (below).
+- **browser_tabs** lists / activates / opens / closes / reloads / navigates your tabs. Needs the companion extension.
+
+### Browser control (optional, Chrome desktop only)
+
+`run_code` runs in a locked-down sandbox with no access to your tabs. To let the AI read and drive the pages you
+actually have open, load the small companion extension in the [`extension/`](extension/) folder:
+
+1. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, pick the `extension/` folder.
+2. Reload your TypingMind tab. `browser_run` and `browser_tabs` now work.
+
+It runs the AI's script through the browser's debugger, so it works even on strict-CSP sites and captures the real
+console; Chrome shows a "started debugging" banner while a script runs. It is **Chrome/Chromium desktop only**, and
+while enabled any page you visit can drive your tabs through it, so keep it on only while you need it. See
+[`extension/README.md`](extension/README.md) for details, scope and safety.
 
 ### Recommended setup (5 minutes, free)
 

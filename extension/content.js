@@ -1,0 +1,38 @@
+// Code Runner Browser Bridge - content script.
+//
+// Injected into EVERY frame of every page (all_frames + match_origin_as_fallback),
+// so it also lands inside TypingMind's sandboxed, opaque-origin plugin iframe -
+// the one place the Code Runner plugin code actually runs. It is a dumb relay:
+// page/plugin code posts a window message, this script forwards it to the
+// service worker over chrome.runtime, and posts the reply back to the window.
+//
+// Protocol (page -> here):  { __crbReq: true, id, request }
+//          (here -> page):  { __crbRes: true, id, response }
+//
+// Security note: this dev build relays any window message carrying __crbReq, so
+// any page you visit while it is enabled can drive your tabs through it. Keep it
+// enabled only while using the Code Runner plugin, or narrow "matches" in
+// manifest.json to your TypingMind origin(s).
+
+(function () {
+  if (window.__crbBridgeInstalled) return;      // all_frames can re-run on some navigations
+  window.__crbBridgeInstalled = true;
+
+  window.addEventListener("message", function (e) {
+    var d = e.data;
+    if (!d || d.__crbReq !== true || typeof d.id !== "string") return;
+    try {
+      chrome.runtime.sendMessage({ type: "crb", request: d.request }, function (resp) {
+        var err = chrome.runtime.lastError;
+        window.postMessage({
+          __crbRes: true,
+          id: d.id,
+          response: err ? { ok: false, error: "bridge: " + err.message } : resp
+        }, "*");
+      });
+    } catch (err) {
+      // Extension context gone (reloaded/updated). Tell the caller instead of hanging.
+      window.postMessage({ __crbRes: true, id: d.id, response: { ok: false, error: "bridge unavailable: " + (err && err.message || err) } }, "*");
+    }
+  }, false);
+})();

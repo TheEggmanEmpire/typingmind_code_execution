@@ -1863,3 +1863,127 @@ async function serve_file(params, userSettings, resources) {
     return serveFinish("**serve_file failed:** " + (e && e.message || e) + ". Retry, or recreate the file with run_code.", ctx);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Browser bridge (browser_run, browser_tabs)
+// ---------------------------------------------------------------------------
+// These two functions reach OUT of the sandboxed plugin iframe to a small
+// companion Chrome extension (extension/ folder of this repository), which the
+// user loads unpacked. The extension injects a content script into this very
+// frame; we talk to it with window.postMessage and it drives chrome.tabs /
+// chrome.scripting on our behalf. With no extension present the ping times out
+// and we return install instructions instead of hanging.
+
+const BROWSER_PING_MS = 800;
+const BROWSER_CALL_MS = 20000;
+
+function browserBridgeCall(request, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const id = "crb" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const onMsg = (e) => {
+      const d = e && e.data;
+      if (!d || d.__crbRes !== true || d.id !== id) return;
+      settled = true;
+      try { removeEventListener("message", onMsg); } catch (x) {}
+      resolve(d.response || { ok: false, error: "empty response from the bridge" });
+    };
+    try { addEventListener("message", onMsg); } catch (x) { return resolve({ ok: false, error: "no window messaging in this runtime" }); }
+    try { postMessage({ __crbReq: true, id, request }, "*"); }
+    catch (x) { try { removeEventListener("message", onMsg); } catch (y) {} return resolve({ ok: false, error: "could not post to the bridge: " + (x && x.message || x) }); }
+    setTimeout(() => {
+      if (settled) return;
+      try { removeEventListener("message", onMsg); } catch (x) {}
+      resolve({ ok: false, error: "__timeout" });
+    }, timeoutMs || BROWSER_CALL_MS);
+  });
+}
+
+const BROWSER_INSTALL_HINT =
+  "The Code Runner browser bridge extension is not responding, so tabs cannot be reached.\n" +
+  "One-time setup (Chrome/Chromium, desktop):\n" +
+  "1. Get this plugin's repository and open chrome://extensions .\n" +
+  "2. Turn on \"Developer mode\" (top right).\n" +
+  "3. Click \"Load unpacked\" and select the extension/ folder.\n" +
+  "4. Make sure the extension is enabled, then reload the TypingMind tab and try again.\n" +
+  "Note: it is Chrome-only and works on desktop, not mobile.";
+
+async function browserReady(ctx) {
+  const pong = await browserBridgeCall({ op: "ping" }, BROWSER_PING_MS);
+  if (pong && pong.ok) return true;
+  return false;
+}
+
+function browserFinish(md, ctx) {
+  // Like serve_file: these tools never touch /workspace, so carry the incoming
+  // state trailer straight through so interleaving them does not lose files.
+  return ctx.incoming ? md + "\n\n[[cr-state:" + ctx.incoming + "]]" : md;
+}
+
+function browserPrelude(userSettings, resources) {
+  const ctx = { incoming: null };
+  try {
+    const cfg = readSettings(userSettings || {});
+    if (cfg.carry) ctx.incoming = extractTrailer(previousOutputText(resources && resources.previousRunOutput));
+  } catch (e) {}
+  return ctx;
+}
+
+async function browser_run(params, userSettings, resources) {
+  const ctx = browserPrelude(userSettings, resources);
+  try {
+    params = params || {};
+    const code = typeof params.code === "string" ? params.code : params.code == null ? "" : String(params.code);
+    if (!code.trim()) return browserFinish("**browser_run:** no `code` was given. Pass JavaScript to run in the tab, e.g. `return document.title;`.", ctx);
+    if (!(await browserReady(ctx))) return browserFinish(BROWSER_INSTALL_HINT, ctx);
+
+    const timeoutMs = Math.min(Math.max((Number(params.timeout) || 15) * 1000, 1000), 120000);
+    const req = { op: "run", code, timeoutMs };
+    if (params.tabId != null) req.tabId = Number(params.tabId);
+
+    const r = await browserBridgeCall(req, timeoutMs + 4000);
+    if (r.error === "__timeout") return browserFinish("**browser_run:** the tab did not answer in time. The script may be running an infinite loop, or the tab is busy. Try a smaller script or a larger `timeout`.", ctx);
+    if (!r.ok) return browserFinish("**browser_run failed:** " + (r.error || "unknown error") + ".", ctx);
+
+    let out = "tab " + r.tabId;
+    out += "\n\nresult: " + (r.result === undefined ? "undefined" : r.result);
+    if (r.logs && r.logs.length) out += "\n\nconsole:\n" + r.logs.join("\n");
+    if (r.error) out += "\n\nerror: " + r.error;
+    return browserFinish(out, ctx);
+  } catch (e) {
+    return browserFinish("**browser_run failed:** " + (e && e.message || e) + ".", ctx);
+  }
+}
+
+async function browser_tabs(params, userSettings, resources) {
+  const ctx = browserPrelude(userSettings, resources);
+  try {
+    params = params || {};
+    const action = String(params.action || "list").toLowerCase();
+    const map = { list: "tabs.list", activate: "tabs.activate", open: "tabs.open", close: "tabs.close", reload: "tabs.reload", navigate: "tabs.navigate" };
+    const op = map[action];
+    if (!op) return browserFinish("**browser_tabs:** unknown action \"" + params.action + "\". Use one of: " + Object.keys(map).join(", ") + ".", ctx);
+    if (!(await browserReady(ctx))) return browserFinish(BROWSER_INSTALL_HINT, ctx);
+
+    const req = { op };
+    if (params.tabId != null) req.tabId = Number(params.tabId);
+    if (params.url != null) req.url = String(params.url);
+    if (params.active != null) req.active = !!params.active;
+    if (params.allWindows != null) req.allWindows = !!params.allWindows;
+
+    const r = await browserBridgeCall(req, BROWSER_CALL_MS);
+    if (r.error === "__timeout") return browserFinish("**browser_tabs:** the extension did not answer in time. Reload the TypingMind tab and try again.", ctx);
+    if (!r.ok) return browserFinish("**browser_tabs failed:** " + (r.error || "unknown error") + ".", ctx);
+
+    if (op === "tabs.list") {
+      const rows = (r.tabs || []).map((t) => "#" + t.id + (t.active ? " *" : "  ") + " " + (t.title || "(untitled)") + "  -  " + t.url);
+      return browserFinish(rows.length ? "Open tabs (id, * = active):\n" + rows.join("\n") : "No tabs found.", ctx);
+    }
+    if (op === "tabs.close") return browserFinish("Closed tab " + r.closed + ".", ctx);
+    if (op === "tabs.reload") return browserFinish("Reloaded tab " + r.tab + ".", ctx);
+    const t = r.tab || {};
+    return browserFinish((action === "open" ? "Opened" : action === "navigate" ? "Navigated" : "Activated") + " tab #" + t.id + ": " + (t.title || t.url || ""), ctx);
+  } catch (e) {
+    return browserFinish("**browser_tabs failed:** " + (e && e.message || e) + ".", ctx);
+  }
+}

@@ -37,3 +37,16 @@ Steps that depend on third-party services report `WARN` instead of `FAIL` when t
 ### Companion Worker
 
 See `worker/README.md` for a local `wrangler dev` check of the proxy and store.
+
+### Browser bridge (real Chrome, loads the companion extension)
+
+Loads `extension/` unpacked into headless Chromium and drives `browser_run` / `browser_tabs`
+from a sandboxed iframe (like TypingMind), proving the postMessage↔extension bridge reaches the
+sandboxed frame and that scripts run in the page, capture console, and return values.
+
+```sh
+node test/run-browser-e2e.js
+CHROME=/path/to/chrome node test/run-browser-e2e.js
+```
+
+Needs a Chrome/Chromium that supports unpacked extensions in `--headless=new` (Chrome 130+).

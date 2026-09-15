@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CR-BRIDGE-TEST-TITLE</title>
+<!-- Loads the unpacked extension/ and drives browser_run / browser_tabs from a
+     sandboxed iframe, exactly like TypingMind. Driven by run-browser-e2e.js. -->
+<script>
+const report = (o) => fetch("/report", { method: "POST", body: JSON.stringify(o) });
+
+(async () => {
+  const impl = await (await fetch("/implementation.js")).text();
+  // Minimal inner harness: eval the plugin, run one browser tool, post the result back.
+  const inner =
+    "window.addEventListener('message', async (e) => {" +
+    "  const { impl, fn, params, name } = e.data || {};" +
+    "  try { (0, eval)(impl);" +
+    "    const f = { browser_run: browser_run, browser_tabs: browser_tabs }[fn];" +
+    "    const out = await f(params, {}, {});" +
+    "    parent.postMessage({ name, out }, '*');" +
+    "  } catch (err) { parent.postMessage({ name, out: 'THROW: ' + (err && err.stack || err) }, '*'); }" +
+    "});";
+
+  const call = (name, fn, params) => new Promise((resolve) => {
+    const f = document.createElement("iframe");
+    f.setAttribute("sandbox", "allow-scripts");
+    f.srcdoc = "<!doctype html><script>" + inner + "<\/script>";
+    const onMsg = (e) => {
+      if (e.source !== f.contentWindow || !e.data || e.data.name !== name) return;
+      window.removeEventListener("message", onMsg);
+      f.remove();
+      resolve(e.data.out);
+    };
+    window.addEventListener("message", onMsg);
+    f.onload = () => f.contentWindow.postMessage({ impl, fn, params, name }, "*");
+    document.body.appendChild(f);
+  });
+
+  const STEPS = [
+    ["bridge reachable (tabs.list)", "browser_tabs", { action: "list" }, (s) => /Open tabs/.test(s) && /CR-BRIDGE-TEST-TITLE/.test(s)],
+    ["run returns the page title", "browser_run", { code: "return document.title" }, (s) => /result: CR-BRIDGE-TEST-TITLE/.test(s)],
+    ["run captures console output", "browser_run", { code: "console.log('hello from page'); return 1 + 1" }, (s) => /result: 2/.test(s) && /hello from page/.test(s)],
+    ["run reads the DOM", "browser_run", { code: "return document.querySelectorAll('*').length > 0" }, (s) => /result: true/.test(s)],
+    ["run returns JSON values", "browser_run", { code: "return { a: 1, b: [2, 3] }" }, (s) => /result: \{"a":1,"b":\[2,3\]\}/.test(s)],
+    ["await works in the page", "browser_run", { code: "await new Promise(r => setTimeout(r, 10)); return 'waited'" }, (s) => /result: waited/.test(s)]
+  ];
+
+  for (const [name, fn, params, pred] of STEPS) {
+    let out = "";
+    // Give the freshly loaded extension/service worker time to come up.
+    for (let i = 0; i < 30; i++) {
+      out = await call(name, fn, params);
+      if (!/not responding/.test(String(out))) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    let ok = false;
+    const clean = String(out).replace(/\s*\[\[cr-state:[^\]]*\]\]\s*$/, "");
+    try { ok = pred(clean); } catch (e) {}
+    await report({ name, ok, out: clean.slice(0, 400) });
+  }
+  await report({ done: true });
+})();
+</script>

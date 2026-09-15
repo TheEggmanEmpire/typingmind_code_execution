@@ -31,7 +31,8 @@ const runCodeSpec = {
     "Remote, short programs without internet or files: " + CE.join(", ") + "; best-effort: " + WB.join(", ") + ". " +
     "Each call is a new process: variables do not survive, files in /workspace do. " +
     "To give the user a file (chart, CSV, image, document), save it in /workspace, then call serve_file. " +
-    "No shell, subprocess, sockets or pip command; websites that block browsers are retried through proxies automatically.",
+    "No shell, subprocess, sockets or pip; blocked sites retry through proxies. " +
+    "To read or control the user's open browser tabs (click, fill, read the DOM, switch/open tabs) use browser_run and browser_tabs.",
   parameters: {
     type: "object",
     properties: {
@@ -87,6 +88,45 @@ const serveFileSpec = {
   }
 };
 
+const browserRunSpec = {
+  name: "browser_run",
+  description:
+    "Run JavaScript inside one of the USER'S OWN open browser tabs; returns the value plus real console output. " +
+    "Use it to read or control a page the user is looking at: read the DOM (return document.title, innerText, a table as JSON), click or fill things (document.querySelector('#save').click()), scroll, change the view. " +
+    "Code runs in the page as an async function body: `await` works and you get a result by writing `return <value>` (JSON-serialisable, never DOM nodes). console.log/warn/error during the run are captured. " +
+    "It runs via the browser's debugger, so it works even on strict-CSP sites; a 'started debugging' banner shows while it runs. " +
+    "Default tab is the active one; pass `tabId` from browser_tabs for another. Cannot script chrome:// pages, the Web Store, or a tab with DevTools open. " +
+    "Needs the companion Chrome extension (extension/ folder) loaded unpacked; returns setup steps if missing. Chrome desktop only, and separate from run_code's /workspace sandbox.",
+  parameters: {
+    type: "object",
+    properties: {
+      code: { type: "string", description: "JavaScript to run in the page. Use `await` freely and `return <value>` to send a result back, e.g. `return [...document.querySelectorAll('h2')].map(e => e.innerText)`. To act on the page: `document.querySelector('button.buy').click(); return 'clicked'`." },
+      tabId: { type: "number", description: "Optional. Which tab to run in (get ids from browser_tabs with action 'list'). Omitted: the currently active tab." },
+      timeout: { type: "number", description: "Optional seconds before the run is abandoned (default 15, max 120)." }
+    },
+    required: ["code"]
+  }
+};
+
+const browserTabsSpec = {
+  name: "browser_tabs",
+  description:
+    "List and manage the user's open browser tabs: see what is open, switch to a tab, open a new one, close one, reload, or navigate a tab to a URL. " +
+    "Call it with action 'list' first to learn tab ids and titles, then pass a `tabId` to act on a specific tab; browser_run uses the same ids. " +
+    "Requires the same companion Chrome extension as browser_run (extension/ folder, loaded unpacked); returns setup steps if it is missing. Chrome desktop only.",
+  parameters: {
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["list", "activate", "open", "close", "reload", "navigate"], description: "What to do. list: all tabs in the current window (add allWindows for every window). activate: bring a tab to the front. open: new tab (optionally at `url`). close/reload: act on `tabId`. navigate: send `tabId` to `url`." },
+      tabId: { type: "number", description: "Target tab id (from action 'list'). Required for activate, close, reload, navigate." },
+      url: { type: "string", description: "For open (page to open) and navigate (where to send the tab)." },
+      active: { type: "boolean", description: "For open: focus the new tab (default true) or open it in the background (false)." },
+      allWindows: { type: "boolean", description: "For list: include tabs from every window, not just the current one." }
+    },
+    required: ["action"]
+  }
+};
+
 const userSettings = [
   { name: "corsProxy", label: "Personal CORS proxy (recommended)", description: "Makes downloads from websites that block browsers work reliably. Deploy the free companion Cloudflare Worker (worker/ folder of this plugin's repository) and enter https://<worker-name>.<account>.workers.dev/?key=<PROXY_KEY>&url= . Any proxy URL prefix, or a URL containing {url}, also works. Without it only a few public proxies are tried, and they often fail.", placeholder: "https://code-runner-proxy.example.workers.dev/?key=SECRET&url=", required: false },
   { name: "workspaceStore", label: "Workspace store (recommended)", description: "Carries large workspaces (charts, downloads, datasets) between calls privately. With the companion Worker enter https://<worker-name>.<account>.workers.dev/store?key=<PROXY_KEY> . Contract for other servers: POST the payload, respond with a read URL as plain text; GET returns it; DELETE removes it. Without it, workspaces above the inline limit go to public temporary stores (litterbox.catbox.moe, pastes.dev, dpaste.com).", placeholder: "https://code-runner-proxy.example.workers.dev/store?key=SECRET", required: false },
@@ -112,7 +152,9 @@ const plugin = {
   dynamicContextEndpoints: [],
   pluginFunctions: [
     { id: "run-code-fn-fa4fdbb3", name: "run_code", implementationType: "javascript", openaiSpec: runCodeSpec, code, outputType: "respond_to_ai" },
-    { id: "serve-file-fn-fa4fdbb3", name: "serve_file", implementationType: "javascript", openaiSpec: serveFileSpec, code, outputType: "render_markdown" }
+    { id: "serve-file-fn-fa4fdbb3", name: "serve_file", implementationType: "javascript", openaiSpec: serveFileSpec, code, outputType: "render_markdown" },
+    { id: "browser-run-fn-fa4fdbb3", name: "browser_run", implementationType: "javascript", openaiSpec: browserRunSpec, code, outputType: "respond_to_ai" },
+    { id: "browser-tabs-fn-fa4fdbb3", name: "browser_tabs", implementationType: "javascript", openaiSpec: browserTabsSpec, code, outputType: "respond_to_ai" }
   ],
   overviewMarkdown
 };
@@ -134,4 +176,7 @@ if (process.argv.includes("--check")) {
 
 fs.writeFileSync(outPath, json);
 console.log("wrote plugin.json (" + json.length + " bytes; run_code desc " + runCodeSpec.description.length +
-  ", serve_file desc " + serveFileSpec.description.length + ", " + LANGS.length + " languages)");
+  ", serve_file desc " + serveFileSpec.description.length +
+  ", browser_run desc " + browserRunSpec.description.length +
+  ", browser_tabs desc " + browserTabsSpec.description.length +
+  ", " + LANGS.length + " languages)");
