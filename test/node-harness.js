@@ -72,7 +72,7 @@ routes.push(async (url, init) => {
 routes.push(async (url, init) => {
   if (url.startsWith("https://open.example/")) return text("open:" + url);
   if (url.startsWith("https://files.test/data.bin")) return new Response(new Uint8Array([1, 2, 3, 250]), { headers: { "content-type": "application/octet-stream" } });
-  if (url.startsWith("https://blocked.example/") || url.startsWith("https://wall.example/") || url.startsWith("https://github.com/") || url.startsWith("https://api.secure.example/")) {
+  if (url.startsWith("https://blocked.example/") || url.startsWith("https://wall.example/") || url.startsWith("https://github.com/") || url.startsWith("https://api.secure.example/") || url.startsWith("https://botblock.example/")) {
     count("direct:" + new URL(url).host); throw new TypeError("Failed to fetch");
   }
   if (url.startsWith("https://slow.example/")) { count("direct:slow"); return hang(init); }
@@ -82,11 +82,13 @@ routes.push(async (url, init) => {
     count("proxy:custom");
     const auth = init.headers && (init.headers.Authorization || init.headers.authorization);
     if (target.includes("missing")) return text("not found upstream", 404, { "x-cr-proxy": "1" });
+    if (target.includes("botblock")) return text("blocked by site", 403, { "x-cr-proxy": "1" });   // site refuses cloud IPs
     return text("custom:" + target + (auth ? " auth=" + auth : ""), 200, { "x-cr-proxy": "1" });
   }
   if (url.startsWith("https://corsmirror.com/")) {
     count("proxy:public");
     if (url.includes("wall.example") || url.includes("slow.example")) return url.includes("slow.example") ? hang(init) : text("refused", 403);
+    if (url.includes("botblock.example%2Fnone")) return text("refused", 403);
     return text("public:" + decodeURIComponent(url.split("url=")[1] || ""));
   }
   if (/^https:\/\/(api\.allorigins\.win|api\.codetabs\.com|api\.cors\.lol|cors\.eu\.org|test\.cors\.workers\.dev)\//.test(url)) {
@@ -243,6 +245,8 @@ const big = { stateLimitKB: "500" };   // keep test workspaces inline unless a t
   check("blocked -> public proxy", await run("javascript", get("https://blocked.example/a"), {}, big), "200 public:https://blocked.example/a");
   check("blocked -> personal proxy first", await run("javascript", get("https://blocked.example/b"), {}, { ...big, corsProxy: "https://proxy.test/?key=k&url=" }), "200 custom:https://blocked.example/b");
   check("personal proxy passes the target's 404 through", await run("javascript", get("https://blocked.example/missing"), {}, { ...big, corsProxy: "https://proxy.test/?key=k&url=" }), "404 not found upstream");
+  check("site refusing the personal proxy -> public proxy", await run("javascript", get("https://botblock.example/pub"), {}, { ...big, corsProxy: "https://proxy.test/?key=k&url=" }), "200 public:https://botblock.example/pub");
+  check("nothing better: the site's own 403 is returned", await run("javascript", get("https://botblock.example/none"), {}, { ...big, corsProxy: "https://proxy.test/?key=k&url=" }), "403 blocked by site");
   check("github blob -> raw mirror", await run("javascript", get("https://github.com/o/r/blob/main/f.txt"), {}, big), "200 raw:https://raw.githubusercontent.com/o/r/main/f.txt");
   hits["proxy:public"] = 0;
   check("credentials never go to public proxies", await run("javascript", get("https://api.secure.example/x", "{ headers: { Authorization: 'Bearer t' } }"), {}, big),

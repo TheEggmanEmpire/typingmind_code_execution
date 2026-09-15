@@ -8,4 +8,4 @@ STORE_TTL = "86400"
 
 [[kv_namespaces]]
 binding = "STORE"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "3d287ebe347a4d8d92279ebdf2f20de6"

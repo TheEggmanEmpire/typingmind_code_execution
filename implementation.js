@@ -425,14 +425,23 @@ async function fetchDirectThenProxies(real, input, init) {
 
   const st = newStats();
   // The user's own proxy and GitHub mirrors first, one at a time (reliable, may be large).
+  // Some sites refuse requests coming from cloud providers: a 403/429/503 through the
+  // personal proxy is kept while the public proxies get a chance (reads only), and
+  // returned if none of them does better.
+  const idempotent = /^(GET|HEAD)$/i.test(init.method || "GET");
+  let held = null;
   for (const cand of cands.filter((c) => c.trusted || c.mirror)) {
     const v = await proxyHop(real, cand, init, fetchTimeoutMs(), st).promise;
-    if (v) return v.r;
+    if (v) {
+      if (cand.trusted && idempotent && [403, 429, 503].includes(v.r.status)) { held = held || v.r; continue; }
+      return v.r;
+    }
     if (init.signal && init.signal.aborted) throw e1;
   }
   const publicCands = cands.filter((c) => !c.trusted && !c.mirror);
   const r = publicCands.length ? await raceProxies(real, publicCands, init, st) : null;
   if (r) return r;
+  if (held) return held;
   if (init.signal && init.signal.aborted) throw e1;
   const why = direct + ", and " + st.tried + " fallback route" + (st.tried === 1 ? "" : "s") + " failed (" + describeStats(st) + ")";
   markDead(host, why, timedOut ? "t" : "b");

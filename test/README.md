@@ -23,11 +23,16 @@ Opens `test/e2e.html` in headless Chrome. Every call runs in a fresh `<iframe sa
 CORS fallbacks, dynamic imports, Compiler Explorer and serve_file.
 
 ```sh
-node test/run-e2e.js
-node test/run-e2e.js --settings '{"corsProxy":"https://<worker>.workers.dev/?key=KEY&url="}'
+node test/run-e2e.js                 # Web Worker path
+node test/run-e2e.js --no-worker     # in-thread fallback (time-limit steps skipped)
+
+# against the deployed companion Worker (adds personal-proxy and workspace-store steps)
+W=https://code-runner-proxy.code-runner-lf.workers.dev; K=$(tr -d '\n' < ~/.config/code-runner/proxy_key)
+node test/run-e2e.js --settings "{\"corsProxy\":\"$W/?key=$K&url=\",\"workspaceStore\":\"$W/store?key=$K\"}"
 ```
 
 Steps that depend on third-party services report `WARN` instead of `FAIL` when they fail.
+`E2E_TIMEOUT_MIN` overrides the 15-minute overall limit.
 
 ### Companion Worker
 

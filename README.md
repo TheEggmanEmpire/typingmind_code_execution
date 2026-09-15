@@ -74,6 +74,8 @@ compiler is retired, a current one is picked automatically; if Compiler Explorer
   mirror (for github.com links), your personal proxy, then public proxies. A host that fails every route is
   remembered for 3 minutes so later requests fail fast, and the output names each unreachable host.
 - Requests carrying credentials (Authorization, API-key or cookie headers) are only ever sent through your own proxy.
+- A few sites refuse requests from cloud providers (python.org, w3.org, ...). When your proxy gets such a
+  403/429/503 for a read, the public proxies are tried as well before that answer is returned.
 - No raw sockets, DNS or ping: the runtime lives inside the browser tab.
 
 ### Persistence between calls

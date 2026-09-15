@@ -34,7 +34,8 @@ const STEPS = [
 // Extra steps when a personal proxy / workspace store is configured (e.g. the companion Worker).
 if (settings.corsProxy) {
   STEPS.push(
-    ["binary from a CORS-blocked host via personal proxy", "run_code", { language: "python", code: "import requests\nb = requests.get('https://www.python.org/static/favicon.ico').content\nprint(len(b) > 1000, b[:4] == b'\\x00\\x00\\x01\\x00')" }, (s) => s === "True True", true],
+    // google.com sends no CORS header but, unlike python.org or w3.org, does not refuse Cloudflare's egress.
+    ["binary from a CORS-blocked host via personal proxy", "run_code", { language: "python", code: "import requests\nb = requests.get('https://www.google.com/favicon.ico').content\nprint(len(b) > 1000, b[:4] == b'\\x00\\x00\\x01\\x00')" }, (s) => s === "True True", true],
     ["target 404 passed through the personal proxy", "run_code", { language: "javascript", code: "const r = await fetch('https://example.com/definitely-missing-page'); console.log(r.status)" }, (s) => s === "404", true]
   );
 }
