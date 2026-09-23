@@ -62,7 +62,7 @@ routes.push(async (url, init) => {
     return store.has(u.toString()) ? text(store.get(u.toString())) : text("gone", 404);
   }
   if (url === "https://litterbox.catbox.moe/resources/internals/api.php") {
-    if (globalThis.__litterDown) return text("down", 503);
+    if (globalThis.__litterDown || globalThis.__litterOnlyDown) return text("down", 503);
     count("litter:post"); const blob = init.body.get("fileToUpload"); const id = "https://litter.catbox.moe/l" + (++storeSeq) + ".txt";
     store.set(id, await blob.text()); return text(id);
   }
@@ -413,7 +413,50 @@ const big = { stateLimitKB: "500" };   // keep test workspaces inline unless a t
   check("manage_files reset_variables", (await tool(manage_files, { action: "reset_variables" }, big), await run("python", "print('inc' in globals(), open('docs/renamed.txt').read())", {}, big)), "False n");
   check("manage_files clear", (await tool(manage_files, { action: "clear" }, big), await run("python", "import os; print(sorted(os.listdir('.')))", {}, big)), (s) => s === "[]");
 
-  // 12. Never throws, always explains --------------------------------------------------------------
+  // 12. Helpers, secrets, notebook, chunked store ---------------------------------------------------
+  prev = undefined;
+  const opts = (raw, file) => { const m = /const o = (\{[\s\S]*?\});\nconst dark/.exec(raw); return m ? JSON.parse(m[1]) : null; };
+  await run("python", "import pandas as pd\ndf = pd.DataFrame({'month': ['2024-01', '2024-02'], 'a': [1, 2], 'b': [3.5, float('nan')]})\nprint(chart(df, x='month', y=['a', 'b'], kind='bar', title='T'))", {}, big);
+  check("python chart() writes a chart page", await run("python", "print(open('chart.html').read())", {}, big), (s) => {
+    const o = opts(s); return o && o.kind === "bar" && o.title === "T" && o.data.length === 2 && o.data[1].b === null && JSON.stringify(o.y) === '["a","b"]';
+  });
+  check("javascript chart() and a custom path", await run("javascript", "await chart([{x: 1, y: 2}, {x: 2, y: 5}], { kind: 'scatter', path: 'out/c.html' }); console.log(await fs.readFile('out/c.html'))", {}, big),
+    (s) => { const o = opts(s); return o && o.kind === "scatter" && o.data[1].y === 5; });
+  check("share_table in python, tables.get in javascript", (await run("python", "import pandas as pd\nshare_table('sales', pd.DataFrame({'region': ['n', 's'], 'amount': [10, 20]}))\nprint(list_tables())", {}, big),
+    await run("javascript", "const t = tables.get('sales'); console.log(t.length, t[1].region, t[1].amount + 1, tables.list().join())", {}, big)), "2 s 21 sales");
+  check("tables.set in javascript, get_table in python", (await run("javascript", "tables.set('pts', [{ x: 1, label: 'a,b' }, { x: 2, label: 'q\"q' }]); console.log('ok')", {}, big),
+    await run("python", "t = get_table('pts')\nprint(len(t), t['label'][0], int(t['x'].sum()))", {}, big)), "2 a,b 3");
+  check("an unknown shared table is explained", await run("python", "get_table('nope')", {}, big), (s) => /no shared table 'nope' \(shared tables: pts, sales\)/.test(s));
+  check("read_text extracts a docx", await run("python", "import docx\nd = docx.Document(); d.add_paragraph('Quarterly report'); d.save('r.docx')\nprint(read_text('r.docx').strip())", { packages: ["python-docx"] }, big), (s) => s.startsWith("Quarterly report"));
+  const sec = { ...big, secrets: "MY_KEY=supersecret123; OTHER=abcdefg" };
+  check("secrets are environment variables and redacted", await run("python", "import os\nprint(os.environ['MY_KEY'], len(os.environ['MY_KEY']))", {}, sec), "[secret MY_KEY] 14");
+  check("javascript env has the secrets", await run("javascript", "console.log(env.MY_KEY.length, Object.keys(env).join())", {}, sec), "14 MY_KEY,OTHER");
+  await run("python", "import os\nk = os.environ['MY_KEY']\nplain = 'fine'\nprint('set')", {}, sec);
+  check("secret values are not saved with the variables", await run("python", "print('k' in globals(), plain)", {}, sec), "False fine");
+  await run("python", "import os\ncfg = {'auth': {'token': os.environ['MY_KEY']}}\nopen('conf.json', 'w').write(str(cfg))\nprint('w')", {}, sec);
+  check("nested secrets and files holding a secret are not carried", await run("python", "import os\nprint('cfg' in globals(), os.path.exists('conf.json'))", {}, sec), (s, raw) => /^False False/.test(s));
+  hits["proxy:public"] = 0;
+  check("a URL-encoded secret never goes to public proxies", await run("javascript", "try { const r = await fetch('https://blocked.example/e?q=' + encodeURIComponent(env.MY_KEY + ' x')); console.log(r.status) } catch (e) { console.log('ERR') }", {}, sec), (s) => /^ERR/.test(s) && hits["proxy:public"] === 0);
+  check("short secrets are refused with a note", await run("python", "print(1)", {}, { ...big, secrets: "PIN=123; LONGER=abcdefgh" }), (s, raw) => /secrets ignored because their values are shorter than 6 characters: PIN/.test(raw));
+  check("typecheck knows chart, tables and env", await run("typescript", "const p: string = await chart([{ x: 1, y: 2 }], { kind: 'bar' }); const t: string[] = tables.list(); const k: string | undefined = env.MY_KEY; return p", { typecheck: true }, sec), "chart.html");
+  check("a chart title with $ patterns is kept intact", await run("javascript", "await chart([{x: 1, y: 2}], { title: \"cost $& $' done\" }); const h = await fs.readFile('chart.html'); console.log(h.includes(\"cost $& $' done\"), h.split('__OPTS__').length)", {}, big), "true 1");
+  check("the trailer never contains a secret", prev, (s, raw) => { const t = /\[\[cr-state:([^\]]+)\]\]/.exec(raw)[1]; return !Buffer.from(t, "base64").toString("latin1").includes("supersecret123"); });
+  hits["proxy:public"] = 0;
+  check("a request carrying a secret never goes to public proxies", await run("javascript", "try { const r = await fetch('https://blocked.example/s?q=' + env.MY_KEY); console.log(r.status) } catch (e) { console.log('ERR', e.message) }", {}, sec),
+    (s) => /^ERR/.test(s) && hits["proxy:public"] === 0);
+  check("the run history does not keep secrets", prev, (s, raw) => { const t = /\[\[cr-state:([^\]]+)\]\]/.exec(raw)[1]; return !Buffer.from(t, "base64").toString("latin1").includes("supersecret123"); });
+  check("export_notebook writes a valid notebook", await tool(manage_files, { action: "export_notebook" }, big), (s) => /Wrote notebook\.ipynb with \d+ runs/.test(s));
+  check("the notebook has code cells with outputs", await run("python", "import json\nnb = json.load(open('notebook.ipynb'))\ncode = [c for c in nb['cells'] if c['cell_type'] == 'code']\nprint(nb['nbformat'], len(code) > 3, any('share_table' in ''.join(c['source']) for c in code))", {}, big), "4 True True");
+  check("export_notebook as markdown", await tool(manage_files, { action: "export_notebook", format: "markdown" }, big), (s) => /Wrote notebook\.md/.test(s));
+  check("manage_files mentions shared tables and history", await tool(manage_files, {}, big), (s) => /shared tables pts, sales/.test(s) && /recorded runs for export_notebook/.test(s));
+  prev = undefined;
+  globalThis.__litterOnlyDown = true; hits["pastes:post"] = 0;
+  const chunky = { stateLimitKB: "1", publicStores: "on" };
+  check("a workspace over a store's limit is uploaded in parts", await run("python", "import os; open('big.bin','wb').write(os.urandom(2600000)); print('w')", {}, chunky), (s) => s === "w" && hits["pastes:post"] >= 2);
+  check("and restored from the parts", await run("python", "import os; print(os.path.getsize('big.bin'))", {}, chunky), "2600000");
+  globalThis.__litterOnlyDown = false;
+
+  // 13. Never throws, always explains --------------------------------------------------------------
   check("null params", await run_code(null, null, null), (s) => /No code was provided/.test(s));
   check("unsupported language", await run("brainfuck", "+", {}, big), (s) => /Unsupported language "brainfuck"/.test(s) && /python/.test(s));
   check("empty code", await run("python", "  ", {}, big), (s) => /No code was provided/.test(s));

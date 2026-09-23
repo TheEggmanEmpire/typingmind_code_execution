@@ -68,7 +68,10 @@ const TS_GLOBALS = [
   "};",
   "declare const storage: { get(key: string): any; set<T>(key: string, value: T): T; has(key: string): boolean; delete(key: string): boolean; keys(): string[]; clear(): void };",
   "declare const stdin: string;",
-  "declare function sleep(ms: number): Promise<void>;"
+  "declare function sleep(ms: number): Promise<void>;",
+  "declare function chart(rows: object[], options?: { x?: string; y?: string | string[]; kind?: 'line' | 'bar' | 'barh' | 'scatter' | 'point' | 'area' | 'pie' | 'donut' | 'histogram'; title?: string; path?: string; color?: string; bins?: number; height?: number; spec?: object }): Promise<string>;",
+  "declare const tables: { get(name: string): Record<string, any>[]; set(name: string, rows: object[]): string; list(): string[] };",
+  "declare const env: Readonly<Record<string, string>>;"
 ].join("\n");
 const WEBR_VERSION = "0.6.0";
 const WEBR_CDNS = [
@@ -80,6 +83,229 @@ const DUCKDB_CDNS = [
   "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@" + DUCKDB_VERSION + "/+esm",
   "https://fastly.jsdelivr.net/npm/@duckdb/duckdb-wasm@" + DUCKDB_VERSION + "/+esm"
 ];
+// Ruby 3.4 (ruby.wasm) with its standard library, and the WASI shim that gives
+// it a /workspace directory.
+const RUBY_CDNS = [
+  { vm: "https://cdn.jsdelivr.net/npm/@ruby/wasm-wasi@2.10.1/+esm", shim: "https://cdn.jsdelivr.net/npm/@bjorn3/browser_wasi_shim@0.4.2/+esm",
+    wasm: "https://cdn.jsdelivr.net/npm/@ruby/3.4-wasm-wasi@2.10.1/dist/ruby+stdlib.wasm" },
+  { vm: "https://fastly.jsdelivr.net/npm/@ruby/wasm-wasi@2.10.1/+esm", shim: "https://fastly.jsdelivr.net/npm/@bjorn3/browser_wasi_shim@0.4.2/+esm",
+    wasm: "https://fastly.jsdelivr.net/npm/@ruby/3.4-wasm-wasi@2.10.1/dist/ruby+stdlib.wasm" }
+];
+
+// chart() in python, javascript and r writes this page with the rows and
+// options in place of __OPTS__; the Vega-Lite spec is built when the page is
+// viewed (preview_file), so each language only serializes data and options.
+const CHART_HTML = String.raw`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/vega@5.30.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5.21.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6.26.0"></script>
+<style>body{margin:0;padding:10px;font:14px system-ui,sans-serif;background:#fff}#c{width:100%}
+@media (prefers-color-scheme:dark){body{background:#0d1117;color:#e6edf3}}</style></head>
+<body><div id="c"></div><script>
+const o = __OPTS__;
+const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+let spec;
+if (o.spec) { spec = o.spec; if (!spec.data) spec.data = { values: o.data || [] }; }
+else {
+  const rows = o.data || [];
+  const keys = rows.length ? Object.keys(rows[0]) : [];
+  const x = o.x || keys[0];
+  const first = (k) => { const r = rows.find((r) => r[k] !== null && r[k] !== undefined); return r ? r[k] : null; };
+  const ys = [].concat(o.y || keys.filter((k) => k !== x && typeof first(k) === "number")).slice(0, 12);
+  const type = (k) => { const v = first(k); if (typeof v === "number") return "quantitative"; if (typeof v === "string" && /^\d{4}-\d{2}(-\d{2})?([T ][\d:.]+Z?)?$/.test(v)) return "temporal"; return "nominal"; };
+  const kind = String(o.kind || "line").toLowerCase();
+  const mark = { line: "line", bar: "bar", barh: "bar", scatter: "point", point: "point", area: "area", pie: "arc", donut: "arc", histogram: "bar" }[kind] || kind;
+  const multi = ys.length > 1, yField = multi ? "value" : ys[0], color = multi ? "series" : o.color;
+  spec = { $schema: "https://vega.github.io/schema/vega-lite/v5.json", width: "container", height: o.height || 360,
+    data: { values: rows }, mark: { type: mark, tooltip: true } };
+  if (o.title) spec.title = o.title;
+  if (mark === "line" && rows.length <= 80) spec.mark.point = true;
+  if (kind === "donut") spec.mark.innerRadius = 70;
+  if (multi) spec.transform = [{ fold: ys, as: ["series", "value"] }];
+  if (mark === "arc") spec.encoding = { theta: { field: yField, type: "quantitative", stack: true }, color: { field: x, type: "nominal" } };
+  else if (kind === "histogram") spec.encoding = { x: { field: x, bin: { maxbins: o.bins || 30 }, type: "quantitative" }, y: { aggregate: "count", type: "quantitative" } };
+  else {
+    const X = { field: x, type: type(x), sort: null }, Y = { field: yField, type: "quantitative", title: multi ? null : yField };
+    spec.encoding = kind === "barh" ? { y: X, x: Y } : { x: X, y: Y };
+    if (color) spec.encoding.color = { field: color, type: "nominal" };
+    if (mark !== "bar") spec.params = [{ name: "zoom", select: "interval", bind: "scales" }];
+  }
+}
+vegaEmbed("#c", spec, { theme: dark ? "dark" : undefined, actions: { export: true, source: false, compiled: false, editor: false } })
+  .catch((e) => { document.getElementById("c").textContent = "Chart error: " + e.message; });
+</script></body></html>`;
+
+// Helpers defined in every Python run: chart(), share_table()/get_table()/
+// list_tables() and read_text(). Plain Python source (no JS escaping).
+const PY_HELPERS = String.raw`
+import os as _cr_os, sys as _cr_sys
+
+def chart(data, x=None, y=None, kind='line', title='', path='chart.html', color=None, bins=None, spec=None, height=None):
+    # Write an interactive chart page to /workspace/<path>; show it with preview_file.
+    import json, math
+    pd, np = _cr_sys.modules.get('pandas'), _cr_sys.modules.get('numpy')
+    rows = data
+    if pd is not None and isinstance(data, pd.Series):
+        data = data.reset_index()
+    if pd is not None and isinstance(data, pd.DataFrame):
+        if not isinstance(data.index, pd.RangeIndex):
+            data = data.reset_index()
+        rows = json.loads(data.to_json(orient='records', date_format='iso'))
+    elif isinstance(data, dict):
+        if data and all(isinstance(v, (list, tuple)) for v in data.values()):
+            keys = list(data)
+            rows = [dict(zip(keys, vals)) for vals in zip(*data.values())]
+        else:
+            rows = [{'label': k, 'value': v} for k, v in data.items()]
+            x = x or 'label'
+            y = y or 'value'
+    else:
+        rows = [r if isinstance(r, dict) else {'x': i, 'y': r} for i, r in enumerate(list(rows))]
+    def clean(v):
+        if np is not None and isinstance(v, np.generic):
+            v = v.item()
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+        return v if v is None or isinstance(v, (int, float, str, bool)) else str(v)
+    rows = [{str(k): clean(v) for k, v in r.items()} for r in rows[:50000]]
+    opts = dict(data=rows, x=x, y=y, kind=kind, title=title, color=color, bins=bins, spec=spec, height=height)
+    page = _CR_CHART_HTML.replace('__OPTS__', json.dumps(opts, default=str).replace('</', '<\\/'))
+    full = _cr_os.path.join('/workspace', path)
+    _cr_os.makedirs(_cr_os.path.dirname(full), exist_ok=True)
+    with open(full, 'w', encoding='utf-8') as f:
+        f.write(page)
+    return path
+
+def _cr_table_path(name):
+    import re
+    if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', str(name)):
+        raise ValueError('table names use letters, digits and _')
+    return '/workspace/.cr/tables/%s.csv' % name
+
+def share_table(name, data):
+    # Share a table with the other languages: a DuckDB view, get_table() in R/JS/Python.
+    import csv
+    p = _cr_table_path(name)
+    _cr_os.makedirs(_cr_os.path.dirname(p), exist_ok=True)
+    pd = _cr_sys.modules.get('pandas')
+    if pd is not None and isinstance(data, (pd.DataFrame, pd.Series)):
+        df = data.to_frame() if isinstance(data, pd.Series) else data
+        df.to_csv(p, index=not isinstance(df.index, pd.RangeIndex))
+        return name
+    rows = list(data)
+    with open(p, 'w', newline='', encoding='utf-8') as f:
+        if rows and isinstance(rows[0], dict):
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        else:
+            csv.writer(f).writerows(rows)
+    return name
+
+def list_tables():
+    d = '/workspace/.cr/tables'
+    return sorted(n[:-4] for n in _cr_os.listdir(d) if n.endswith('.csv')) if _cr_os.path.isdir(d) else []
+
+def get_table(name):
+    # A shared table: a pandas DataFrame when pandas is available, else a list of dicts.
+    p = _cr_table_path(name)
+    if not _cr_os.path.exists(p):
+        raise FileNotFoundError('no shared table %r (shared tables: %s)' % (name, ', '.join(list_tables()) or 'none'))
+    try:
+        import pandas as pd
+        return pd.read_csv(p)
+    except ImportError:
+        import csv
+        with open(p, newline='', encoding='utf-8') as f:
+            return list(csv.DictReader(f))
+
+def read_text(path, max_chars=None):
+    # Plain text of a PDF, DOCX, PPTX, XLSX, HTML or text file.
+    ext = _cr_os.path.splitext(str(path))[1].lower()
+    try:
+        if ext == '.pdf':
+            import pypdf
+            t = '\n\n'.join((pg.extract_text() or '') for pg in pypdf.PdfReader(path).pages)
+        elif ext == '.docx':
+            import docx
+            d = docx.Document(path)
+            t = '\n'.join(p.text for p in d.paragraphs)
+            for tb in d.tables:
+                t += '\n' + '\n'.join('\t'.join(c.text for c in r.cells) for r in tb.rows)
+        elif ext == '.pptx':
+            from pptx import Presentation
+            t = '\n\n'.join('--- slide %d ---\n' % (i + 1) + '\n'.join(sh.text_frame.text for sh in sl.shapes if sh.has_text_frame)
+                            for i, sl in enumerate(Presentation(path).slides))
+        elif ext in ('.xlsx', '.xlsm'):
+            import openpyxl
+            wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+            t = '\n\n'.join('--- sheet %s ---\n' % ws.title + '\n'.join('\t'.join('' if v is None else str(v) for v in r)
+                            for r in ws.iter_rows(values_only=True)) for ws in wb.worksheets)
+        elif ext in ('.html', '.htm'):
+            from bs4 import BeautifulSoup
+            with open(path, encoding='utf-8', errors='replace') as f:
+                t = BeautifulSoup(f.read(), 'html.parser').get_text('\n')
+        else:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                t = f.read()
+    except ModuleNotFoundError as e:
+        pkg = {'pypdf': 'pypdf', 'docx': 'python-docx', 'pptx': 'python-pptx', 'openpyxl': 'openpyxl', 'bs4': 'beautifulsoup4'}.get(e.name, e.name)
+        raise ModuleNotFoundError('read_text needs %s for %s files: pass packages: ["%s"]' % (pkg, ext, pkg)) from None
+    return t[:max_chars] if max_chars else t
+`;
+
+// Helpers attached in every R run: chart(), share_table(), get_table(), list_tables().
+const R_HELPERS = String.raw`local({
+  e <- new.env()
+  e$.cr_json1 <- function(v) {
+    if (length(v) == 0 || (length(v) == 1 && is.na(v))) return("null")
+    if (inherits(v, c("Date", "POSIXt"))) return(encodeString(format(v), quote = '"'))
+    if (is.factor(v)) v <- as.character(v)
+    if (is.logical(v)) return(tolower(as.character(v)))
+    if (is.numeric(v)) return(if (is.finite(v)) format(v, digits = 15, scientific = FALSE, trim = TRUE) else "null")
+    encodeString(as.character(v), quote = '"')
+  }
+  e$.cr_json_rows <- function(df) {
+    df <- as.data.frame(df, stringsAsFactors = FALSE)
+    if (!is.null(rownames(df)) && !identical(rownames(df), as.character(seq_len(nrow(df))))) df <- cbind(row = rownames(df), df)
+    n <- min(nrow(df), 50000)
+    keys <- encodeString(names(df), quote = '"')
+    rows <- vapply(seq_len(n), function(i) paste0("{", paste0(keys, ":", vapply(df, function(col) e$.cr_json1(col[[i]]), ""), collapse = ","), "}"), "")
+    paste0("[", paste(rows, collapse = ","), "]")
+  }
+  e$chart <- function(data, x = NULL, y = NULL, kind = "line", title = "", path = "chart.html", color = NULL, bins = NULL) {
+    s <- function(v) if (is.null(v)) "null" else if (length(v) > 1) paste0("[", paste(encodeString(v, quote = '"'), collapse = ","), "]") else encodeString(as.character(v), quote = '"')
+    opts <- paste0('{"data":', e$.cr_json_rows(data), ',"x":', s(x), ',"y":', s(y), ',"kind":', s(kind), ',"title":', s(title),
+                   ',"color":', s(color), ',"bins":', if (is.null(bins)) "null" else bins, '}')
+    page <- paste(readLines("/tmp/cr_chart.html", warn = FALSE), collapse = "\n")
+    opts <- paste(strsplit(opts, "</", fixed = TRUE)[[1]], collapse = "<\\/")
+    parts <- strsplit(page, "__OPTS__", fixed = TRUE)[[1]]
+    page <- paste0(parts[1], opts, parts[2])
+    if (dirname(path) != ".") dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+    writeLines(page, path)
+    invisible(path)
+  }
+  e$.cr_table_path <- function(name) {
+    if (!grepl("^[A-Za-z_][A-Za-z0-9_]*$", name)) stop("table names use letters, digits and _")
+    file.path("/workspace/.cr/tables", paste0(name, ".csv"))
+  }
+  e$share_table <- function(name, data) {
+    p <- e$.cr_table_path(name); dir.create(dirname(p), recursive = TRUE, showWarnings = FALSE)
+    utils::write.csv(as.data.frame(data), p, row.names = FALSE); invisible(name)
+  }
+  e$list_tables <- function() sub("\\.csv$", "", list.files("/workspace/.cr/tables", pattern = "\\.csv$"))
+  e$get_table <- function(name) {
+    p <- e$.cr_table_path(name)
+    if (!file.exists(p)) stop(sprintf("no shared table '%s' (shared tables: %s)", name, paste(e$list_tables(), collapse = ", ")))
+    utils::read.csv(p, stringsAsFactors = FALSE, check.names = FALSE)
+  }
+  attach(e, name = "cr:helpers", warn.conflicts = FALSE)
+})
+`;
+
+// Packages read_text() needs, installed when the code names such a file.
+const READ_TEXT_PKGS = { pdf: "pypdf", docx: "python-docx", pptx: "python-pptx", xlsx: "openpyxl", xlsm: "openpyxl" };
+
 const SCRIPT_TIMEOUT_MS  = 45000;
 const RUNTIME_TIMEOUT_MS = 180000;   // wasm + stdlib download can be slow on mobile
 
@@ -87,13 +313,17 @@ const WORKDIR = "/workspace";
 const DB_REL = "data.sqlite";
 const PY_SESSION_REL = ".cr/session.pkl";   // saved Python variables, carried like any file
 const UPLOADS_DIR = "uploads";              // files the user attached to their message
+const TABLES_DIR = ".cr/tables";            // share_table(): CSV files every language can read
 const SQL_ROWS_SHOWN = 500;
 const OUTPUT_HEAD = 30000;           // characters of output kept from the start...
 const OUTPUT_TAIL = 10000;           // ...and from the end, when a run prints more
 const EXEC_TIMEOUT_S_DEFAULT = 120;
 const STATE_LIMIT_KB_DEFAULT = 24;
 const STATE_TTL_MIN_DEFAULT = 1440;
-const MAX_CARRY_BYTES = 40 * 1024 * 1024;
+const MAX_CARRY_BYTES = 40 * 1024 * 1024;         // without a private store
+const MAX_CARRY_BYTES_STORE = 150 * 1024 * 1024;  // with one: uploaded in parts
+const MAX_STORE_PARTS = 8;
+function maxCarry(cfg) { return cfg && cfg.workspaceStore && cfg.bigWorkspace ? MAX_CARRY_BYTES_STORE : MAX_CARRY_BYTES; }
 const PRIVATE_STORE_MAX = 24 * 1024 * 1024;   // the companion Worker's limit (KV values are capped at 25 MB)
 const SERVE_MAX_BYTES = 20 * 1024 * 1024;
 
@@ -132,7 +362,7 @@ const PY_PIP_ALIASES = {
 // ---------------------------------------------------------------------------
 // Languages
 // ---------------------------------------------------------------------------
-const LOCAL_LANGS = ["python", "javascript", "typescript", "sql", "duckdb", "r"];
+const LOCAL_LANGS = ["python", "javascript", "typescript", "sql", "duckdb", "r", "ruby"];
 
 // Compiler Explorer (godbolt.org) runs these. `wb` names a Wandbox compiler to
 // fall back to when Compiler Explorer is unreachable; `pick` finds a current
@@ -151,7 +381,6 @@ const CE_LANGS = {
   "d":       { id: "dmd21120",            lang: "d",       args: "",                   wb: "dmd-2.109.1",    pick: /dmd|ldc/ },
   "haskell": { id: "ghc9122",             lang: "haskell", args: "",                   wb: "ghc-9.10.1",     pick: /ghc \d/ },
   "ocaml":   { id: "ocaml5200",           lang: "ocaml",   args: "",                   wb: "ocaml-5.2.0",    pick: /ocamlopt \d/ },
-  "ruby":    { id: "ruby405",             lang: "ruby",    args: "",                   wb: "ruby-4.0.2",     pick: /^Ruby \d/ },
   "perl":    { id: "perl5440",            lang: "perl",    args: "",                   wb: "perl-5.42.0",    pick: /^Perl \d/ },
   "lua":     { id: "lua550",              lang: "lua",     args: "",                   wb: "lua-5.4.7",      pick: /^Lua \d/ },
   "dart":    { id: "dart373",             lang: "dart",    args: "",                   pick: /^Dart \d/ },
@@ -163,6 +392,10 @@ const CE_LANGS = {
   "ada":     { id: "gnat162",             lang: "ada",     args: "",                   pick: /x86-64 gnat \d/ },
   "objc":    { id: "objcg162",            lang: "objc",    args: "",                   pick: /x86-64 gcc \d/ }
 };
+
+// Ruby runs in the browser (ruby.wasm); Compiler Explorer runs it when a
+// version or flags are asked for, or when ruby.wasm cannot load.
+const RUBY_CE = { id: "ruby405", lang: "ruby", args: "", wb: "ruby-4.0.2", pick: /^Ruby \d/ };
 
 // R runs in the browser (webR); Wandbox is its fallback when webR cannot load.
 const R_WANDBOX = { compiler: "r-4.4.1", wbLang: "R" };
@@ -362,7 +595,29 @@ function carriesCredentials(input, init) {
   };
   if (init && scan(init.headers)) return true;
   if (input && typeof input === "object" && input.headers && scan(input.headers)) return true;
-  return urlCarriesSecret(requestUrl(input)) || bodyCarriesSecret(init && init.body);
+  return urlCarriesSecret(requestUrl(input)) || bodyCarriesSecret(init && init.body) || containsSecretValue(input, init);
+}
+
+// Any configured secret value in the URL, a header or a text body.
+function containsSecretValue(input, init) {
+  const vals = [].concat(...Object.values(globalThis.__crSecrets || {}).filter((v) => typeof v === "string" && v.length >= 6).map(secretForms));
+  if (!vals.length) return false;
+  const parts = [requestUrl(input)];
+  try { parts.push(decodeURIComponent(requestUrl(input))); } catch (e) {}
+  const addHeaders = (h) => {
+    if (!h) return;
+    if (typeof h.forEach === "function" && !Array.isArray(h)) h.forEach((v) => parts.push(String(v)));
+    else if (Array.isArray(h)) h.forEach(([, v]) => parts.push(String(v)));
+    else Object.values(h).forEach((v) => parts.push(String(v)));
+  };
+  addHeaders(init && init.headers);
+  if (input && typeof input === "object") addHeaders(input.headers);
+  const b = init && init.body;
+  if (typeof b === "string") parts.push(b);
+  else if (b && (b instanceof ArrayBuffer || ArrayBuffer.isView(b))) parts.push(new TextDecoder().decode(b instanceof ArrayBuffer ? new Uint8Array(b) : new Uint8Array(b.buffer, b.byteOffset, b.byteLength)));
+  else if (typeof URLSearchParams === "function" && b instanceof URLSearchParams) parts.push(b.toString());
+  const all = parts.join("\n");
+  return vals.some((v) => all.includes(v));
 }
 
 // user:pass@host, or a query parameter named like a key/token (?api_key=, ?token=, ?key=).
@@ -600,7 +855,7 @@ function patchXHR() {
       throw netError(host, why, err);
     }
     const credentialed = r.headers.some(([k]) => AUTH_HEADER.test(k)) || !!this.withCredentials ||
-      urlCarriesSecret(r.url) || bodyCarriesSecret(body);
+      urlCarriesSecret(r.url) || bodyCarriesSecret(body) || containsSecretValue(r.url, { headers: r.headers, body });
     let responseType = "";
     try { responseType = this.responseType; } catch (e) {}
     const cands = proxyCandidates(r.url, { credentialed, sync: true }).slice(0, XHR_SYNC_ROUTES_MAX);
@@ -849,7 +1104,7 @@ function crEngine(post, env) {
     "    if inspect.isgenerator(v) or inspect.iscoroutine(v) or inspect.isasyncgen(v) or isinstance(v, io.IOBase): return True",
     "    m = getattr(type(v), '__module__', '') or ''",
     "    return m.split('.')[0] in ('sqlite3', '_sqlite3', 'socket', '_thread', 'threading', 'pyodide', '_pyodide', 'js', 'zipfile', 'tarfile')",
-    "def _cr_session_save(path, limit):",
+    "def _cr_session_save(path, limit, secrets=()):",
     "    import pickle, types, inspect, os",
     "    g = globals()",
     "    imports, defs, data, mods, skipped = {}, [], {}, set(), []",
@@ -866,6 +1121,7 @@ function crEngine(post, env) {
     "                continue",
     "            if _cr_resource(v): continue",
     "            b = pickle.dumps(v, protocol=4)",
+    "            if any(sec and sec.encode('utf-8') in b for sec in secrets): continue",
     "            data[name] = b",
     "            m = (getattr(type(v), '__module__', '') or '').split('.')[0]",
     "            if m and m not in ('builtins', '__main__'): mods.add(m)",
@@ -958,6 +1214,9 @@ function crEngine(post, env) {
           inst.runPython("import pyodide_http\ngetattr(pyodide_http, 'patch_urllib', pyodide_http.patch_all)()");
         } catch (e) { pyHttpOk = false; }
         inst.runPython(PY_SETUP);
+        inst.globals.set("_CR_CHART_HTML", CHART_HTML);
+        inst.runPython(PY_HELPERS);
+        inst.runPython("_CR_BASE = set(globals())");
         py = inst;
         return inst;
       })().catch((e) => { pyLoading = null; throw e; });
@@ -995,11 +1254,15 @@ function crEngine(post, env) {
     // Packages Pyodide ships load from the imports; retry once for a flaky CDN.
     const loadImports = async () => {
       const errs = [];
-      const src = code + "\n" + sessionMods.map((m) => "import " + m).join("\n");
+      const src = code + "\n" + sessionMods.map((m) => "import " + m).join("\n") + (/\bget_table\s*\(/.test(code) ? "\nimport pandas" : "");
       try { await p.loadPackagesFromImports(src, { ...quiet, errorCallback: (m) => errs.push(String(m)) }); }
       catch (e) { errs.push(String(e && e.message || e)); }
       return errs;
     };
+    // Secrets from the plugin settings, as environment variables.
+    if (G.__crSecrets && Object.keys(G.__crSecrets).length) {
+      try { p.globals.set("_cr_env", p.toPy(G.__crSecrets)); p.runPython("import os\nos.environ.update(_cr_env)\ndel _cr_env"); } catch (e) {}
+    }
     let loadErrors = await loadImports();
     if (loadErrors.length) loadErrors = await loadImports();
     if (loadErrors.length) notes.push("some Python packages could not be downloaded: " + loadErrors.slice(0, 3).join(" | ").slice(0, 400));
@@ -1014,6 +1277,10 @@ function crEngine(post, env) {
       const missing = missingProxy.toJs(); missingProxy.destroy();
       for (const n of missing) if (PY_PIP_ALIASES[n]) wanted.push(PY_PIP_ALIASES[n]);
     } catch (e) {}
+    if (/\bread_text\s*\(/.test(code)) {
+      for (const m of code.matchAll(/\.(pdf|docx|pptx|xlsx|xlsm)\b/gi)) wanted.push(READ_TEXT_PKGS[m[1].toLowerCase()]);
+      if (/\.html?\b/i.test(code)) { try { await p.loadPackage("beautifulsoup4", quiet); } catch (e) {} }
+    }
     const toInstall = [...new Set(wanted)];
     if (toInstall.length) {
       try {
@@ -1077,10 +1344,10 @@ function crEngine(post, env) {
     } catch (e) {}
     if (keepVars) {
       try {
-        const r = p.globals.get("_cr_session_save")(sessionPath, msg.stateBudget || 20 * 1024 * 1024);
+        const r = p.globals.get("_cr_session_save")(sessionPath, msg.stateBudget || 20 * 1024 * 1024, p.toPy(Object.values(G.__crSecrets || {})));
         const skipped = r.toJs(); r.destroy();
-        if (skipped.length) notes.push("these Python variables are not kept for the next call: " + skipped.slice(0, 12).join(", ") +
-          (skipped.some((x) => /too large/.test(x)) && msg.stateBudget < 1048576 ? " (large values need a workspace store in the plugin settings; save data to files or recompute it)" : " (they cannot be pickled; recreate them when needed)"));
+        if (skipped.length) notes.push("not kept for the next call: " + skipped.slice(0, 12).join(", ") +
+          (skipped.some((x) => /too large/.test(x)) && msg.stateBudget < 1048576 ? " (large values need a workspace store in the plugin settings; save data to files or recompute it)" : ""));
       } catch (e) { notes.push("the Python variables could not be saved for the next call (" + String(e && e.message || e).split("\n").pop().slice(0, 200) + ")"); }
     }
     return error;
@@ -1250,6 +1517,52 @@ function crEngine(post, env) {
     };
   }
 
+  // chart(rows, { x, y, kind, title, path }) -> writes an interactive chart page.
+  async function jsChart(rows, o) {
+    o = o || {};
+    const data = Array.isArray(rows) ? rows.slice(0, 50000).map((r, i) => (r && typeof r === "object" ? r : { x: i, y: r })) : [];
+    const opts = { data, x: o.x || null, y: o.y || null, kind: o.kind || "line", title: o.title || "", color: o.color || null, bins: o.bins || null, spec: o.spec || null, height: o.height || null };
+    const path = o.path || "chart.html";
+    const json = JSON.stringify(opts, (k, v) => (typeof v === "bigint" ? Number(v) : v)).replace(/<\//g, "<\\/");
+    wsWrite(path, new TextEncoder().encode(CHART_HTML.replace("__OPTS__", () => json)));
+    return path;
+  }
+
+  // tables.get/set/list: the shared CSV tables (share_table in Python and R).
+  function parseCsv(text) {
+    const rows = []; let row = [], cur = "", q = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (q) { if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; continue; }
+      if (c === '"' && cur === "") q = true;
+      else if (c === ",") { row.push(cur); cur = ""; }
+      else if (c === "\n" || c === "\r") { if (c === "\r" && text[i + 1] === "\n") i++; row.push(cur); rows.push(row); row = []; cur = ""; }
+      else cur += c;
+    }
+    if (cur !== "" || row.length) { row.push(cur); rows.push(row); }
+    const [head, ...body] = rows.filter((r) => r.length > 1 || r[0] !== "");
+    const num = (v) => (v !== "" && !isNaN(Number(v)) ? Number(v) : v);
+    return head ? body.map((r) => Object.fromEntries(head.map((h, i) => [h, num(r[i] == null ? "" : r[i])]))) : [];
+  }
+  function toCsv(rows) {
+    const list = Array.isArray(rows) ? rows : [];
+    const keys = [...new Set(list.flatMap((r) => (r && typeof r === "object" ? Object.keys(r) : [])))];
+    const cell = (v) => { const s = v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v); return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+    return [keys.map(cell).join(",")].concat(list.map((r) => keys.map((k) => cell(r && r[k])).join(","))).join("\n") + "\n";
+  }
+  function makeTables() {
+    const path = (name) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(String(name))) throw new Error("table names use letters, digits and _");
+      return WORKDIR + "/" + TABLES_DIR + "/" + name + ".csv";
+    };
+    const list = () => (wsExists(WORKDIR + "/" + TABLES_DIR) ? wsReaddir(WORKDIR + "/" + TABLES_DIR).filter((n) => n.endsWith(".csv")).map((n) => n.slice(0, -4)) : []);
+    return {
+      list,
+      get: (name) => { const p = path(name); if (!wsExists(p)) throw new Error("no shared table '" + name + "' (shared tables: " + (list().join(", ") || "none") + ")"); return parseCsv(new TextDecoder().decode(wsRead(p))); },
+      set: (name, rows) => { wsWrite(path(name), new TextEncoder().encode(toCsv(rows))); return name; }
+    };
+  }
+
   function makeStorage() {
     return {
       get: (k) => kv.get(String(k)),
@@ -1311,7 +1624,7 @@ function crEngine(post, env) {
     };
     const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
     let fn;
-    try { fn = new AsyncFunction("console", "fetch", "fs", "storage", "stdin", "sleep", "importScripts", src); }
+    try { fn = new AsyncFunction("console", "fetch", "fs", "storage", "stdin", "sleep", "importScripts", "chart", "tables", "env", src); }
     catch (e) {
       post({ id: runId, ev: "started" });
       return label + " syntax error: " + (e && e.message || e);
@@ -1323,7 +1636,8 @@ function crEngine(post, env) {
       : async (...urls) => { for (const u of urls) await withTimeout(loadScript(u), SCRIPT_TIMEOUT_MS, "importScripts " + u); };
     post({ id: runId, ev: "started" });
     try {
-      const v = await fn(con, netFetch, makeFs(), makeStorage(), typeof msg.stdin === "string" ? msg.stdin : "", sleep, scripts);
+      const v = await fn(con, netFetch, makeFs(), makeStorage(), typeof msg.stdin === "string" ? msg.stdin : "", sleep, scripts,
+        jsChart, makeTables(), Object.freeze({ ...(G.__crSecrets || {}) }));
       if (v !== undefined) emit(fmt(v) + "\n");
       return null;
     } catch (e) {
@@ -1461,6 +1775,10 @@ function crEngine(post, env) {
     }
     if (msg.reset) { for (const f of [R_SESSION, R_PKGS]) try { await w.FS.unlink(WORKDIR + "/" + f); } catch (e) {} }
     await w.FS.writeFile("/tmp/cr_stdin.txt", new TextEncoder().encode(typeof msg.stdin === "string" ? msg.stdin : ""));
+    await w.FS.writeFile("/tmp/cr_chart.html", new TextEncoder().encode(CHART_HTML));
+    try { await w.evalRVoid(R_HELPERS); } catch (e) {}
+    const secrets = G.__crSecrets || {};
+    for (const [k, v] of Object.entries(secrets)) { try { await w.evalRVoid("Sys.setenv(" + rString(k) + " = " + rString(v) + ")"); } catch (e) {} }
     await w.evalRVoid("setwd('/workspace')\n" +
       "local({ lines <- readLines('/tmp/cr_stdin.txt', warn = FALSE); e <- new.env()\n" +
       "  e$readline <- function(prompt = '') { cat(prompt); if (!length(lines)) return(''); x <- lines[1]; lines <<- lines[-1]; x }\n" +
@@ -1526,7 +1844,9 @@ function crEngine(post, env) {
       try {
         await w.evalRVoid("local({ dir.create('.cr', showWarnings = FALSE)\n" +
           "  v <- ls(globalenv())\n" +
-          "  if (length(v)) save(list = v, file = " + rString(R_SESSION) + ", envir = globalenv()) else unlink(" + rString(R_SESSION) + ")\n" +
+          "  sec <- " + (Object.keys(secrets).length ? "c(" + Object.values(secrets).map(rString).join(", ") + ")" : "character(0)") + "\n" +
+          "  v <- Filter(function(n) { x <- get(n, envir = globalenv()); !(is.character(x) && length(sec) && any(vapply(sec, function(s) any(grepl(s, x, fixed = TRUE)), TRUE))) }, v)\n" +
+          "  if (length(v)) save(list = v, file = " + rString(R_SESSION) + ", envir = globalenv(), compress = FALSE) else unlink(" + rString(R_SESSION) + ")\n" +
           "  p <- setdiff(.packages(), c('stats', 'graphics', 'grDevices', 'utils', 'datasets', 'methods', 'base', 'webr'))\n" +
           "  if (length(p)) writeLines(p, " + rString(R_PKGS) + ") else unlink(" + rString(R_PKGS) + ") })");
         let size = 0;
@@ -1632,6 +1952,12 @@ function crEngine(post, env) {
         try { await conn.query("IMPORT DATABASE '" + DUCK_DIR + "'"); }
         catch (e) { notes.push("the saved DuckDB tables could not be restored (" + String(e && e.message || e).split("\n")[0].slice(0, 200) + ")"); }
       }
+      // Shared tables (share_table in Python/R, tables.set in JS) appear as views.
+      for (const rel of before.keys()) {
+        const m = new RegExp("^" + TABLES_DIR.replace(/[.]/g, "\\.") + "/([A-Za-z_][A-Za-z0-9_]*)\\.csv$").exec(rel);
+        if (!m) continue;
+        try { await conn.query("CREATE VIEW IF NOT EXISTS \"" + m[1] + "\" AS SELECT * FROM read_csv_auto('" + rel + "')"); } catch (e) {}
+      }
       post({ id: runId, ev: "started" });
       const blocks = [];
       let changed = 0;
@@ -1694,6 +2020,80 @@ function crEngine(post, env) {
     return error;
   }
 
+  // ----- Ruby (ruby.wasm) -------------------------------------------------------------
+  let rubyLib = null;
+  async function ensureRuby() {
+    if (rubyLib) return rubyLib;
+    const errors = [];
+    const get = G.__crRealFetch || fetch;
+    for (const c of cfg.rubyCdns || RUBY_CDNS) {
+      try {
+        const [vmMod, shim] = await withTimeout(Promise.all([import(c.vm), import(c.shim)]), SCRIPT_TIMEOUT_MS, "ruby.wasm modules from " + hostOf(c.vm));
+        const r = await withTimeout(get(c.wasm), RUNTIME_TIMEOUT_MS, "the Ruby runtime from " + hostOf(c.wasm));
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const module = await withTimeout(WebAssembly.compile(await r.arrayBuffer()), RUNTIME_TIMEOUT_MS, "compiling the Ruby runtime");
+        rubyLib = { RubyVM: vmMod.RubyVM, shim, module };
+        return rubyLib;
+      } catch (e) { errors.push(hostOf(c.wasm) + ": " + (e.message || e)); }
+    }
+    const err = new Error("Could not download the Ruby runtime (ruby.wasm) from any CDN (" + errors.join("; ") + ")");
+    err.runtimeUnavailable = true;
+    throw err;
+  }
+
+  async function runRuby(msg) {
+    const { RubyVM, shim, module } = await ensureRuby();
+    // /workspace as a WASI directory tree.
+    const root = new Map();
+    const before = new Map(wsWalk());
+    for (const [rel, b] of before) {
+      const parts = rel.split("/");
+      let dir = root;
+      for (const d of parts.slice(0, -1)) {
+        let sub = dir.get(d);
+        if (!sub || !(sub instanceof shim.Directory)) { sub = new shim.Directory(new Map()); dir.set(d, sub); }
+        dir = sub.contents;
+      }
+      dir.set(parts[parts.length - 1], new shim.File(b.slice()));
+    }
+    const pre = new shim.PreopenDirectory(WORKDIR, root);
+    const decOut = new TextDecoder(), decErr = new TextDecoder();
+    const fds = [
+      new shim.OpenFile(new shim.File(new TextEncoder().encode(typeof msg.stdin === "string" ? msg.stdin : ""))),
+      new shim.ConsoleStdout((b) => emit(decOut.decode(b, { stream: true }))),
+      new shim.ConsoleStdout((b) => emit(decErr.decode(b, { stream: true }))),
+      pre
+    ];
+    const envList = ["HOME=" + WORKDIR, "PWD=" + WORKDIR].concat(Object.entries(G.__crSecrets || {}).map(([k, v]) => k + "=" + v));
+    const wasi = new shim.WASI(["ruby"], envList, fds, { debug: false });
+    const { vm } = await RubyVM.instantiateModule({ module, wasip1: wasi });
+    vm.eval('Dir.chdir("' + WORKDIR + '")');
+    post({ id: runId, ev: "started" });
+    let error = null;
+    try {
+      const v = vm.eval(msg.code);
+      if (v && String(v.call("nil?")) !== "true") emit("=> " + String(v.call("inspect")) + "\n");
+    } catch (e) {
+      const m = String(e && e.message || e).split("\n").filter((l) => !/^\s*-e:in 'Kernel\.eval'/.test(l)).join("\n").replace(/^eval:(\d+)/gm, "line $1");
+      error = "Ruby error: " + m.trim();
+    }
+    try { vm.eval("$stdout.flush; $stderr.flush"); } catch (e) {}
+    emit(decOut.decode()); emit(decErr.decode());
+    // Back out: walk the tree.
+    const after = new Map();
+    const walk = (dir, prefix) => {
+      for (const [name, node] of dir) {
+        const rel = prefix ? prefix + "/" + name : name;
+        if (node instanceof shim.Directory) walk(node.contents, rel);
+        else if (node instanceof shim.File) after.set(rel, node.data instanceof Uint8Array ? node.data : new Uint8Array(node.data));
+      }
+    };
+    walk(pre.dir.contents, "");
+    for (const [rel, b] of after) { const old = before.get(rel); if (!old || old.length !== b.length || old.some((x, i) => x !== b[i])) wsWrite(WORKDIR + "/" + rel, b); }
+    for (const rel of before.keys()) if (!after.has(rel)) { try { wsRemove(WORKDIR + "/" + rel); } catch (e) {} }
+    return error;
+  }
+
   // ----- messages ----------------------------------------------------------------------
   async function handle(msg) {
     const id = msg && msg.id;
@@ -1706,6 +2106,7 @@ function crEngine(post, env) {
           G.__crCorsProxy = cfg.corsProxy || "";
           G.__crFetchTimeout = cfg.fetchTimeoutMs || 30000;
           G.__crNoPublicProxies = !!cfg.noPublicProxies;
+          G.__crSecrets = cfg.secrets && typeof cfg.secrets === "object" ? cfg.secrets : {};
           mergeHosts(msg.hosts);
           for (const [rel, b] of msg.files || []) wsWrite(WORKDIR + "/" + rel, b);
           for (const [k, v] of Object.entries(msg.kv || {})) kv.set(k, v);
@@ -1724,6 +2125,7 @@ function crEngine(post, env) {
             else if (msg.lang === "sql") error = await runSql(msg);
             else if (msg.lang === "r") error = await runR(msg, notes);
             else if (msg.lang === "duckdb") error = await runDuck(msg, notes);
+            else if (msg.lang === "ruby") error = await runRuby(msg);
             else error = "Unsupported language: " + msg.lang;
           } catch (e) {
             error = String(e && e.message || e);
@@ -1735,7 +2137,8 @@ function crEngine(post, env) {
         }
         case "snapshot": {
           const kvObj = {};
-          for (const [k, v] of kv) { try { JSON.stringify(v); kvObj[k] = v; } catch (e) {} }
+          const secretVals = Object.values(G.__crSecrets || {}).filter(Boolean);
+          for (const [k, v] of kv) { try { const j = JSON.stringify(v); if (!secretVals.some((sv) => j.includes(sv))) kvObj[k] = v; } catch (e) {} }
           return post({ id, ok: true, files: wsWalk(), kv: kvObj, hosts: hostHealthSnapshot() });
         }
         default:
@@ -1754,12 +2157,12 @@ const SHARED_FUNCTIONS = [
   loadScript, withTimeout, bytesToBase64, base64ToBytes, hostOf, isAbort,
   fetchTimeoutMs, proxyTimeoutMs, proxyPhaseMs, deadHostProbeMs, hostHealth, deadHost, markDead, markAlive,
   netNote, netError, hostHealthSnapshot, mergeHosts, applyProxy, mirrorUrl, proxyCandidates, requestUrl,
-  carriesCredentials, urlCarriesSecret, bodyCarriesSecret, noteProxyRejected, timedFetch, proxyHop, raceProxies, describeStats, fetchDirectThenProxies, netFetch,
+  carriesCredentials, urlCarriesSecret, bodyCarriesSecret, containsSecretValue, secretForms, noteProxyRejected, timedFetch, proxyHop, raceProxies, describeStats, fetchDirectThenProxies, netFetch,
   patchFetch, patchXHR, crEngine
 ];
 function workerConstants() {
   return {
-    WORKDIR, DB_REL, PY_SESSION_REL, SQL_ROWS_SHOWN, TSC_CDNS, TS_LIBS, TS_GLOBALS, WEBR_CDNS, DUCKDB_CDNS, OUTPUT_HEAD, OUTPUT_TAIL, SCRIPT_TIMEOUT_MS, RUNTIME_TIMEOUT_MS, BABEL_CDNS,
+    WORKDIR, DB_REL, PY_SESSION_REL, SQL_ROWS_SHOWN, RUBY_CDNS, CHART_HTML, PY_HELPERS, R_HELPERS, READ_TEXT_PKGS, TABLES_DIR, TSC_CDNS, TS_LIBS, TS_GLOBALS, WEBR_CDNS, DUCKDB_CDNS, OUTPUT_HEAD, OUTPUT_TAIL, SCRIPT_TIMEOUT_MS, RUNTIME_TIMEOUT_MS, BABEL_CDNS,
     PY_PIP_ALIASES, BUILTIN_PROXIES, PROXY_PARALLEL, DEAD_HOST_TTL_MS, XHR_SYNC_ROUTES_MAX
   };
 }
@@ -1948,7 +2351,7 @@ function decodeContainer(body) {
     if (!snap || snap.v !== 1) throw new Error("unknown workspace format");
     const files = (snap.files || []).map(([p, b64]) => [p, base64ToBytes(b64)]);
     if (snap.sql && !files.some(([p]) => p === DB_REL)) files.push([DB_REL, base64ToBytes(snap.sql)]);
-    return { files, kv: snap.kv || {}, hosts: snap.net && snap.net.hosts, ext: snap.ext || null, att: [] };
+    return { files, kv: snap.kv || {}, hosts: snap.net && snap.net.hosts, ext: snap.ext || null, att: [], hist: [] };
   }
   const len = new DataView(body.buffer, body.byteOffset, body.byteLength).getUint32(0);
   const header = JSON.parse(new TextDecoder().decode(body.subarray(4, 4 + len)));
@@ -1956,7 +2359,8 @@ function decodeContainer(body) {
   let off = 4 + len;
   const files = [];
   for (const [p, n] of header.files || []) { files.push([p, body.slice(off, off + n)]); off += n; }
-  return { files, kv: header.kv || {}, hosts: header.net && header.net.hosts, ext: header.ext || null, att: Array.isArray(header.att) ? header.att : [] };
+  return { files, kv: header.kv || {}, hosts: header.net && header.net.hosts, ext: header.ext || null,
+    att: Array.isArray(header.att) ? header.att : [], hist: Array.isArray(header.hist) ? header.hist : [] };
 }
 
 async function decodeState(b64) {
@@ -2008,13 +2412,20 @@ async function restoreSnapshot(b64, cfg) {
   try { snap = await decodeState(b64); }
   catch (e) { throw new Error("the saved workspace data is damaged"); }
   if (snap.ext) {
-    const ext = snap.ext;
+    const ext = snap.ext, hist = snap.hist, att = snap.att;
     if (!ext.exp || Date.now() > ext.exp) throw new Error("the saved workspace expired");
-    let text;
-    try { text = await downloadBlob(ext.url, cfg); }
-    catch (e) { throw new Error("the saved workspace could not be downloaded from " + hostOf(ext.url) + " (" + (e.message || e) + ")"); }
+    let text = "";
+    const urls = Array.isArray(ext.parts) ? ext.parts : [ext.url];
+    for (const u of urls) {
+      try { text += await downloadBlob(u, cfg); }
+      catch (e) { throw new Error("the saved workspace could not be downloaded from " + hostOf(u) + " (" + (e.message || e) + ")"); }
+    }
     try { snap = await decodeState(text); }
     catch (e) { throw new Error("the downloaded workspace is damaged"); }
+    // Run history and attachment ids travel in the small pointer, not in the
+    // uploaded workspace, so an unchanged workspace is not uploaded again.
+    if (hist && hist.length) snap.hist = hist;
+    if (att && att.length) snap.att = att;
     globalThis.__crExtIn = { ptr: ext, trailer: b64 };
   }
   mergeHosts(snap.hosts);
@@ -2079,9 +2490,10 @@ async function uploadState(payload, cfg, hash) {
     e.noStore = true;
     throw e;
   }
-  const bins = all.filter((b) => payload.length <= b.max);
+  // A payload bigger than a store's limit goes up in parts (at most MAX_STORE_PARTS).
+  const bins = all.filter((b) => payload.length <= b.max * MAX_STORE_PARTS);
   if (!bins.length) {
-    const max = Math.max(...all.map((b) => b.max));
+    const max = Math.max(...all.map((b) => b.max)) * MAX_STORE_PARTS;
     const e = new Error("it is " + Math.ceil(payload.length / 1024) + " KB compressed, more than the workspace store accepts (" + Math.round(max / 1048576) + " MB)");
     e.tooLarge = true;
     e.max = max;
@@ -2090,13 +2502,22 @@ async function uploadState(payload, cfg, hash) {
   const errors = [];
   for (const bin of bins) {
     try {
-      const { url, del } = await binUpload(bin, payload);
-      const check = await downloadBlob(url, cfg);
-      if (check !== payload) throw new Error("read-back mismatch");
+      const size = bin.max - 1024;
+      const chunks = [];
+      for (let i = 0; i < payload.length; i += size) chunks.push(payload.slice(i, i + size));
+      const urls = [];
+      for (const chunk of chunks) {
+        const { url } = await binUpload(bin, chunk);
+        const check = await downloadBlob(url, cfg);
+        if (check !== chunk) throw new Error("read-back mismatch");
+        urls.push(url);
+      }
       // Earlier uploads are left to expire: an edited or regenerated message
       // further up the chat may still point at them.
       const lifeMin = Math.min(cfg.ttlMin, bin.lifeMin || Infinity);
-      return { url, del, exp: Date.now() + lifeMin * 60000, h: hash || undefined };
+      const ptr = { exp: Date.now() + lifeMin * 60000, h: hash || undefined };
+      if (urls.length === 1) ptr.url = urls[0]; else ptr.parts = urls;
+      return ptr;
     } catch (e) { errors.push(hostOf(bin.host) + ": " + (e.message || e)); }
   }
   throw new Error("upload failed (" + errors.join("; ") + ")");
@@ -2111,29 +2532,44 @@ async function buildTrailer(snap, cfg, notes) {
   let files = snap.files || [];
   const kvObj = snap.kv || {};
   const hosts = hostHealthSnapshot();
-  if (!files.length && !Object.keys(kvObj).length && !hosts && !(snap.att && snap.att.length)) return null;
+  if (!files.length && !Object.keys(kvObj).length && !hosts && !(snap.att && snap.att.length) && !(snap.hist && snap.hist.length)) return null;
+  const secretVals = secretValues(cfg.secrets);
+  if (secretVals.length) {
+    const leaking = files.filter(([, b]) => bytesContainSecret(b, secretVals)).map(([p]) => p);
+    if (leaking.length) {
+      files = files.filter(([p]) => !leaking.includes(p));
+      notes.push("these files contain one of your secrets, so they are not kept for the next call (the workspace travels in the chat): " + leaking.slice(0, 10).map(displayName).join(", "));
+    }
+  }
   const total = files.reduce((n, [, b]) => n + b.length, 0);
-  if (total > MAX_CARRY_BYTES) {
+  const cap = maxCarry(cfg);
+  if (total > cap) {
     // Keep the smallest files that fit; name the ones that are dropped.
     const sorted = files.slice().sort((a, b) => a[1].length - b[1].length);
     const kept = [], lost = [];
     let used = 0;
-    for (const f of sorted) { if (used + f[1].length <= MAX_CARRY_BYTES) { kept.push(f); used += f[1].length; } else lost.push(f[0]); }
+    for (const f of sorted) { if (used + f[1].length <= cap) { kept.push(f); used += f[1].length; } else lost.push(f[0]); }
     files = kept;
-    notes.push("/workspace is larger than " + (MAX_CARRY_BYTES >> 20) + " MB, so these files will NOT exist in the next call: " + lost.slice(0, 10).map(displayName).join(", ") + (lost.length > 10 ? ", ..." : "") + ". Finish the work that needs them in this call, or write smaller outputs");
+    notes.push("/workspace is larger than " + (cap >> 20) + " MB, so these files will NOT exist in the next call: " + lost.slice(0, 10).map(displayName).join(", ") + (lost.length > 10 ? ", ..." : "") + ". Finish the work that needs them in this call, or write smaller outputs");
   }
   const header = { kv: kvObj };
   if (hosts) header.net = { hosts };
-  if (snap.att && snap.att.length) header.att = snap.att.slice(-50);
+  const outer = {};
+  if (snap.att && snap.att.length) outer.att = snap.att.slice(-50);
+  if (snap.hist && snap.hist.length) outer.hist = snap.hist;
+  Object.assign(header, outer);
   const limit = cfg.limitKB * 1024;
+  const inner = { kv: kvObj };
+  if (hosts) inner.net = { hosts };
   const encode = async (list) => bytesToBase64(await packBytes(encodeContainer(header, list)));
+  const encodeInner = async (list) => bytesToBase64(await packBytes(encodeContainer(inner, list)));
   const pointer = async (payload) => {
     // An unchanged workspace reuses the copy already stored (no upload) until
     // shortly before it expires.
     const hash = await sha256Short(payload);
     const inc = globalThis.__crExtIn;
-    if (hash && inc && inc.ptr && inc.ptr.h === hash && Date.now() < inc.ptr.exp - 30 * 60000) return inc.trailer;
-    return bytesToBase64(await packBytes(encodeContainer({ ext: await uploadState(payload, cfg, hash) }, [])));
+    const ptr = hash && inc && inc.ptr && inc.ptr.h === hash && Date.now() < inc.ptr.exp - 30 * 60000 ? inc.ptr : await uploadState(payload, cfg, hash);
+    return bytesToBase64(await packBytes(encodeContainer({ ext: ptr, ...outer }, [])));
   };
 
   let b64 = await encode(files);
@@ -2141,7 +2577,7 @@ async function buildTrailer(snap, cfg, notes) {
   let reason = "offloading large workspaces is off";
   let target = limit;
   if (cfg.bigWorkspace) {
-    try { return await pointer(b64); }
+    try { return await pointer(await encodeInner(files)); }
     catch (e) {
       reason = e.message || String(e);
       if (e.tooLarge) target = e.max;   // the store can still take a smaller set
@@ -2162,7 +2598,7 @@ async function buildTrailer(snap, cfg, notes) {
   }
   let trailer = null;
   if (b64.length <= limit) trailer = b64;
-  else if (cfg.bigWorkspace) { try { trailer = await pointer(b64); } catch (e) {} }
+  else if (cfg.bigWorkspace) { try { trailer = await pointer(await encodeInner(kept)); } catch (e) {} }
   if (trailer === null) {
     lost.push(...kept.map(([p]) => p));
     kept.length = 0;
@@ -2187,6 +2623,64 @@ function cdnCandidates(defaults, custom) {
   return c ? [typeof defaults[0] === "string" ? c : { index: c }, ...defaults] : defaults;
 }
 
+// Secrets setting: a JSON object {"NAME": "value"} or NAME=value pairs separated
+// by newlines or semicolons. Names must be valid environment variable names.
+function parseSecrets(raw) {
+  const out = {};
+  const text = String(raw == null ? "" : raw).trim();
+  if (!text) return out;
+  let obj = null;
+  if (text.startsWith("{")) { try { obj = JSON.parse(text); } catch (e) {} }
+  if (!obj) {
+    obj = {};
+    for (const part of text.split(/[\n;]+/)) {
+      const i = part.indexOf("=");
+      if (i > 0) obj[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+    }
+  }
+  // Values shorter than 6 characters cannot be told apart from ordinary text
+  // (redacting them would mangle output), so they are refused, not half-protected.
+  for (const [k, v] of Object.entries(obj)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || v == null) continue;
+    if (String(v).length >= 6) out[k] = String(v); else out.__tooShort = (out.__tooShort || []).concat(k);
+  }
+  return out;
+}
+function secretEntries(secrets) { return Object.entries(secrets || {}).filter(([k, v]) => k !== "__tooShort" && typeof v === "string"); }
+function secretValues(secrets) { return secretEntries(secrets).map(([, v]) => v); }
+
+// The forms a secret can take on its way out: as is, URL-encoded, form-encoded.
+function secretForms(v) {
+  const forms = new Set([v]);
+  try { forms.add(encodeURIComponent(v)); forms.add(encodeURIComponent(v).replace(/%20/g, "+")); } catch (e) {}
+  return [...forms];
+}
+
+// Does this byte array contain one of the secrets (UTF-8)?
+function bytesContainSecret(u8, values) {
+  for (const v of values) {
+    const needle = new TextEncoder().encode(v);
+    if (!needle.length) continue;
+    let i = u8.indexOf(needle[0]);
+    while (i !== -1 && i + needle.length <= u8.length) {
+      let j = 1;
+      while (j < needle.length && u8[i + j] === needle[j]) j++;
+      if (j === needle.length) return true;
+      i = u8.indexOf(needle[0], i + 1);
+    }
+  }
+  return false;
+}
+
+// Secret values never appear in what the model reads.
+function redactSecrets(text, secrets) {
+  let t = String(text);
+  for (const [k, v] of secretEntries(secrets).sort((a, b) => b[1].length - a[1].length)) {
+    for (const f of secretForms(v)) t = t.split(f).join("[secret " + k + "]");
+  }
+  return t;
+}
+
 function readSettings(us) {
   const s = (k) => String(us && us[k] != null ? us[k] : "").trim();
   const num = (k, d) => { const n = Number(s(k)); return n > 0 ? n : d; };
@@ -2205,11 +2699,13 @@ function readSettings(us) {
     publicProxies: flag("publicProxies", true),
     publicStores: flag("publicStores", false),
     keepVars: flag("keepVariables", true),
-    importAttachments: flag("importAttachments", true)
+    importAttachments: flag("importAttachments", true),
+    secrets: parseSecrets(us && us.secrets)
   };
 }
 
 function applyNetSettings(cfg) {
+  globalThis.__crSecrets = Object.fromEntries(secretEntries(cfg.secrets));
   globalThis.__crCorsProxy = cfg.corsProxy;
   globalThis.__crFetchTimeout = cfg.fetchTimeoutMs;
   globalThis.__crNoPublicProxies = !cfg.publicProxies;
@@ -2243,7 +2739,7 @@ function finish(out, ctx, trailer) {
   if (!text) text = "(no output - print the values you need)";
   const notes = ctx.notes.concat(networkNotes());
   if (notes.length) text += "\n\n" + notes.map((n) => "(" + n + ")").join("\n");
-  text = defuseTrailers(text);
+  text = defuseTrailers(redactSecrets(text, globalThis.__crSecrets));
   const t = trailer === undefined ? ctx.incoming : trailer;
   if (t) text += "\n\n[[cr-state:" + t + "]]";
   return text;
@@ -2418,7 +2914,7 @@ async function wbRun(compiler, wbLang, code, stdin, fix, opts) {
 
 async function runRemote(language, code, stdin, opts) {
   opts = opts || {};
-  const ce0 = CE_LANGS[language];
+  const ce0 = CE_LANGS[language] || (language === "ruby" ? RUBY_CE : null);
   if (ce0) {
     let ce = { ...ce0, args: mergeArgs(ce0.args, opts.args) };
     let chosen = "";
@@ -2499,7 +2995,7 @@ async function importAttachments(resources, seen, notes) {
       catch (e) { r = await netFetch(a.url); }
       if (!r.ok) throw new Error("HTTP " + r.status);
       const b = new Uint8Array(await r.arrayBuffer());
-      if (b.length > MAX_CARRY_BYTES) throw new Error("larger than " + (MAX_CARRY_BYTES >> 20) + " MB");
+      if (b.length > MAX_CARRY_BYTES_STORE) throw new Error("larger than " + (MAX_CARRY_BYTES_STORE >> 20) + " MB");
       files.push([UPLOADS_DIR + "/" + unique, b]);
       ids.push(id);
     } catch (e) { notes.push("the attached file " + unique + " could not be read (" + (e.message || e) + ")"); }
@@ -2521,6 +3017,19 @@ function sameBytes(a, b) {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;
+}
+
+// Each in-browser run is recorded (code and the start of its output) for the
+// notebook export. The record has a size budget so it never crowds out files.
+// It travels inline (it is small and changes every run), so its budget is a
+// slice of the inline limit.
+function addHistory(hist, entry, cfg) {
+  const budget = Math.max(2048, Math.floor(cfg.limitKB * 1024 / 4));
+  const list = (Array.isArray(hist) ? hist : []).concat([entry]);
+  const size = () => new TextEncoder().encode(JSON.stringify(list)).length;
+  if (size() > budget) { entry.code = entry.code.slice(0, 2000); entry.out = entry.out.slice(0, 600); }
+  while (list.length > 1 && size() > budget) list.shift();
+  return size() > budget ? hist || [] : list;
 }
 
 // A one-line summary of what the run changed in /workspace, so the model
@@ -2569,8 +3078,10 @@ async function runCodeInner(params, userSettings, resources, ctx) {
   if (!language) return finish("Unsupported language \"" + params.language + "\". Supported: " + ALL_LANGS.join(", ") + ".", ctx);
   const stdin = params.stdin == null ? "" : String(params.stdin);
   const remoteOpts = { args: params.compiler_args, version: params.compiler_version };
+  if (cfg.secrets.__tooShort) ctx.notes.push("secrets ignored because their values are shorter than 6 characters: " + cfg.secrets.__tooShort.join(", "));
 
-  if (!LOCAL_LANGS.includes(language)) {
+  // Ruby with a specific version or flags runs on Compiler Explorer.
+  if (!LOCAL_LANGS.includes(language) || (language === "ruby" && (params.compiler_version || params.compiler_args))) {
     // Remote languages never touch /workspace: the carried state passes through unchanged.
     if (Array.isArray(params.files) && params.files.length) ctx.notes.push("`files` are only written for the in-browser languages (python, javascript, typescript, sql, duckdb, r); remote programs get input through `stdin`");
     return finish(await runRemote(language, code, stdin, remoteOpts), ctx);
@@ -2599,7 +3110,7 @@ async function runCodeInner(params, userSettings, resources, ctx) {
   added += given.length;
   // Anything added here must survive even if the run itself fails or times out.
   if (added && cfg.carry) {
-    const t = await buildTrailer({ files: startFiles, kv: restored ? restored.kv : {}, att }, cfg, []).catch(() => null);
+    const t = await buildTrailer({ files: startFiles, kv: restored ? restored.kv : {}, att, hist: restored ? restored.hist : [] }, cfg, []).catch(() => null);
     if (t) ctx.incoming = t;
   }
 
@@ -2611,6 +3122,7 @@ async function runCodeInner(params, userSettings, resources, ctx) {
       cfg: {
         corsProxy: cfg.corsProxy,
         noPublicProxies: !cfg.publicProxies,
+        secrets: Object.fromEntries(secretEntries(cfg.secrets)),
         fetchTimeoutMs: cfg.fetchTimeoutMs,
         pyodideCdns: cdnCandidates(PYODIDE_CDNS, cfg.pyodideCdn),
         sqljsCdns: cdnCandidates(SQLJS_CDNS, cfg.sqljsCdn),
@@ -2654,6 +3166,10 @@ async function runCodeInner(params, userSettings, resources, ctx) {
       ctx.notes.push(res.runtimeUnavailable + ", so this ran on Wandbox instead: no /workspace files, no extra packages, variables not kept");
       return finish(wb.text, ctx);
     }
+    if (res.runtimeUnavailable && language === "ruby") {
+      ctx.notes.push(res.runtimeUnavailable + ", so this ran on Compiler Explorer instead: no /workspace files");
+      return finish(await runRemote("ruby", code, stdin, remoteOpts), ctx);
+    }
     if (res.runtimeUnavailable) return finish("Could not run " + language + ": " + res.runtimeUnavailable, ctx);
 
     for (const [h, why] of res.netLog || []) netNote(h, why);
@@ -2670,7 +3186,10 @@ async function runCodeInner(params, userSettings, resources, ctx) {
     }
     const change = workspaceChanges(startFiles, snap.files || [], ctx.notes);
     if (change) ctx.notes.push(change);
-    const trailer = await buildTrailer({ ...snap, att }, cfg, ctx.notes);
+    const shown = redactSecrets(out, cfg.secrets);
+    const entry = { t: Date.now(), lang: language, code: redactSecrets(code.slice(0, 20000), cfg.secrets), out: shown.length > 4000 ? shown.slice(0, 3000) + "\n...\n" + shown.slice(-900) : shown };
+    const hist = addHistory(restored ? restored.hist : [], entry, cfg);
+    const trailer = await buildTrailer({ ...snap, att, hist }, cfg, ctx.notes);
     return finish(out, ctx, trailer);
   } finally {
     engine.terminate();
@@ -2903,7 +3422,42 @@ function savedStateSummary(files) {
   if (has(PY_SESSION_REL)) out.push("Python variables");
   if (has(".cr/session.RData")) out.push("R variables");
   if (has(".cr/duck")) out.push("DuckDB tables");
+  const shared = files.map(([f]) => /^\.cr\/tables\/(.+)\.csv$/.exec(f)).filter(Boolean).map((m) => m[1]);
+  if (shared.length) out.push("shared tables " + shared.join(", "));
+
   return out;
+}
+
+// The recorded runs as a Jupyter notebook (Python cells run as code, other
+// languages as annotated code blocks) or as Markdown.
+function buildNotebook(history, format) {
+  const lines = (t) => String(t).split("\n").map((l, i, a) => (i < a.length - 1 ? l + "\n" : l));
+  const fence = (lang, body) => { const f = String(body).includes("```") ? "~~~~" : "```"; return f + lang + "\n" + String(body).replace(/\s+$/, "") + "\n" + f; };
+  const names = { python: "Python", javascript: "JavaScript", typescript: "TypeScript", sql: "SQL (SQLite)", duckdb: "DuckDB", r: "R", ruby: "Ruby" };
+  if (format === "markdown") {
+    const parts = ["# Code Runner session", ""];
+    history.forEach((h, i) => {
+      parts.push("## " + (i + 1) + ". " + (names[h.lang] || h.lang) + (h.t ? " (" + new Date(h.t).toISOString().slice(0, 16).replace("T", " ") + " UTC)" : ""), "",
+        fence(h.lang === "duckdb" ? "sql" : h.lang, h.code), "");
+      if (h.out) parts.push("Output:", "", fence("", h.out), "");
+    });
+    return parts.join("\n");
+  }
+  const cells = [{ cell_type: "markdown", id: "cr-title", metadata: {}, source: lines("# Code Runner session\n\nExported from TypingMind. Python cells can be re-run; other languages are kept as annotated code blocks.") }];
+  history.forEach((h, i) => {
+    if (h.lang === "python") {
+      cells.push({ cell_type: "code", id: "cr-" + i, execution_count: i + 1, metadata: {}, source: lines(h.code),
+        outputs: h.out ? [{ output_type: "stream", name: "stdout", text: lines(h.out) }] : [] });
+    } else {
+      cells.push({ cell_type: "markdown", id: "cr-" + i, metadata: {},
+        source: lines("**" + (names[h.lang] || h.lang) + "**\n\n" + fence(h.lang === "duckdb" ? "sql" : h.lang, h.code) + (h.out ? "\n\nOutput:\n\n" + fence("", h.out) : "")) });
+    }
+  });
+  return JSON.stringify({
+    nbformat: 4, nbformat_minor: 5,
+    metadata: { kernelspec: { name: "python3", display_name: "Python 3", language: "python" }, language_info: { name: "python" } },
+    cells
+  }, null, 1);
 }
 
 async function manage_files(params, userSettings, resources) {
@@ -2968,8 +3522,16 @@ async function manage_files(params, userSettings, resources) {
     } else if (action === "reset_variables") {
       files = files.filter(([p]) => !isInternal(p));
       text = "Saved Python/R variables and DuckDB tables were cleared; files are kept.";
+    } else if (action === "export_notebook") {
+      const list = snap.hist || [];
+      if (!list.length) return finish("There are no recorded runs to export yet (runs in the in-browser languages are recorded; remote languages are not).", ctx);
+      const format = String(params.format || "ipynb").toLowerCase() === "markdown" ? "markdown" : "ipynb";
+      const out = safeRel(params.path || (format === "markdown" ? "notebook.md" : "notebook.ipynb"));
+      if (!out) return finish("manage_files export_notebook: `path` must be a relative path in /workspace.", ctx);
+      files = mergeFileLists(files, [[out, new TextEncoder().encode(buildNotebook(list, format))]]);
+      text = "Wrote " + out + " with " + list.length + " run" + (list.length === 1 ? "" : "s") + ". Call serve_file to give it to the user, or preview_file to show it.";
     } else if (action !== "list") {
-      return finish("Unknown action \"" + action + "\". Use list, delete, rename, clear or reset_variables.", ctx);
+      return finish("Unknown action \"" + action + "\". Use list, delete, rename, clear, reset_variables or export_notebook.", ctx);
     }
 
     const rows = visible().sort((a, b) => (a[0] < b[0] ? -1 : 1));
@@ -2980,10 +3542,11 @@ async function manage_files(params, userSettings, resources) {
       : "/workspace is empty.";
     const saved = savedStateSummary(files);
     const keys = Object.keys(kv);
+    if (snap.hist && snap.hist.length) saved.push(snap.hist.length + " recorded runs for export_notebook");
     const extra = [saved.length ? "saved between calls: " + saved.join(", ") : "", keys.length ? "JavaScript storage keys: " + keys.slice(0, 20).join(", ") : ""].filter(Boolean);
     const out = (text ? text + "\n\n" : "") + listing + (extra.length ? "\n(" + extra.join("; ") + ")" : "");
     if (action === "list" && files === snap.files) return finish(out, ctx);
-    const trailer = await buildTrailer({ files, kv, att }, cfg, ctx.notes);
+    const trailer = await buildTrailer({ files, kv, att, hist: action === "clear" && !(params.keep_variables === true || params.keep_variables === "true") ? [] : snap.hist }, cfg, ctx.notes);
     return finish(out, ctx, trailer);
   } catch (e) {
     return finish("manage_files failed: " + (e && e.message || e), ctx);
@@ -3001,7 +3564,12 @@ function previewKind(name, mime, as) {
   const ext = extOf(name);
   if (as && as !== "auto") return as;
   if (["csv", "tsv"].includes(ext)) return "table";
-  if (["xlsx", "xls", "ods"].includes(ext)) return "sheet";
+  if (["xlsx", "xls", "ods", "xlsm"].includes(ext)) return "sheet";
+  if (ext === "parquet") return "parquet";
+  if (["sqlite", "sqlite3", "db"].includes(ext)) return "sqlite";
+  if (ext === "docx") return "docx";
+  if (ext === "pptx") return "pptx";
+  if (ext === "ipynb") return "notebook";
   if (ext === "json" || ext === "geojson" || ext === "jsonl" || ext === "ndjson") return "json";
   if (ext === "html" || ext === "htm") return "html";
   if (ext === "md" || ext === "markdown") return "markdown";
@@ -3069,7 +3637,7 @@ function table(head, rows, note) {
   let sortCol = -1, dir = 1, filter = "";
   const isNum = head.map((_, c) => { let n = 0, t = 0; for (const r of rows.slice(0, 200)) { const x = r[c]; if (x === "" || x == null) continue; t++; if (!isNaN(Number(String(x).replace(/,/g, "")))) n++; } return t > 0 && n / t > 0.9; });
   const search = el("input", { type: "search", placeholder: "Filter " + rows.length.toLocaleString() + " rows..." });
-  const info = el("span", { className: "mut" });
+  const info = el("span", { className: "mut info" });
   const wrap = el("div", { className: "wrap" });
   const hdr = document.querySelector("header"); hdr.append(search, info);
   function render() {
@@ -3097,9 +3665,79 @@ try {
   else if (D.kind === "sheet") {
     await load("https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js");
     const wb = XLSX.read(bytes, { type: "array" });
-    const show = (n) => { const rows = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: false, defval: "" }); document.querySelectorAll("header input,header .mut+.mut").forEach((e) => e.remove()); if (!rows.length) v.textContent = "(empty sheet)"; else table(rows[0].map(String), rows.slice(1), "sheet " + n); };
+    let current = wb.SheetNames[0];
+    const formulas = el("input", { type: "checkbox", title: "Show formulas" });
+    const rowsOf = (ws) => {
+      if (!formulas.checked) return XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+      if (!ws["!ref"]) return [];
+      const r = XLSX.utils.decode_range(ws["!ref"]), out = [];
+      for (let R = r.s.r; R <= r.e.r; R++) { const row = []; for (let C = r.s.c; C <= r.e.c; C++) { const c = ws[XLSX.utils.encode_cell({ r: R, c: C })]; row.push(!c ? "" : c.f ? "=" + c.f : c.w != null ? c.w : c.v); } out.push(row); }
+      return out;
+    };
+    const show = (n) => { current = n; const rows = rowsOf(wb.Sheets[n]); document.querySelectorAll("header input[type=search],header .info").forEach((e) => e.remove()); if (!rows.length) v.textContent = "(empty sheet)"; else table(rows[0].map(String), rows.slice(1), "sheet " + n); };
+    formulas.onchange = () => show(current);
     if (wb.SheetNames.length > 1) { const sel = el("select", { onchange: () => show(sel.value) }, wb.SheetNames.map((n) => el("option", { value: n, textContent: n }))); document.querySelector("header").append(sel); }
-    show(wb.SheetNames[0]);
+    document.querySelector("header").append(el("label", { className: "mut" }, [formulas, " formulas"]));
+    show(current);
+  }
+  else if (D.kind === "parquet") {
+    const { parquetReadObjects } = await import("https://cdn.jsdelivr.net/npm/hyparquet@1.31.1/+esm");
+    const rows = await parquetReadObjects({ file: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) });
+    if (!rows.length) v.textContent = "(no rows)"; else objectsTable(rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, x]) => [k, typeof x === "bigint" ? x.toString() : x instanceof Date ? x.toISOString() : x]))));
+  }
+  else if (D.kind === "sqlite") {
+    await load("https://cdn.jsdelivr.net/npm/sql.js@1.13.0/dist/sql-wasm.js");
+    const SQL = await initSqlJs({ locateFile: (f) => "https://cdn.jsdelivr.net/npm/sql.js@1.13.0/dist/" + f });
+    const db = new SQL.Database(bytes);
+    const names = (db.exec("SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name")[0] || { values: [] }).values.map((r) => r[0]);
+    if (!names.length) v.textContent = "(no tables)";
+    else {
+      const show = (n) => {
+        document.querySelectorAll("header input[type=search], header .info").forEach((e) => e.remove());
+        const count = db.exec('SELECT count(*) FROM "' + n.replace(/"/g, '""') + '"')[0].values[0][0];
+        const r = db.exec('SELECT * FROM "' + n.replace(/"/g, '""') + '" LIMIT 5000')[0];
+        if (!r) { v.textContent = "(" + n + " is empty)"; return; }
+        table(r.columns, r.values.map((row) => row.map((x) => (x instanceof Uint8Array ? "<blob " + x.length + " bytes>" : x))), "table " + n + (count > 5000 ? " \u00b7 first 5000 of " + count : ""));
+      };
+      if (names.length > 1) { const sel = el("select", { onchange: () => show(sel.value) }, names.map((n) => el("option", { value: n, textContent: n }))); document.querySelector("header").append(sel); }
+      show(names[0]);
+    }
+  }
+  else if (D.kind === "docx") {
+    await load("https://cdn.jsdelivr.net/npm/mammoth@1.12.3/mammoth.browser.min.js");
+    const r = await mammoth.convertToHtml({ arrayBuffer: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) });
+    const d = el("div", { className: "md" }); d.innerHTML = r.value; d.querySelectorAll("script").forEach((s) => s.remove());
+    v.replaceChildren(d, el("p", {}, [dl()]));
+  }
+  else if (D.kind === "pptx") {
+    await load("https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js");
+    const zip = await JSZip.loadAsync(bytes);
+    const slides = Object.keys(zip.files).filter((f) => /^ppt\/slides\/slide\d+\.xml$/.test(f)).sort((a, b) => Number(a.match(/\d+/)[0]) - Number(b.match(/\d+/)[0]));
+    const box = el("div", { className: "md" });
+    for (const [i, f] of slides.entries()) {
+      const xml = new DOMParser().parseFromString(await zip.file(f).async("string"), "application/xml");
+      const paras = [...xml.getElementsByTagName("a:p")].map((p) => [...p.getElementsByTagName("a:t")].map((t) => t.textContent).join("")).filter((t) => t.trim());
+      box.append(el("h3", { textContent: "Slide " + (i + 1) }), el("div", {}, paras.map((t, j) => el(j === 0 ? "p" : "li", { textContent: t }))));
+    }
+    v.replaceChildren(box, el("p", {}, [dl()]));
+  }
+  else if (D.kind === "notebook") {
+    const nb = JSON.parse(text());
+    try { await load("https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"); } catch (e) {}
+    const src = (x) => (Array.isArray(x) ? x.join("") : String(x || ""));
+    const box = el("div", { className: "md" });
+    for (const c of nb.cells || []) {
+      if (c.cell_type === "markdown") { const d = el("div"); d.innerHTML = typeof marked !== "undefined" ? marked.parse(src(c.source)) : ""; if (typeof marked === "undefined") d.textContent = src(c.source); d.querySelectorAll("script").forEach((s) => s.remove()); box.append(d); }
+      else if (c.cell_type === "code") {
+        box.append(el("pre", { textContent: src(c.source) }));
+        for (const o of c.outputs || []) {
+          const data = o.data || {};
+          if (data["image/png"]) box.append(el("img", { src: "data:image/png;base64," + src(data["image/png"]).replace(/\s+/g, "") }));
+          else { const t = o.text || data["text/plain"] || (o.output_type === "error" ? (o.ename + ": " + o.evalue) : ""); if (t) box.append(el("pre", { textContent: src(t), style: "opacity:.8" })); }
+        }
+      }
+    }
+    v.replaceChildren(box);
   }
   else if (D.kind === "json") {
     const t = text(); let val;
@@ -3156,7 +3794,7 @@ async function preview_file(params, userSettings, resources) {
     const name = rel.split("/").pop() || rel;
     const mime = guessMime(name);
     const as = String(params.as || "auto").toLowerCase();
-    const kind = previewKind(name, mime, ["auto", "table", "sheet", "json", "html", "markdown", "text", "image", "audio", "video", "pdf", "download"].includes(as) ? as : "auto");
+    const kind = previewKind(name, mime, ["auto", "table", "sheet", "json", "html", "markdown", "text", "image", "audio", "video", "pdf", "parquet", "sqlite", "docx", "pptx", "notebook", "download"].includes(as) ? as : "auto");
     return page(previewHtml(rel, mime, kind, bytes));
   } catch (e) {
     return msg("preview_file failed: " + (e && e.message || e));

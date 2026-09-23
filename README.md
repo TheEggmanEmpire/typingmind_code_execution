@@ -4,24 +4,34 @@ Lets the AI run code, work with your files and show you the results. 35 language
 
 | Where | Languages | Internet | Files (`/workspace`) | Variables kept between calls |
 |---|---|---|---|---|
-| In your browser (WASM) | **python** (Pyodide, Python 3.13), **javascript**, **typescript**, **sql** (SQLite), **duckdb** (DuckDB), **r** (webR) | yes, over HTTP | yes, shared by all of them | Python and R variables, DuckDB tables, JS `storage` |
-| Compiler Explorer (godbolt.org) | c, c++, rust, go, java, kotlin, csharp, fsharp, swift, zig, d, haskell, ocaml, ruby, perl, lua, dart, fortran, pascal, crystal, julia, cobol, ada, objc | no | no | no |
+| In your browser (WASM) | **python** (Pyodide, Python 3.13), **javascript**, **typescript**, **sql** (SQLite), **duckdb** (DuckDB), **r** (webR), **ruby** (ruby.wasm) | yes, over HTTP (not Ruby) | yes, shared by all of them | Python and R variables, DuckDB tables, JS `storage` |
+| Compiler Explorer (godbolt.org) | c, c++, rust, go, java, kotlin, csharp, fsharp, swift, zig, d, haskell, ocaml, perl, lua, dart, fortran, pascal, crystal, julia, cobol, ada, objc | no | no | no |
 | Wandbox (best effort) | bash, php, scala, nim, elixir | no | no | no |
 
 Six functions:
 
 - **run_code** runs a program and returns its output to the AI.
-- **preview_file** shows a file to you as an interactive page: CSV, TSV, JSON and Excel as a sortable, filterable
-  table; HTML pages rendered live (dashboards, Plotly/Chart.js/D3 charts, reports); Markdown rendered; audio and
-  video with players; images and PDFs.
+- **preview_file** shows a file to you as an interactive page: CSV, TSV, JSON, Excel (with a formulas toggle),
+  Parquet and SQLite as sortable, filterable tables; HTML pages and charts rendered live; Markdown, Word, PowerPoint
+  and Jupyter notebooks rendered; audio and video with players; images and PDFs.
 - **serve_file** shows a file in the chat: images inline, small text as a code block, anything else
   (PDF, XLSX, ZIP, ...) as a download link.
-- **manage_files** lists, deletes, renames or clears the files in `/workspace` without running code.
+- **manage_files** lists, deletes, renames or clears the files in `/workspace` without running code, and exports
+  the session as a Jupyter notebook (`export_notebook`).
 - **browser_run** runs JavaScript in one of *your own open browser tabs* and returns the value plus console output:
   read the page, click, fill forms, scroll, change the view. Needs the companion extension (below).
 - **browser_tabs** lists / activates / opens / closes / reloads / navigates your tabs. Needs the companion extension.
 
 The contents of files you are shown never pass through the AI's context.
+
+### Helpers in your code
+
+- **`chart(data, x, y, kind, title, path)`** (Python, R, JavaScript) writes an interactive chart page (Vega-Lite:
+  zoom, tooltips, PNG/SVG export) from a DataFrame, dict or list of rows; `kind` is line, bar, barh, scatter, area,
+  pie, donut or histogram, and `y` can list several columns. The AI then shows it with `preview_file`.
+- **`share_table(name, df)` / `get_table(name)` / `list_tables()`** (Python, R; `tables.set/get/list` in
+  JavaScript) pass tables between languages. A shared table is also a DuckDB view of the same name.
+- **`read_text(path)`** (Python) returns the text of a PDF, Word, PowerPoint, Excel or HTML file.
 
 ### Your files
 
@@ -42,6 +52,14 @@ It runs the AI's script through the browser's debugger, so it works even on stri
 console; Chrome shows a "started debugging" banner while a script runs. It is **Chrome/Chromium desktop only**, and
 while enabled any page you visit can drive your tabs through it, so keep it on only while you need it. See
 [`extension/README.md`](extension/README.md) for details, scope and safety.
+
+### Secrets
+
+Put API keys the code may use into the **Secrets** setting (`NAME=value; NAME2=value`). They become environment
+variables (`os.environ`, `Sys.getenv`, `ENV`, `env` in JavaScript). Their values are replaced by `[secret NAME]` in
+everything the AI reads, are never saved with the workspace (variables or files containing one are dropped from
+the carry, with a note), are not kept in the run history, and requests carrying them (also URL-encoded) never go
+through public proxies. Values shorter than 6 characters are refused.
 
 ### Recommended setup (5 minutes, free)
 
@@ -81,6 +99,13 @@ kept for the next call (the AI is told which ones).
 - Variables are pickled after each run; functions and classes defined at the top level are kept by their source.
   Things that cannot be saved (open files, generators, database connections) are skipped, and the AI is told when
   a value it may need was not kept.
+
+### Ruby
+
+Ruby 3.4 with its standard library runs in the browser (ruby.wasm, about 30 MB on first use): `/workspace` is the
+working directory, `gets` reads `stdin`, the last expression's value is shown. No internet or gems, and variables
+are not kept. With `compiler_version` or `compiler_args`, or when ruby.wasm cannot load, Ruby runs on Compiler
+Explorer instead.
 
 ### R
 
@@ -142,7 +167,8 @@ Single-file programs with a normal `main`, input via `stdin`, a run-time limit o
 compressed and attached to the tool output as a hidden `[[cr-state:...]]` marker that the next call reads back.
 
 - Up to 24 KB compressed travels inline (**Inline workspace limit**). It costs tokens, so keep it small.
-- Larger workspaces are uploaded to your **Workspace store**; only a pointer travels. The store's key is never
+- Larger workspaces are uploaded to your **Workspace store** (in parts when above the store's 24 MB limit, up to
+  150 MB in total); only a pointer travels. The store's key is never
   written into the chat, so a shared chat does not expose the files.
 - Without a store, larger workspaces are not uploaded anywhere unless you turn on **Allow public temporary stores**
   (litterbox.catbox.moe, pastes.dev, dpaste.com: anyone with the link can read the data until it expires).
@@ -152,6 +178,20 @@ compressed and attached to the tool output as a hidden `[[cr-state:...]]` marker
 - When something cannot be carried, the largest files are dropped first and the AI is told exactly which ones.
 - Program output and file contents cannot fake this marker: any `[[cr-state:` they contain is neutralised, so only
   the plugin's own marker is ever read back.
+
+### Session notebook
+
+Each in-browser run is recorded (code, and the start of its output, with secrets removed). `manage_files` with
+`action: export_notebook` writes them as `notebook.ipynb` (Python cells runnable, other languages as annotated
+blocks) or Markdown, ready for `serve_file` or `preview_file`.
+
+### What is not possible here
+
+TypingMind runs each plugin call in a sandboxed frame with an opaque (`null`) origin and returns its output once:
+there is no browser storage to cache packages in (the browser's HTTP cache still speeds up repeat downloads),
+no way to stream partial output while a run is going, and nothing that runs between chat turns, so scheduled runs
+are out of reach. Lua and PHP stay remote: the in-browser Lua has no file access and the PHP runtime needs
+`crypto.subtle`, which the sandbox lacks.
 
 ### Security notes
 
@@ -175,6 +215,7 @@ compressed and attached to the tool output as a hidden `[[cr-state:...]]` marker
 | Allow public CORS proxies | on | Public proxies for sites that block browsers (never for credentialed requests) |
 | Keep variables between calls | on | Save Python/R variables and DuckDB tables |
 | Import attached files | on | Save the user's attachments to `/workspace/uploads` |
+| Secrets | - | API keys for code, as environment variables (redacted, never saved) |
 | Offloaded workspace lifetime (minutes) | 1440 | Older offloaded workspaces are not restored |
 | HTTP request timeout (ms) | 30000 | Per request, before fallbacks |
 | Pyodide CDN / sql.js CDN | - | Put a mirror in front of the built-in CDN lists |

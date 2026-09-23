@@ -17,7 +17,8 @@ stores opt-in, unchanged-workspace reuse, dropping large files, expiry, v1 trail
 saved Python variables (data, functions, classes, imports, reset, off), the `files` parameter, attachments,
 TypeScript `typecheck`, compiler flags and versions, serve_file, preview_file, manage_files, the remote runners
 (compile errors, timeouts, retired compilers, Wandbox fallback) and that run_code always returns an explanation
-instead of throwing.
+instead of throwing. Also: chart(), shared tables, read_text(), secrets (injection, redaction, never carried,
+never proxied publicly), the run history and notebook export, and chunked uploads.
 
 R (webR) and DuckDB need a real browser; the end-to-end test covers them.
 
@@ -26,7 +27,8 @@ R (webR) and DuckDB need a real browser; the end-to-end test covers them.
 Opens `test/e2e.html` in headless Chrome. Every call runs in a fresh `<iframe sandbox="allow-scripts">`
 (opaque origin, like TypingMind), so this is the authoritative test for the Worker path, time limits,
 CORS fallbacks, dynamic imports, Compiler Explorer, R, DuckDB, TypeScript type checking, saved variables,
-the engine's isolation from user code, serve_file, preview_file and manage_files.
+the engine's isolation from user code, Ruby, cross-language tables, serve_file, preview_file (each preview is
+loaded in a sandboxed frame and must render) and manage_files.
 
 ```sh
 node test/run-e2e.js                 # Web Worker path

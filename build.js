@@ -27,13 +27,12 @@ for (const fn of ["run_code", "serve_file", "preview_file", "manage_files", "bro
 const runCodeSpec = {
   name: "run_code",
   description:
-    "Run code and return its output (print what you need). In the browser, with HTTP internet and a persistent /workspace folder: " +
-    "python (Pyodide 3.13; numpy, pandas, matplotlib, requests, sklearn...), javascript / typescript (top-level await, fetch, fs, storage), " +
-    "sql (SQLite, /workspace/data.sqlite), duckdb (SQL over CSV/Parquet/JSON files), r (webR; packages from library() install automatically). " +
-    "Files in /workspace AND Python/R variables, DuckDB tables and JS storage survive between calls (reset: true starts clean). " +
-    "Files the user attaches appear in /workspace/uploads. " +
+    "Run code; returns its output (print what you need). In the browser with a persistent /workspace folder: " +
+    "python (Pyodide; numpy, pandas, matplotlib, requests...), javascript/typescript, sql (SQLite), duckdb (SQL over CSV/Parquet), r (webR), ruby (no internet). " +
+    "Files, Python/R variables, DuckDB tables and JS storage survive between calls (reset: true starts clean). " +
+    "User attachments are in /workspace/uploads. Helpers: chart() makes an interactive chart file, share_table()/get_table() pass tables between languages, read_text() extracts PDF/DOCX/PPTX/XLSX text. " +
     "Remote, short programs without internet or files: " + CE.join(", ") + "; best-effort: " + WB.join(", ") + ". " +
-    "Show results to the user with preview_file (tables, HTML, media) or serve_file (images, downloads). No shell, subprocess or sockets. " +
+    "Show results with preview_file (tables, charts, HTML, media) or serve_file (images, downloads). " +
     "User's open browser tabs: browser_tabs, browser_run.",
   parameters: {
     type: "object",
@@ -44,11 +43,15 @@ const runCodeSpec = {
         description:
           "The complete program. Output is everything printed, plus the last expression's value (python, r) or a top-level `return` value (javascript/typescript). Paths are relative to /workspace. " +
           "PYTHON: open('data.csv') reads /workspace; top-level await; open matplotlib figures are saved as figure_N.png; input() reads `stdin`; variables, functions, classes and imports from earlier calls are still defined. HTTP via requests, urllib or pyodide.http.pyfetch. " +
+          "HELPERS (python; same names in r; javascript: chart(rows, {x, y, kind, title, path}), tables.get/set/list): chart(data, x=None, y=None, kind='line'|'bar'|'barh'|'scatter'|'area'|'pie'|'donut'|'histogram', title='', path='chart.html') writes an interactive chart from a DataFrame, dict or list of dicts (y may be a list of columns), then call preview_file; " +
+          "share_table(name, df) and get_table(name) exchange tables between python, r, javascript and duckdb (a shared table is a DuckDB view of that name); read_text(path) returns the text of a PDF, DOCX, PPTX, XLSX or HTML file (python). " +
+          "SECRETS the user configured are environment variables (os.environ, Sys.getenv, ENV, javascript `env`); never print them. " +
           "JAVASCRIPT / TYPESCRIPT (browser worker, not Node.js: no require/process/DOM): fetch(url); async fs relative to /workspace: fs.readFile(p) text, fs.readFile(p, 'binary') Uint8Array, fs.writeFile(p, string | Uint8Array | Blob | Response | object), fs.appendFile, fs.readdir(), fs.exists, fs.stat, fs.mkdir, fs.rm(p, {recursive: true}), fs.rename, fs.copyFile, fs.list(), fs.download(url, name?); " +
           "storage.get/set(key, value) keeps JSON values; `stdin` is a string; libraries: `await import('https://cdn.jsdelivr.net/npm/<pkg>/+esm')`. Variables do not persist in JS (use storage or files). " +
           "SQL: SQLite on /workspace/data.sqlite (python: sqlite3.connect('data.sqlite')). " +
           "DUCKDB: query files by name, e.g. SELECT * FROM 'uploads/sales.csv' or read_parquet('x.parquet'); CREATE TABLE ... persists; COPY (...) TO 'out.csv' writes a file. " +
           "R: cwd is /workspace; plots are saved as rplot_N.png; readline() reads `stdin`; objects persist, library() calls are re-attached. " +
+          "RUBY: Ruby 3.4 with its standard library, cwd /workspace, gets reads `stdin`; no internet, no gems, variables do not persist. " +
           "REMOTE LANGUAGES: one file with a normal main, input from `stdin`, a few seconds of run time. " +
           "INTERNET: for a page's readable text fetch 'https://r.jina.ai/' + url; GitHub files via raw.githubusercontent.com."
       },
@@ -74,8 +77,8 @@ const runCodeSpec = {
       timeout: { type: "number", description: "Optional time limit in seconds for the in-browser languages (default 120, max 900). The run is stopped and reported when exceeded; /workspace keeps its state from before the call." },
       reset: { type: "boolean", description: "Start without the Python/R variables and DuckDB tables saved by earlier calls (files are kept). Use when earlier state gets in the way." },
       typecheck: { type: "boolean", description: "TypeScript only: type-check with the real TypeScript compiler (strict) before running; type errors are reported with line numbers and the code does not run. Slower on first use (downloads ~9 MB)." },
-      compiler_args: { type: "string", description: "Remote compiled languages only: compiler flags, e.g. \"-O2 -std=c++20\" or \"--edition 2024\". They replace the matching default flags." },
-      compiler_version: { type: "string", description: "Remote languages only: compiler version, e.g. \"13\" (gcc 13), \"clang 18\", \"1.80\" (rust). An unknown version returns the list of available ones." }
+      compiler_args: { type: "string", description: "Remote compiled languages only: compiler flags, e.g. \"-O2 -std=c++20\" or \"--edition 2024\". They replace the matching default flags. For ruby this runs it remotely." },
+      compiler_version: { type: "string", description: "Remote languages only: compiler version, e.g. \"13\" (gcc 13), \"clang 18\", \"1.80\" (rust), \"3.3\" (ruby, runs remotely). An unknown version returns the list of available ones." }
     },
     required: ["language", "code"]
   }
@@ -141,14 +144,14 @@ const browserTabsSpec = {
 const previewFileSpec = {
   name: "preview_file",
   description:
-    "Show the user an interactive preview of a /workspace file in the chat: CSV/TSV/JSON/XLSX as a sortable, filterable table; " +
-    "HTML pages rendered live (dashboards, charts made with Plotly/Chart.js/D3, reports); Markdown rendered; audio and video with players; images; PDFs. " +
+    "Show the user an interactive preview of a /workspace file in the chat: CSV/TSV/JSON/XLSX/Parquet/SQLite as a sortable, filterable table (Excel formulas on request); " +
+    "HTML pages rendered live (chart() output, dashboards, Plotly/D3, reports); Markdown, Word (DOCX), PowerPoint (PPTX) and Jupyter notebooks rendered; audio and video with players; images; PDFs. " +
     "Use it to present tables, HTML output and media; use serve_file when the user needs to download the file. The file contents do not pass through your context. Files up to 15 MB.",
   parameters: {
     type: "object",
     properties: {
       path: { type: "string", description: "Path of the file in /workspace, e.g. 'results.csv' or 'report.html'." },
-      as: { type: "string", enum: ["auto", "table", "sheet", "json", "html", "markdown", "text", "image", "audio", "video", "pdf"], description: "Presentation. auto (default) chooses from the file extension." }
+      as: { type: "string", enum: ["auto", "table", "sheet", "json", "parquet", "sqlite", "html", "markdown", "docx", "pptx", "notebook", "text", "image", "audio", "video", "pdf"], description: "Presentation. auto (default) chooses from the file extension." }
     },
     required: ["path"]
   }
@@ -159,15 +162,18 @@ const manageFilesSpec = {
   description:
     "List, delete, rename or clear the files in /workspace without running code. " +
     "list shows every file with its size (including the user's attachments in uploads/) and what state is saved between calls. " +
-    "delete takes paths or globs (\"tmp/*\", \"out/\"); rename moves a file or folder; clear empties the workspace; reset_variables forgets saved Python/R variables and DuckDB tables but keeps the files.",
+    "delete takes paths or globs (\"tmp/*\", \"out/\"); rename moves a file or folder; clear empties the workspace; reset_variables forgets saved Python/R variables and DuckDB tables but keeps the files; " +
+    "export_notebook writes the session's runs (code and output) as notebook.ipynb or Markdown, for serve_file.",
   parameters: {
     type: "object",
     properties: {
-      action: { type: "string", enum: ["list", "delete", "rename", "clear", "reset_variables"], description: "Default list." },
+      action: { type: "string", enum: ["list", "delete", "rename", "clear", "reset_variables", "export_notebook"], description: "Default list." },
       paths: { type: "array", items: { type: "string" }, description: "delete: files, folders (ending in /) or globs (* and **)." },
       from: { type: "string", description: "rename: current path." },
       to: { type: "string", description: "rename: new path." },
-      keep_variables: { type: "boolean", description: "clear: keep saved variables and tables, remove only the files." }
+      keep_variables: { type: "boolean", description: "clear: keep saved variables and tables, remove only the files." },
+      format: { type: "string", enum: ["ipynb", "markdown"], description: "export_notebook: file format (default ipynb)." },
+      path: { type: "string", description: "export_notebook: output path (default notebook.ipynb or notebook.md)." }
     }
   }
 };
@@ -179,7 +185,11 @@ const USAGE_GUIDE = [
   "- Files the user attaches to their message are saved to /workspace/uploads/<name> automatically; check with manage_files (action list) when unsure what exists.",
   "- Data the user pastes as text: pass it in run_code `files` instead of embedding it in code.",
   "- Pick the language: python for general data work, files, web requests, charts; duckdb for SQL over big CSV/Parquet/JSON files; sql for a small persistent SQLite database; r for statistics and ggplot2; javascript/typescript for JS tasks (typecheck: true for strict type checking). Other languages run remotely without files or internet.",
-  "- Show results instead of pasting them: preview_file for tables (sortable), HTML pages and dashboards, Markdown, audio/video; serve_file for images inline and download links. Charts: matplotlib figures and R plots are saved automatically (figure_N.png, rplot_N.png).",
+  "- Show results instead of pasting them: preview_file for tables (sortable; also Parquet, SQLite, Excel), HTML pages, Word/PowerPoint/notebooks, Markdown, audio/video; serve_file for images inline and download links.",
+  "- Charts: for an interactive chart call chart(df, x=..., y=..., kind=...) in python/r/javascript, then preview_file('chart.html'). Static images: matplotlib figures and R plots are saved automatically (figure_N.png, rplot_N.png).",
+  "- Across languages: share_table('sales', df) in python or r, then SELECT ... FROM sales in duckdb, get_table('sales') in r/python, tables.get('sales') in javascript. read_text('uploads/report.pdf') (python) extracts document text.",
+  "- API keys the user configured are environment variables (list them with os.environ keys); use them in requests, never print them.",
+  "- manage_files export_notebook turns the session's runs into notebook.ipynb for the user (then serve_file).",
   "- Output is capped at 40,000 characters: print summaries (df.head(), describe(), counts), not whole datasets.",
   "- Internet works over HTTP from the browser. Blocked sites are retried through proxies; for a web page's readable text fetch https://r.jina.ai/<url>. Requests with API keys never go through public proxies.",
   "- Each run has a time limit (default 120 s, `timeout` up to 900). A stopped run keeps /workspace as it was before the call.",
@@ -197,6 +207,7 @@ const userSettings = [
   { name: "publicStores", label: "Allow public temporary stores", description: "Default off (private). When no workspace store is set, \"on\" lets large workspaces be uploaded to public temporary paste services (litterbox.catbox.moe, pastes.dev, dpaste.com; anyone with the link can read them until they expire). Keep off for private data.", placeholder: "off", required: false },
   { name: "publicProxies", label: "Allow public CORS proxies", description: "Default on. Requests to sites that block browsers are retried through public CORS proxies (never requests carrying keys, tokens or passwords). Set \"off\" for a private-only setup: only your personal proxy is used.", placeholder: "on", required: false },
   { name: "keepVariables", label: "Keep variables between calls", description: "Default on. Python and R variables, functions and imports, and DuckDB tables are saved with the workspace and restored in the next call. Set \"off\" to start every call with a clean interpreter (files still persist).", placeholder: "on", required: false },
+  { name: "secrets", label: "Secrets (API keys for code)", type: "password", description: "Optional. API keys the code may use, as NAME=value pairs separated by semicolons (or a JSON object). They become environment variables (os.environ in Python, Sys.getenv in R, ENV in Ruby, `env` in JavaScript), are replaced by [secret NAME] in anything the AI reads, are never saved with the workspace, and requests carrying them never go through public proxies.", placeholder: "OPENAI_API_KEY=sk-...; GITHUB_TOKEN=ghp_...", required: false },
   { name: "importAttachments", label: "Import attached files", description: "Default on. Files the user attaches to a message are saved to /workspace/uploads so code can read them. Set \"off\" to disable.", placeholder: "on", required: false },
   { name: "workspaceTtlMin", label: "Offloaded workspace lifetime (minutes)", description: "Default 1440 (24 hours). An offloaded workspace older than this is not restored.", type: "number", required: false },
   { name: "fetchTimeoutMs", label: "HTTP request timeout (ms)", description: "Default 30000. Per-request timeout for fetch / requests from Python and JavaScript before fallbacks are tried.", type: "number", required: false },

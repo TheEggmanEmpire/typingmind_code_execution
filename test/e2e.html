@@ -42,7 +42,19 @@ const STEPS = [
   ["r objects and packages persist", "run_code", { language: "r", code: "cat(keep_me, toJSON(1), '\\n')" }, (s) => /^99 \[1\]/.test(s), true],
   ["preview_file renders a table", "preview_file", { path: "totals.csv" }, (s) => /^<!doctype html>/.test(s) && /"kind":"table"/.test(s)],
   ["manage_files lists everything", "manage_files", {}, (s) => /from_r\.csv/.test(s) && /Python variables/.test(s) && /R variables/.test(s) && /DuckDB tables/.test(s)],
-  ["serve_file after the new tools", "serve_file", { path: "from_r.csv" }, (s) => /k,total|"k","total"/.test(s)]
+  ["serve_file after the new tools", "serve_file", { path: "from_r.csv" }, (s) => /k,total|"k","total"/.test(s)],
+  ["ruby runs with files and stdin", "run_code", { language: "ruby", code: "require 'json'\nname = gets.strip\nFile.write('ruby.json', JSON.generate({hi: name}))\nputs File.read('totals.csv').lines.count\n[1, 2].sum", stdin: "Ada\n" }, (s) => /^3\n=> 3/.test(s) && !/error/i.test(s), true],
+  ["python reads the ruby output", "run_code", { language: "python", code: "print(open('ruby.json').read())" }, (s) => s === '{"hi":"Ada"}'],
+  ["ruby errors are reported", "run_code", { language: "ruby", code: "x = 1\nraise ArgumentError, 'bad input'" }, (s) => /Ruby error: .*bad input \(ArgumentError\)/.test(s), true],
+  ["share_table from python, a view in duckdb", "run_code", { language: "python", code: "import pandas as pd\nshare_table('people', pd.DataFrame({'name': ['a', 'b', 'c'], 'age': [30, 40, 50]}))\nprint('shared')" }, (s) => s === "shared"],
+  ["duckdb queries the shared table and writes parquet", "run_code", { language: "duckdb", code: "SELECT avg(age) AS a FROM people; COPY people TO 'people.parquet' (FORMAT parquet);" }, (s) => /^a\n40/.test(s), true],
+  ["r reads the shared table and makes a chart", "run_code", { language: "r", code: "p <- get_table('people')\ncat(nrow(p), max(p$age), '\\n')\nchart(p, x = 'name', y = 'age', kind = 'bar', title = paste0('Ages </', 'script>'), path = 'ages.html')" }, (s) => /^3 50/.test(s), true],
+  ["preview a parquet file", "preview_file", { path: "people.parquet" }, (s) => /"kind":"parquet"/.test(s)],
+  ["preview the sqlite database", "preview_file", { path: "data.sqlite" }, (s) => /"kind":"sqlite"/.test(s)],
+  ["python chart for preview", "run_code", { language: "python", code: "chart({'a': 3, 'b': 5}, kind='pie', title='Share')" }, (s) => /chart\.html/.test(s)],
+  ["preview the chart page", "preview_file", { path: "chart.html" }, (s) => /"kind":"html"/.test(s)],
+  ["export the session as a notebook", "manage_files", { action: "export_notebook" }, (s) => /Wrote notebook\.ipynb/.test(s)],
+  ["preview the notebook", "preview_file", { path: "notebook.ipynb" }, (s) => /"kind":"notebook"/.test(s)]
 ];
 
 // Extra steps when a personal proxy / workspace store is configured (e.g. the companion Worker).
@@ -56,9 +68,25 @@ if (settings.corsProxy) {
 if (settings.workspaceStore) {
   STEPS.push(
     ["large workspace written", "run_code", { language: "python", code: "import os\nopen('big.bin','wb').write(os.urandom(300000))\nprint('w')" }, (s) => s === "w"],
-    ["large workspace restored from the store", "run_code", { language: "python", code: "import os\nprint(os.path.getsize('big.bin'))" }, (s) => s === "300000"]
+    ["large workspace restored from the store", "run_code", { language: "python", code: "import os\nprint(os.path.getsize('big.bin'))" }, (s) => s === "300000"],
+    // A python-docx file is larger than the inline limit, so these need the store.
+    ["python makes a docx", "run_code", { language: "python", code: "import docx\nd = docx.Document(); d.add_heading('Report', 1); d.add_paragraph('Body text'); d.save('r.docx'); print('ok')", packages: ["python-docx"] }, (s) => s.startsWith("ok"), true],
+    ["preview the docx", "preview_file", { path: "r.docx" }, (s) => /"kind":"docx"/.test(s)]
   );
 }
+
+// Loads a preview_file page in a sandboxed frame, as TypingMind does, and reports
+// the text it shows after a few seconds (or "NESTED" plus the tag for an iframe).
+const rendered = (html) => new Promise((resolve) => {
+  const f = document.createElement("iframe");
+  f.setAttribute("sandbox", "allow-scripts");
+  const probe = "<script>setTimeout(() => { const v = document.getElementById('v'); parent.postMessage({ probe: 1, text: v ? (v.querySelector('iframe,embed,img,audio,video,table') ? v.querySelector('iframe,embed,img,audio,video,table').tagName + ' ' : '') + v.innerText.slice(0, 300) : '' }, '*'); }, 6000)<\/script>";
+  f.srcdoc = html.replace(/<\/body><\/html>\s*(<!--[\s\S]*-->)?\s*$/, probe + "</body></html>");
+  const on = (e) => { if (e.source === f.contentWindow && e.data && e.data.probe) { removeEventListener("message", on); f.remove(); resolve(e.data.text); } };
+  addEventListener("message", on);
+  document.body.appendChild(f);
+  setTimeout(() => { removeEventListener("message", on); f.remove(); resolve("NO PROBE"); }, 20000);
+});
 
 (async () => {
   const impl = await (await fetch("/implementation.js")).text();
@@ -86,6 +114,11 @@ if (settings.workspaceStore) {
     const clean = String(r.out).replace(/\s*(<!--)?\[\[cr-state:[A-Za-z0-9+/=]+\]\](-->)?\s*$/, "").replace(/\n*\(files in \/workspace: [^\n]*\)$/, "");
     let ok = false;
     try { ok = pred(clean); } catch (e) {}
+    if (ok && fn === "preview_file") {
+      const shown = await rendered(String(r.out));
+      ok = !/^Loading|Could not preview|NO PROBE|Chart error/.test(shown) && shown.trim().length > 0;
+      if (!ok) { await report({ name: name + " (rendered)", ok: false, live: true, ms: 0, out: shown }); continue; }
+    }
     await report({ name, ok, live: !!live, ms: r.ms, out: clean.replace(/data:[a-z/+.-]+;base64,[A-Za-z0-9+/=]{40,}/g, "data:...").slice(0, 800) });
   }
   await report({ done: true });
