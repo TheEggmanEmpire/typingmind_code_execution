@@ -18,52 +18,64 @@ const overviewMarkdown = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
 // The language list comes from the implementation itself, so the schema can never drift.
 const sandbox = {};
 vm.createContext(sandbox);
-vm.runInContext(code + "\n;globalThis.__langs = { all: ALL_LANGS, ce: Object.keys(CE_LANGS), wb: Object.keys(WB_LANGS) };", sandbox);
+vm.runInContext(code + "\n;globalThis.__langs = { all: ALL_LANGS, ce: Object.keys(CE_LANGS), wb: Object.keys(WB_LANGS), local: LOCAL_LANGS };", sandbox);
 const { all: LANGS, ce: CE, wb: WB } = sandbox.__langs;
+for (const fn of ["run_code", "serve_file", "preview_file", "manage_files", "browser_run", "browser_tabs"]) {
+  if (vm.runInContext("typeof " + fn, sandbox) !== "function") throw new Error(fn + " is not defined in implementation.js");
+}
 
 const runCodeSpec = {
   name: "run_code",
   description:
-    "Run code and return its output (print what you need). " +
-    "In-browser, with HTTP internet access and a /workspace folder that persists across calls: " +
-    "python (Pyodide, Python 3.13: numpy, pandas, matplotlib, requests, bs4, PIL, sklearn...; common pure-Python packages install automatically), " +
-    "javascript / typescript (top-level await, fetch, fs, storage), sql (SQLite file /workspace/data.sqlite). " +
+    "Run code and return its output (print what you need). In the browser, with HTTP internet and a persistent /workspace folder: " +
+    "python (Pyodide 3.13; numpy, pandas, matplotlib, requests, sklearn...), javascript / typescript (top-level await, fetch, fs, storage), " +
+    "sql (SQLite, /workspace/data.sqlite), duckdb (SQL over CSV/Parquet/JSON files), r (webR; packages from library() install automatically). " +
+    "Files in /workspace AND Python/R variables, DuckDB tables and JS storage survive between calls (reset: true starts clean). " +
+    "Files the user attaches appear in /workspace/uploads. " +
     "Remote, short programs without internet or files: " + CE.join(", ") + "; best-effort: " + WB.join(", ") + ". " +
-    "Each call is a new process: variables do not survive, files in /workspace do. " +
-    "To give the user a file (chart, CSV, image, document), save it in /workspace, then call serve_file. " +
-    "No shell, subprocess, sockets or pip; blocked sites retry through proxies. " +
-    "To read or control the user's open browser tabs (click, fill, read the DOM, switch/open tabs) use browser_run and browser_tabs.",
+    "Show results to the user with preview_file (tables, HTML, media) or serve_file (images, downloads). No shell, subprocess or sockets. " +
+    "User's open browser tabs: browser_tabs, browser_run.",
   parameters: {
     type: "object",
     properties: {
-      language: { type: "string", enum: LANGS, description: "Language of `code`. Prefer python for data, files, web requests and anything long-running." },
+      language: { type: "string", enum: LANGS, description: "Language of `code`. Prefer python for data, files, web requests and long jobs; duckdb for SQL over large CSV/Parquet files; r for statistics." },
       code: {
         type: "string",
         description:
-          "The complete program. Output is everything printed, plus the last expression's value (python) or a top-level `return` value (javascript/typescript). " +
-          "PYTHON: cwd is /workspace, so open('data.csv') reads and writes there; top-level await works; open matplotlib figures are saved automatically as figure_N.png; input() reads `stdin`. " +
-          "HTTP via requests, urllib.request or pyodide.http.pyfetch. " +
-          "JAVASCRIPT / TYPESCRIPT (a browser worker, not Node.js - no require, process or DOM): fetch(url); async fs with paths relative to /workspace: " +
-          "fs.readFile(p) returns text, fs.readFile(p, 'binary') a Uint8Array, fs.writeFile(p, string | Uint8Array | Blob | Response | object), fs.appendFile, fs.readdir(), fs.exists, fs.stat, fs.mkdir, fs.rm(p, {recursive: true}), fs.rename, fs.copyFile, fs.list(), fs.download(url, name?); " +
-          "storage.get/set(key, value) keeps JSON values between calls; `stdin` is a string; libraries load with `await import('https://cdn.jsdelivr.net/npm/<package>/+esm')` or `await importScripts(url)`. " +
-          "SQL runs on /workspace/data.sqlite; python opens the same database with sqlite3.connect('data.sqlite'). " +
-          "REMOTE LANGUAGES: one file with a normal main function, input from `stdin`, a run-time limit of a few seconds. " +
-          "INTERNET: for the readable text of a web page fetch 'https://r.jina.ai/' + url; for GitHub files use raw.githubusercontent.com URLs."
+          "The complete program. Output is everything printed, plus the last expression's value (python, r) or a top-level `return` value (javascript/typescript). Paths are relative to /workspace. " +
+          "PYTHON: open('data.csv') reads /workspace; top-level await; open matplotlib figures are saved as figure_N.png; input() reads `stdin`; variables, functions, classes and imports from earlier calls are still defined. HTTP via requests, urllib or pyodide.http.pyfetch. " +
+          "JAVASCRIPT / TYPESCRIPT (browser worker, not Node.js: no require/process/DOM): fetch(url); async fs relative to /workspace: fs.readFile(p) text, fs.readFile(p, 'binary') Uint8Array, fs.writeFile(p, string | Uint8Array | Blob | Response | object), fs.appendFile, fs.readdir(), fs.exists, fs.stat, fs.mkdir, fs.rm(p, {recursive: true}), fs.rename, fs.copyFile, fs.list(), fs.download(url, name?); " +
+          "storage.get/set(key, value) keeps JSON values; `stdin` is a string; libraries: `await import('https://cdn.jsdelivr.net/npm/<pkg>/+esm')`. Variables do not persist in JS (use storage or files). " +
+          "SQL: SQLite on /workspace/data.sqlite (python: sqlite3.connect('data.sqlite')). " +
+          "DUCKDB: query files by name, e.g. SELECT * FROM 'uploads/sales.csv' or read_parquet('x.parquet'); CREATE TABLE ... persists; COPY (...) TO 'out.csv' writes a file. " +
+          "R: cwd is /workspace; plots are saved as rplot_N.png; readline() reads `stdin`; objects persist, library() calls are re-attached. " +
+          "REMOTE LANGUAGES: one file with a normal main, input from `stdin`, a few seconds of run time. " +
+          "INTERNET: for a page's readable text fetch 'https://r.jina.ai/' + url; GitHub files via raw.githubusercontent.com."
+      },
+      files: {
+        type: "array",
+        description: "Optional files to write into /workspace before running, e.g. data the user pasted into the chat: [{\"path\": \"data.csv\", \"content\": \"a,b\\n1,2\"}]. Use encoding \"base64\" for binary content. Prefer this over embedding large text in `code`.",
+        items: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Relative path in /workspace." },
+            content: { type: "string", description: "File content (text, or base64 when encoding is base64)." },
+            encoding: { type: "string", enum: ["text", "base64"], description: "Default text." }
+          },
+          required: ["path", "content"]
+        }
       },
       packages: {
         type: "array",
         items: { type: "string" },
-        description:
-          "Python only. Extra PyPI packages to install before running, e.g. [\"beautifulsoup4\", \"pyyaml\"]. Packages Pyodide ships (numpy, pandas, scipy, matplotlib, scikit-learn, pillow, lxml, bs4...) and common ones such as yaml, docx, openpyxl or tabulate load automatically from the imports. Pure-Python wheels or packages built for Pyodide only."
+        description: "Extra packages. Python: PyPI names installed with micropip (pure-Python wheels or Pyodide builds; common ones such as yaml, docx, openpyxl load automatically from imports). R: package names from the webR repository (library() calls install automatically)."
       },
-      stdin: {
-        type: "string",
-        description: "Optional standard input: python input() reads it line by line, javascript/typescript get it as `stdin`, compiled programs read it from stdin."
-      },
-      timeout: {
-        type: "number",
-        description: "Optional time limit in seconds for python, javascript, typescript and sql (default 120, max 900). The run is stopped and reported when it is exceeded."
-      }
+      stdin: { type: "string", description: "Optional standard input: python input() and R readline() read it line by line, javascript/typescript get it as `stdin`, compiled programs read stdin." },
+      timeout: { type: "number", description: "Optional time limit in seconds for the in-browser languages (default 120, max 900). The run is stopped and reported when exceeded; /workspace keeps its state from before the call." },
+      reset: { type: "boolean", description: "Start without the Python/R variables and DuckDB tables saved by earlier calls (files are kept). Use when earlier state gets in the way." },
+      typecheck: { type: "boolean", description: "TypeScript only: type-check with the real TypeScript compiler (strict) before running; type errors are reported with line numbers and the code does not run. Slower on first use (downloads ~9 MB)." },
+      compiler_args: { type: "string", description: "Remote compiled languages only: compiler flags, e.g. \"-O2 -std=c++20\" or \"--edition 2024\". They replace the matching default flags." },
+      compiler_version: { type: "string", description: "Remote languages only: compiler version, e.g. \"13\" (gcc 13), \"clang 18\", \"1.80\" (rust). An unknown version returns the list of available ones." }
     },
     required: ["language", "code"]
   }
@@ -73,15 +85,14 @@ const serveFileSpec = {
   name: "serve_file",
   description:
     "Show a file from /workspace to the user directly in the chat, without its contents passing through your context: " +
-    "images appear inline, small text/code/CSV/JSON files as a code block, and anything else (PDF, XLSX, DOCX, ZIP, audio...) as a download link. " +
-    "First create the file with run_code (for example save a chart, a CSV or a report into /workspace), then call serve_file with its path. " +
-    "Use this instead of pasting file contents into your answer. Files up to 20 MB.",
+    "images appear inline, small text/code/CSV/JSON files as a code block, anything else (PDF, XLSX, DOCX, ZIP, audio...) as a download link. " +
+    "Create the file with run_code first, then call serve_file with its path. Use it instead of pasting file contents into your answer, and whenever the user wants to download a file. Files up to 20 MB.",
   parameters: {
     type: "object",
     properties: {
       path: { type: "string", description: "Path of the file in /workspace, e.g. 'chart.png', 'out/report.csv' or '/workspace/data.xlsx'." },
       filename: { type: "string", description: "Optional download name shown to the user. Defaults to the file's own name." },
-      mime: { type: "string", description: "Optional MIME type. Guessed from the extension when omitted." },
+      mime: { type: "string", description: "Optional MIME type, e.g. text/csv. Guessed from the extension when omitted." },
       as: { type: "string", enum: ["auto", "image", "link", "text"], description: "How to present it. auto (default): image inline, small text files as a code block, otherwise a download link." }
     },
     required: ["path"]
@@ -127,13 +138,66 @@ const browserTabsSpec = {
   }
 };
 
+const previewFileSpec = {
+  name: "preview_file",
+  description:
+    "Show the user an interactive preview of a /workspace file in the chat: CSV/TSV/JSON/XLSX as a sortable, filterable table; " +
+    "HTML pages rendered live (dashboards, charts made with Plotly/Chart.js/D3, reports); Markdown rendered; audio and video with players; images; PDFs. " +
+    "Use it to present tables, HTML output and media; use serve_file when the user needs to download the file. The file contents do not pass through your context. Files up to 15 MB.",
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Path of the file in /workspace, e.g. 'results.csv' or 'report.html'." },
+      as: { type: "string", enum: ["auto", "table", "sheet", "json", "html", "markdown", "text", "image", "audio", "video", "pdf"], description: "Presentation. auto (default) chooses from the file extension." }
+    },
+    required: ["path"]
+  }
+};
+
+const manageFilesSpec = {
+  name: "manage_files",
+  description:
+    "List, delete, rename or clear the files in /workspace without running code. " +
+    "list shows every file with its size (including the user's attachments in uploads/) and what state is saved between calls. " +
+    "delete takes paths or globs (\"tmp/*\", \"out/\"); rename moves a file or folder; clear empties the workspace; reset_variables forgets saved Python/R variables and DuckDB tables but keeps the files.",
+  parameters: {
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["list", "delete", "rename", "clear", "reset_variables"], description: "Default list." },
+      paths: { type: "array", items: { type: "string" }, description: "delete: files, folders (ending in /) or globs (* and **)." },
+      from: { type: "string", description: "rename: current path." },
+      to: { type: "string", description: "rename: new path." },
+      keep_variables: { type: "boolean", description: "clear: keep saved variables and tables, remove only the files." }
+    }
+  }
+};
+
+// Always in the model's context while the plugin is enabled: how to use the tools well.
+const USAGE_GUIDE = [
+  "Code Runner tools: run_code, preview_file, serve_file, manage_files.",
+  "- Work in steps. /workspace files, Python and R variables, DuckDB tables and JavaScript storage persist between run_code calls, so load data once and reuse it; pass reset: true to start clean.",
+  "- Files the user attaches to their message are saved to /workspace/uploads/<name> automatically; check with manage_files (action list) when unsure what exists.",
+  "- Data the user pastes as text: pass it in run_code `files` instead of embedding it in code.",
+  "- Pick the language: python for general data work, files, web requests, charts; duckdb for SQL over big CSV/Parquet/JSON files; sql for a small persistent SQLite database; r for statistics and ggplot2; javascript/typescript for JS tasks (typecheck: true for strict type checking). Other languages run remotely without files or internet.",
+  "- Show results instead of pasting them: preview_file for tables (sortable), HTML pages and dashboards, Markdown, audio/video; serve_file for images inline and download links. Charts: matplotlib figures and R plots are saved automatically (figure_N.png, rplot_N.png).",
+  "- Output is capped at 40,000 characters: print summaries (df.head(), describe(), counts), not whole datasets.",
+  "- Internet works over HTTP from the browser. Blocked sites are retried through proxies; for a web page's readable text fetch https://r.jina.ai/<url>. Requests with API keys never go through public proxies.",
+  "- Each run has a time limit (default 120 s, `timeout` up to 900). A stopped run keeps /workspace as it was before the call.",
+  "- Read the notes in parentheses at the end of run_code output: they list new files, saved figures, installed packages and problems.",
+  "- The user's own open browser tabs are separate from /workspace: browser_tabs lists and switches them, browser_run runs JavaScript in one (needs the companion Chrome extension)."
+].join("\n");
+
 const userSettings = [
   { name: "corsProxy", label: "Personal CORS proxy (recommended)", description: "Makes downloads from websites that block browsers work reliably. Deploy the free companion Cloudflare Worker (worker/ folder of this plugin's repository) and enter https://<worker-name>.<account>.workers.dev/?key=<PROXY_KEY>&url= . Any proxy URL prefix, or a URL containing {url}, also works. Without it only a few public proxies are tried, and they often fail.", placeholder: "https://code-runner-proxy.example.workers.dev/?key=SECRET&url=", required: false },
-  { name: "workspaceStore", label: "Workspace store (recommended)", description: "Carries large workspaces (charts, downloads, datasets) between calls privately. With the companion Worker enter https://<worker-name>.<account>.workers.dev/store?key=<PROXY_KEY> . Contract for other servers: POST the payload, respond with a read URL as plain text; GET returns it; DELETE removes it. Without it, workspaces above the inline limit go to public temporary stores (litterbox.catbox.moe, pastes.dev, dpaste.com).", placeholder: "https://code-runner-proxy.example.workers.dev/store?key=SECRET", required: false },
+  { name: "workspaceStore", label: "Workspace store (recommended)", description: "Carries large workspaces (charts, downloads, datasets) between calls privately. With the companion Worker enter https://<worker-name>.<account>.workers.dev/store?key=<PROXY_KEY> . Contract for other servers: POST the payload, respond with a read URL as plain text; GET returns it; DELETE removes it. Without it, files above the inline limit are not carried between calls unless public temporary stores are allowed below.", placeholder: "https://code-runner-proxy.example.workers.dev/store?key=SECRET", required: false },
   { name: "execTimeoutSec", label: "Run time limit (seconds)", description: "Default 120. Python, JavaScript, TypeScript and SQL runs are stopped after this long (the model can pass a different `timeout` per call, up to 900).", type: "number", required: false },
   { name: "stateCarry", label: "Persist workspace between calls", description: "Default on. TypingMind runs each call in a fresh sandbox, so /workspace (including the SQLite database) and JavaScript storage are carried forward inside the tool output. Set to \"off\" to disable.", placeholder: "on", required: false },
   { name: "stateLimitKB", label: "Inline workspace limit (KB)", description: "Default 24. A compressed workspace up to this size travels inside the tool output (it costs tokens); a larger one is offloaded to the workspace store.", type: "number", required: false },
-  { name: "bigWorkspace", label: "Offload large workspaces", description: "Default on. Workspaces above the inline limit are uploaded to the workspace store (yours, or a public temporary store when none is set) and only a small pointer travels in the output. Set \"off\" to never upload; oversized files are then dropped between calls (the model is told which).", placeholder: "on", required: false },
+  { name: "bigWorkspace", label: "Offload large workspaces", description: "Default on. Workspaces above the inline limit are uploaded to the workspace store and only a small pointer travels in the output. Set \"off\" to never upload; oversized files are then dropped between calls (the model is told which).", placeholder: "on", required: false },
+  { name: "publicStores", label: "Allow public temporary stores", description: "Default off (private). When no workspace store is set, \"on\" lets large workspaces be uploaded to public temporary paste services (litterbox.catbox.moe, pastes.dev, dpaste.com; anyone with the link can read them until they expire). Keep off for private data.", placeholder: "off", required: false },
+  { name: "publicProxies", label: "Allow public CORS proxies", description: "Default on. Requests to sites that block browsers are retried through public CORS proxies (never requests carrying keys, tokens or passwords). Set \"off\" for a private-only setup: only your personal proxy is used.", placeholder: "on", required: false },
+  { name: "keepVariables", label: "Keep variables between calls", description: "Default on. Python and R variables, functions and imports, and DuckDB tables are saved with the workspace and restored in the next call. Set \"off\" to start every call with a clean interpreter (files still persist).", placeholder: "on", required: false },
+  { name: "importAttachments", label: "Import attached files", description: "Default on. Files the user attaches to a message are saved to /workspace/uploads so code can read them. Set \"off\" to disable.", placeholder: "on", required: false },
   { name: "workspaceTtlMin", label: "Offloaded workspace lifetime (minutes)", description: "Default 1440 (24 hours). An offloaded workspace older than this is not restored.", type: "number", required: false },
   { name: "fetchTimeoutMs", label: "HTTP request timeout (ms)", description: "Default 30000. Per-request timeout for fetch / requests from Python and JavaScript before fallbacks are tried.", type: "number", required: false },
   { name: "pyodideCdn", label: "Pyodide CDN (optional)", description: "Base URL of a Pyodide 0.29.4 full distribution to try first, e.g. a self-hosted copy. Built-in fallbacks: cdn/fastly/gcore/testingcf.jsdelivr.net, then unpkg.", placeholder: "https://cdn.jsdelivr.net/pyodide/v0.29.4/full/", required: false },
@@ -149,12 +213,17 @@ const plugin = {
   authenticationType: "AUTH_TYPE_NONE",
   oauthConfig: null,
   userSettings,
-  dynamicContextEndpoints: [],
+  permissions: ["read_user_message"],
+  dynamicContextEndpoints: [
+    { id: "code-runner-usage-fa4fdbb3", name: "How to use Code Runner", source: "static", method: "GET", url: "", staticContent: USAGE_GUIDE, cacheDurationHours: 1, cacheRefreshPolicy: "REFRESH_NEVER" }
+  ],
   pluginFunctions: [
     { id: "run-code-fn-fa4fdbb3", name: "run_code", implementationType: "javascript", openaiSpec: runCodeSpec, code, outputType: "respond_to_ai" },
     { id: "serve-file-fn-fa4fdbb3", name: "serve_file", implementationType: "javascript", openaiSpec: serveFileSpec, code, outputType: "render_markdown" },
     { id: "browser-run-fn-fa4fdbb3", name: "browser_run", implementationType: "javascript", openaiSpec: browserRunSpec, code, outputType: "respond_to_ai" },
-    { id: "browser-tabs-fn-fa4fdbb3", name: "browser_tabs", implementationType: "javascript", openaiSpec: browserTabsSpec, code, outputType: "respond_to_ai" }
+    { id: "browser-tabs-fn-fa4fdbb3", name: "browser_tabs", implementationType: "javascript", openaiSpec: browserTabsSpec, code, outputType: "respond_to_ai" },
+    { id: "preview-file-fn-fa4fdbb3", name: "preview_file", implementationType: "javascript", openaiSpec: previewFileSpec, code, outputType: "render_html" },
+    { id: "manage-files-fn-fa4fdbb3", name: "manage_files", implementationType: "javascript", openaiSpec: manageFilesSpec, code, outputType: "respond_to_ai" }
   ],
   overviewMarkdown
 };
@@ -175,8 +244,5 @@ if (process.argv.includes("--check")) {
 }
 
 fs.writeFileSync(outPath, json);
-console.log("wrote plugin.json (" + json.length + " bytes; run_code desc " + runCodeSpec.description.length +
-  ", serve_file desc " + serveFileSpec.description.length +
-  ", browser_run desc " + browserRunSpec.description.length +
-  ", browser_tabs desc " + browserTabsSpec.description.length +
-  ", " + LANGS.length + " languages)");
+console.log("wrote plugin.json (" + json.length + " bytes; descriptions " + plugin.pluginFunctions.map((f) => f.name + " " + f.openaiSpec.description.length).join(", ") +
+  "; usage guide " + USAGE_GUIDE.length + " chars; " + LANGS.length + " languages)");

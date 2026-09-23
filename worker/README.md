@@ -15,7 +15,8 @@ openssl rand -hex 24 > ~/.config/code-runner/proxy_key && chmod 600 ~/.config/co
 tr -d '\n' < ~/.config/code-runner/proxy_key | npx wrangler secret put PROXY_KEY
 ```
 
-Until `PROXY_KEY` is set every proxy and upload request is refused with `401`.
+Until `PROXY_KEY` is set every proxy and store request is refused with `401`. Bad-key responses include
+`X-CR-Error: bad-key`; they do not include `X-CR-Proxy`.
 
 - **No workers.dev subdomain yet?** `wrangler deploy` stops with "You need to register a workers.dev subdomain".
   Open Workers & Pages in the dashboard once, or register one via the API:
@@ -49,9 +50,11 @@ end-to-end suite (`node test/run-e2e.js` with both settings).
 |---|---|
 | `ANY /?key=KEY&url=<encoded url>` | Proxies the request (method, body, headers) and adds CORS headers. The target's own status is passed through and marked `X-CR-Proxy: 1`. Cookies are neither forwarded nor returned. |
 | `POST /store?key=KEY[&ttl=seconds]` | Stores the body (max 24 MB) for `ttl` (default `STORE_TTL`, 24 h) and returns its URL. |
-| `GET /store/<id>` / `DELETE /store/<id>` | Reads / deletes a stored blob. The id is random and unguessable, so the key is not needed. |
+| `GET /store/<id>?key=KEY` / `DELETE /store/<id>?key=KEY` | Reads / deletes a stored blob. The key can also be sent in the `x-cr-key` header. The plugin appends the key automatically; blob links shared in chats are useless without the key. |
 
-Requests without the right key get `401`, so nobody else can use the proxy. Rotate the key with
+Requests without the right key get `401`, so nobody else can use the proxy or store. Uploads over 24 MiB
+are rejected with `413`; a declared oversized `Content-Length` is rejected before the body is read.
+Rotate the key with
 `npx wrangler secret put PROXY_KEY` and update both plugin settings.
 
 ### Sites that refuse Cloudflare
@@ -61,6 +64,20 @@ The Worker passes that status through unchanged; the plugin then also tries the 
 returns the site's `403` only if none of them succeeds.
 
 ### Local test
+
+```sh
+node worker/test.mjs
+```
+
+After updating the Worker, redeploy it with `npx wrangler deploy` from this directory.
+
+### Limits
+
+Cloudflare KV's free tier allows about 1,000 writes per day (deletes count) and 1 GB of storage;
+individual values can be up to 25 MB. The plugin only uploads when a workspace exceeds the inline
+limit and reuses unchanged uploads.
+
+### Local development
 
 ```sh
 printf 'PROXY_KEY=local-test-key\n' > .dev.vars

@@ -5,16 +5,17 @@
 <script>
 const params = new URLSearchParams(location.search);
 const settings = params.get("settings") ? JSON.parse(params.get("settings")) : {};
-const noWorker = params.get("noWorker") === "1";   // in-thread fallback: time limits cannot interrupt a loop there
+const noWorker = params.get("noWorker") === "1";
+const only = params.get("only") ? new RegExp(params.get("only"), "i") : null;   // run a subset: --only "duckdb|r "   // in-thread fallback: time limits cannot interrupt a loop there
 const report = (o) => fetch("/report", { method: "POST", body: JSON.stringify(o) });
 
 // [name, function, params, predicate on the output (state marker removed), live-network?]
 const STEPS = [
   ["python runs in a worker", "run_code", { language: "python", code: "import sys\nopen('a.txt','w').write('hi')\nprint(sys.version.split()[0])" }, (s) => /^3\.13/.test(s)],
   ["file carried to the next call", "run_code", { language: "python", code: "print(open('a.txt').read())" }, (s) => s === "hi"],
-  ["python requests (CORS-enabled host)", "run_code", { language: "python", code: "import requests\nr = requests.get('https://cdn.jsdelivr.net/pyodide/v0.29.4/full/pyodide-lock.json')\nprint(r.status_code, len(r.content) > 1000)" }, (s) => s === "200 True", true],
+  ["python requests (CORS-enabled host)", "run_code", { language: "python", code: "import requests\nr = requests.get('https://cdn.jsdelivr.net/pyodide/v0.29.4/full/pyodide-lock.json')\nprint(r.status_code, len(r.content) > 1000)" }, (s) => /^200 True/.test(s), true],
   ["python requests (CORS-blocked host, fallback)", "run_code", { language: "python", code: "import requests\nr = requests.get('https://example.com/')\nprint(r.status_code, 'Example Domain' in r.text)" }, (s) => s === "200 True", true],
-  ["python urllib binary", "run_code", { language: "python", code: "import urllib.request\nb = urllib.request.urlopen('https://cdn.jsdelivr.net/npm/sql.js@1.13.0/dist/sql-wasm.wasm').read()\nprint(len(b) > 100000, b[:4])" }, (s) => s === "True b'\\x00asm'", true],
+  ["python urllib binary", "run_code", { language: "python", code: "import urllib.request\nb = urllib.request.urlopen('https://cdn.jsdelivr.net/npm/sql.js@1.13.0/dist/sql-wasm.wasm').read()\nprint(len(b) > 100000, b[:4])" }, (s) => s.startsWith("True b'\\x00asm'"), true],
   ["python infinite loop stopped", "run_code", { language: "python", code: "print('before', flush=True)\nwhile True:\n    pass", timeout: 6 }, (s) => /^before/.test(s) && /stopped after the 6 s time limit/.test(s)],
   ["workspace intact after the stop", "run_code", { language: "python", code: "print(open('a.txt').read())" }, (s) => s === "hi"],
   ["matplotlib figure saved", "run_code", { language: "python", code: "import matplotlib.pyplot as plt\nplt.bar(['a','b'], [3,5])\nprint('ok')" }, (s) => /^ok/.test(s) && /figure_1\.png/.test(s)],
@@ -28,7 +29,20 @@ const STEPS = [
   ["sql", "run_code", { language: "sql", code: "CREATE TABLE t(x); INSERT INTO t VALUES (1),(2); SELECT count(*) AS n FROM t;" }, (s) => s === "n\n2"],
   ["python reads the sql database", "run_code", { language: "python", code: "import sqlite3\nprint(sqlite3.connect('data.sqlite').execute('select sum(x) from t').fetchone()[0])" }, (s) => s === "3"],
   ["remote c", "run_code", { language: "c", code: "#include <stdio.h>\nint main(void){ int a; scanf(\"%d\", &a); printf(\"%d\\n\", a * 2); return 0; }", stdin: "21" }, (s) => s === "42", true],
-  ["files still there after everything", "run_code", { language: "javascript", code: "console.log((await fs.list()).map(f => f.path).sort().join(','))" }, (s) => /a\.txt/.test(s) && /data\.sqlite/.test(s) && /figure_1\.png/.test(s)]
+  ["files still there after everything", "run_code", { language: "javascript", code: "console.log((await fs.list()).map(f => f.path).sort().join(','))" }, (s) => /a\.txt/.test(s) && /data\.sqlite/.test(s) && /figure_1\.png/.test(s)],
+  ["worker code cannot see the engine's private state", "run_code", { language: "javascript", code: "console.log(typeof globalThis.__crRunning, typeof self.__crCorsProxy, typeof self.__crRealFetch)" }, (s) => s === "undefined undefined undefined" || /^number/.test(s) && noWorker],
+  ["python variables survive the call", "run_code", { language: "python", code: "import pandas as pd\ndf = pd.DataFrame({'v': [1, 2, 3]})\ndef double(x):\n    return 2 * x\nprint('set')" }, (s) => s === "set"],
+  ["python variables restored", "run_code", { language: "python", code: "print(double(int(df.v.sum())))" }, (s) => s === "12"],
+  ["typescript typecheck catches an error", "run_code", { language: "typescript", code: "const n: number = 'x';", typecheck: true }, (s) => /line 1: TS2322/.test(s), true],
+  ["typescript typecheck passes", "run_code", { language: "typescript", code: "const t: string = await fs.readFile('a.txt'); return t.toUpperCase()", typecheck: true }, (s) => s === "HI", true],
+  ["duckdb reads a workspace file and writes one", "run_code", { language: "duckdb", code: "CREATE TABLE s AS SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'b')) t(n, k);\nCOPY (SELECT k, sum(n) AS total FROM s GROUP BY k ORDER BY k) TO 'totals.csv' (HEADER);\nSELECT k, sum(n) AS total, DATE '2024-02-03' AS d, 1.50::DECIMAL(5,2) AS p FROM s GROUP BY k ORDER BY k;" }, (s) => /^k \| total \| d \| p\na \| 1 \| 2024-02-03 \| 1\.50\nb \| 5 \| 2024-02-03 \| 1\.50/.test(s), true],
+  ["duckdb tables persist", "run_code", { language: "duckdb", code: "SELECT count(*) AS n FROM s; SELECT * FROM 'totals.csv' ORDER BY k;" }, (s) => /n\n3/.test(s) && /a \| 1/.test(s), true],
+  ["python reads the duckdb output", "run_code", { language: "python", code: "print(open('totals.csv').read().strip())" }, (s) => /^k,total\na,1\nb,5/.test(s)],
+  ["r runs with packages, plots and files", "run_code", { language: "r", code: "library(jsonlite)\nd <- read.csv('totals.csv')\nprint(sum(d$total))\ncat(toJSON(list(n = nrow(d))), '\\n')\nplot(d$total)\nwrite.csv(d, 'from_r.csv', row.names = FALSE)\nkeep_me <- 99" }, (s) => /\[1\] 6/.test(s) && /\{"n":\[2\]\}/.test(s) && /rplot_1\.png/.test(s), true],
+  ["r objects and packages persist", "run_code", { language: "r", code: "cat(keep_me, toJSON(1), '\\n')" }, (s) => /^99 \[1\]/.test(s), true],
+  ["preview_file renders a table", "preview_file", { path: "totals.csv" }, (s) => /^<!doctype html>/.test(s) && /"kind":"table"/.test(s)],
+  ["manage_files lists everything", "manage_files", {}, (s) => /from_r\.csv/.test(s) && /Python variables/.test(s) && /R variables/.test(s) && /DuckDB tables/.test(s)],
+  ["serve_file after the new tools", "serve_file", { path: "from_r.csv" }, (s) => /k,total|"k","total"/.test(s)]
 ];
 
 // Extra steps when a personal proxy / workspace store is configured (e.g. the companion Worker).
@@ -66,9 +80,10 @@ if (settings.workspaceStore) {
   });
   for (const [name, fn, p, pred, live] of STEPS) {
     if (noWorker && /infinite loop/.test(name)) continue;
+    if (only && !only.test(name)) continue;
     const r = await call(name, fn, p);
     prev = r.out;
-    const clean = String(r.out).replace(/\s*(<!--)?\[\[cr-state:[A-Za-z0-9+/=]+\]\](-->)?\s*$/, "");
+    const clean = String(r.out).replace(/\s*(<!--)?\[\[cr-state:[A-Za-z0-9+/=]+\]\](-->)?\s*$/, "").replace(/\n*\(files in \/workspace: [^\n]*\)$/, "");
     let ok = false;
     try { ok = pred(clean); } catch (e) {}
     await report({ name, ok, live: !!live, ms: r.ms, out: clean.replace(/data:[a-z/+.-]+;base64,[A-Za-z0-9+/=]{40,}/g, "data:...").slice(0, 800) });

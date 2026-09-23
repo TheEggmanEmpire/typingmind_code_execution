@@ -3,10 +3,9 @@
 //
 //   GET|POST|... /?key=KEY&url=<encoded target>   proxy any http(s) request
 //   POST /store?key=KEY[&ttl=seconds]              store the body, returns its URL
-//   GET|DELETE /store/<id>                         read / delete a stored blob
+//   GET|DELETE /store/<id>?key=KEY                 read / delete a stored blob
 //
-// The proxy and uploads require KEY (secret PROXY_KEY). A stored blob is read
-// by its unguessable id, so the key never has to travel with the blob URL.
+// The proxy and all store operations require KEY (secret PROXY_KEY).
 
 const STRIP_REQUEST = /^(host|origin|referer|cookie|content-length|connection|accept-encoding|x-forwarded-.*|x-real-ip|cf-.*|sec-fetch-.*|x-cr-key)$/i;
 const STORE_ID = /^\/store\/([A-Za-z0-9_-]{24,80})$/;
@@ -24,6 +23,11 @@ function cors(headers = new Headers()) {
 
 function text(body, status = 200) {
   return new Response(body, { status, headers: cors(new Headers({ "Content-Type": "text/plain; charset=utf-8" })) });
+}
+
+function authError(body) {
+  const headers = cors(new Headers({ "Content-Type": "text/plain; charset=utf-8", "X-CR-Error": "bad-key" }));
+  return new Response(body, { status: 401, headers });
 }
 
 function keyOk(request, url, env) {
@@ -65,6 +69,10 @@ function newId() {
 
 async function store(request, url, env) {
   if (!env.STORE) return text("store: KV binding STORE is not configured", 503);
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null && Number(contentLength) > MAX_STORE_BYTES) {
+    return text("store: payload too large (max 24 MB)", 413);
+  }
   const body = await request.arrayBuffer();
   if (body.byteLength > MAX_STORE_BYTES) return text("store: payload too large (max 24 MB)", 413);
   const ttl = Math.min(Math.max(Number(url.searchParams.get("ttl")) || Number(env.STORE_TTL) || 3600, 60), 7 * 86400);
@@ -80,6 +88,7 @@ export default {
     try {
       const m = url.pathname.match(STORE_ID);
       if (m) {
+        if (!keyOk(request, url, env)) return authError("store: missing or wrong key");
         if (!env.STORE) return text("store: KV binding STORE is not configured", 503);
         if (request.method === "DELETE") { await env.STORE.delete(m[1]); return text("deleted"); }
         const v = await env.STORE.get(m[1], "arrayBuffer");
@@ -88,11 +97,11 @@ export default {
       }
       if (url.pathname === "/store") {
         if (request.method !== "POST") return text("store: POST a body to /store", 405);
-        if (!keyOk(request, url, env)) return text("store: missing or wrong key", 401);
+        if (!keyOk(request, url, env)) return authError("store: missing or wrong key");
         return store(request, url, env);
       }
       if (url.pathname === "/" && url.searchParams.has("url")) {
-        if (!keyOk(request, url, env)) return text("proxy: missing or wrong key", 401);
+        if (!keyOk(request, url, env)) return authError("proxy: missing or wrong key");
         return proxy(request, url.searchParams.get("url"));
       }
       if (url.pathname === "/") return text("Code Runner proxy is running.");

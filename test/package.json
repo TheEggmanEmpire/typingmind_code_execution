@@ -2,6 +2,7 @@
   "dependencies": {
     "@babel/standalone": "^8.0.5",
     "pyodide": "^0.29.4",
-    "sql.js": "^1.13.0"
+    "sql.js": "^1.13.0",
+    "typescript": "^6.0.3"
   }
 }

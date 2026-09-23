@@ -51,6 +51,8 @@ const server = http.createServer((req, res) => {
 const query = [];
 if (settings) query.push("settings=" + encodeURIComponent(settings));
 if (process.argv.includes("--no-worker")) query.push("noWorker=1");
+const onlyArg = process.argv.indexOf("--only");
+if (onlyArg > 0) query.push("only=" + encodeURIComponent(process.argv[onlyArg + 1]));
 const url = "http://127.0.0.1:" + PORT + "/test/e2e.html" + (query.length ? "?" + query.join("&") : "");
 const chrome = spawn(findChrome(), ["--headless=new", "--disable-gpu", "--no-first-run", "--user-data-dir=" + fs.mkdtempSync(path.join(os.tmpdir(), "cr-e2e-")), url], { stdio: "ignore" });
 const timer = setTimeout(() => { console.log("TIMEOUT: e2e run did not finish in time"); finish(); }, (Number(process.env.E2E_TIMEOUT_MIN) || 15) * 60 * 1000);

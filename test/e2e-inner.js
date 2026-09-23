@@ -8,7 +8,7 @@ window.addEventListener("message", async (e) => {
     if (noWorker) globalThis.__crNoWorker = true;   // exercise the in-thread fallback
     (0, eval)(impl);
     const t0 = Date.now();
-    const f = fn === "serve_file" ? serve_file : run_code;
+    const f = { run_code, serve_file, preview_file, manage_files }[fn] || run_code;
     const out = await f(params, settings || {}, { previousRunOutput: prev });
     parent.postMessage({ name, out, ms: Date.now() - t0 }, "*");
   } catch (err) {
