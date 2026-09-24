@@ -3,23 +3,17 @@
 <title>Code Runner Browser Bridge</title>
 <style>
   body { font: 14px/1.5 system-ui, sans-serif; max-width: 640px; margin: 24px auto; padding: 0 16px; color: #1f2328; }
-  code, input, textarea { font: 13px ui-monospace, Menlo, monospace; }
-  input, textarea { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #d0d7de; border-radius: 6px; }
+  code, textarea { font: 13px ui-monospace, Menlo, monospace; }
+  textarea { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #d0d7de; border-radius: 6px; }
   button { padding: 6px 12px; border: 1px solid #d0d7de; border-radius: 6px; background: #f6f8fa; cursor: pointer; }
-  .row { display: flex; gap: 8px; align-items: center; } .row input { flex: 1; }
   .mut { color: #656d76; font-size: 13px; } #saved { color: #1a7f37; margin-left: 8px; }
 </style>
 <h2>Code Runner Browser Bridge</h2>
-<p>This extension lets the Code Runner plugin in TypingMind read and operate your tabs. It only answers pages on the
-trusted hosts below that also send the pairing key.</p>
-
-<h3>1. Pairing key</h3>
-<p class="mut">Paste this into the Code Runner plugin setting <b>Browser pairing key</b>.</p>
-<div class="row"><input id="key" readonly><button id="copy">Copy</button><button id="regen">New key</button></div>
-
-<h3>2. Trusted hosts</h3>
-<p class="mut">Pages allowed to use the bridge, one per line. <code>*.example.com</code> matches subdomains.
-Add your own host if you run TypingMind self-hosted or on a custom domain.</p>
+<p>This extension lets the Code Runner plugin in TypingMind read and operate your tabs. It only answers the pages
+on the trusted hosts below, so other websites cannot use it.</p>
+<h3>Trusted hosts</h3>
+<p class="mut">One per line. <code>*.example.com</code> matches subdomains. Add your own host if you run TypingMind
+self-hosted or on a custom domain.</p>
 <textarea id="hosts" rows="5"></textarea>
 <p><button id="save">Save</button><span id="saved"></span></p>
 <script src="options.js"></script>

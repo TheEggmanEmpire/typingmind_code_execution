@@ -103,6 +103,7 @@
     while (stack.length) {
       const node = stack.pop();
       if (node.nodeType === 1) {
+        if (node.hasAttribute("data-crb-hl")) continue;
         if (SKIP_TAGS.has(node.tagName)) {
           if (node.tagName === "IFRAME") { try { const d = node.contentDocument; if (d && d.body) { yield { frame: node }; stack.push(d.body); } } catch (e) {} }
           continue;
@@ -136,6 +137,7 @@
 
     for (const item of walk(document.body || document.documentElement)) {
       if (truncated) break;
+      if (item.el && item.el.hasAttribute && item.el.hasAttribute("data-crb-hl")) continue;
       if (item.frame) { flushText(); push("--- iframe ---"); continue; }
       if (item.text) {
         const p = item.text.parentElement;
@@ -328,7 +330,7 @@
     const block = (node, depth) => {
       for (const c of node.childNodes) {
         if (c.nodeType === 3) { const t = c.textContent.replace(/\s+/g, " ").trim(); if (t) out.push(t); continue; }
-        if (c.nodeType !== 1 || SKIP.test(c.tagName)) continue;
+        if (c.nodeType !== 1 || SKIP.test(c.tagName) || (c.hasAttribute && c.hasAttribute("data-crb-hl"))) continue;
         if (root === document.body && NOISE.test(c.tagName)) continue;
         if (typeof c.checkVisibility === "function" && !c.checkVisibility()) continue;
         const tag = c.tagName;
@@ -363,24 +365,29 @@
     return { url: location.href, title: document.title, markdown: md, truncated, length: md.length };
   }
 
-  // Numbered boxes over the indexed elements, for screenshots.
-  function highlight(on) {
+  // Numbered boxes over the indexed elements, nanobrowser style: "page" anchors
+  // them to the document (they scroll with it, shown on the live page until the
+  // next snapshot); the default pins them to the viewport for a screenshot.
+  function highlight(on, anchor) {
     document.querySelectorAll("[data-crb-hl]").forEach((n) => n.remove());
     if (!on) return 0;
+    const page = anchor === "page";
+    const dx = page ? window.scrollX : 0, dy = page ? window.scrollY : 0;
     const box = document.createElement("div");
     box.setAttribute("data-crb-hl", "");
-    box.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483647";
+    box.style.cssText = (page ? "position:absolute;left:0;top:0;width:0;height:0;" : "position:fixed;inset:0;") + "pointer-events:none;z-index:2147483647";
     const colors = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#008080", "#9a6324", "#800000"];
     map.forEach((e, i) => {
       if (!e.isConnected || !visible(e)) return;
       const r = rectOf(e);
-      if (r.y + r.h < 0 || r.y > window.innerHeight) return;
+      if (!page && (r.y + r.h < 0 || r.y > window.innerHeight)) return;
       const c = colors[i % colors.length];
       const d = document.createElement("div");
-      d.style.cssText = "position:fixed;left:" + r.x + "px;top:" + r.y + "px;width:" + r.w + "px;height:" + r.h + "px;border:2px solid " + c + ";box-sizing:border-box";
+      d.style.cssText = "position:" + (page ? "absolute" : "fixed") + ";left:" + (r.x + dx) + "px;top:" + (r.y + dy) + "px;width:" + r.w + "px;height:" + r.h + "px;border:2px solid " + c + ";background:" + c + "14;box-sizing:border-box";
       const l = document.createElement("span");
       l.textContent = String(i + 1);
-      l.style.cssText = "position:absolute;top:-2px;right:-2px;background:" + c + ";color:#fff;font:bold 11px/14px sans-serif;padding:0 3px;border-radius:2px";
+      // The tag sits just above the box's corner (inside it at the very top of the page).
+      l.style.cssText = "position:absolute;" + (r.y > 16 ? "top:-15px" : "top:0") + ";right:-2px;background:" + c + ";color:#fff;font:bold 11px/14px sans-serif;padding:0 3px;border-radius:2px;white-space:nowrap";
       d.appendChild(l);
       box.appendChild(d);
     });

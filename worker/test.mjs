@@ -6,12 +6,13 @@ const blobs = new Map();
 const writes = [];
 const STORE = {
   async get(id, type) {
-    assert.equal(type, "arrayBuffer");
     const value = blobs.get(id);
-    return value === undefined ? null : value.slice(0);
+    if (value === undefined) return null;
+    if (type === "arrayBuffer") return typeof value === "string" ? new TextEncoder().encode(value).buffer : value.slice(0);
+    return typeof value === "string" ? value : new TextDecoder().decode(value);
   },
   async put(id, body, opts) {
-    const bytes = body instanceof ArrayBuffer ? body.slice(0) : await new Response(body).arrayBuffer();
+    const bytes = typeof body === "string" ? body : body instanceof ArrayBuffer ? body.slice(0) : await new Response(body).arrayBuffer();
     blobs.set(id, bytes);
     writes.push({ id, expirationTtl: opts.expirationTtl });
   },
@@ -171,6 +172,69 @@ try {
     await worker.fetch(req(`/store?key=${key}&ttl=5`, { method: "POST", body: "small" }), env);
     await worker.fetch(req(`/store?key=${key}&ttl=999999999`, { method: "POST", body: "large" }), env);
     assert.deepEqual(writes.slice(-2).map((entry) => entry.expirationTtl), [60, 604800]);
+  });
+
+  await test("deletion links: key required, GET confirms, POST deletes once (gofile)", async () => {
+    const body = JSON.stringify({ service: "gofile", name: "report.pdf", url: "https://gofile.io/d/abc", id: "content-1", token: "guest-token" });
+    const denied = await worker.fetch(req("/links", { method: "POST", body }), env);
+    assert.equal(denied.status, 401);
+    const made = await worker.fetch(req(`/links?key=${key}`, { method: "POST", body }), env);
+    assert.equal(made.status, 201);
+    const link = (await made.text()).trim();
+    assert.match(link, /^https:\/\/worker\.test\/unshare\/[A-Za-z0-9_-]{24,}$/);
+    const path = new URL(link).pathname;
+    const page = await worker.fetch(req(path), env);
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    assert.match(html, /Delete shared file/);
+    assert.match(html, /report\.pdf/);
+    assert.ok(!/guest-token/.test(html), "the page must not reveal the token");
+    let deleted = null;
+    const saved = globalThis.fetch;
+    globalThis.fetch = async (input, init) => { deleted = { url: String(input), init }; return new Response(JSON.stringify({ status: "ok" }), { headers: { "Content-Type": "application/json" } }); };
+    try {
+      const done = await worker.fetch(req(path, { method: "POST" }), env);
+      assert.equal(done.status, 200);
+      assert.match(await done.text(), /Deleted/);
+    } finally { globalThis.fetch = saved; }
+    assert.equal(deleted.url, "https://api.gofile.io/contents");
+    assert.equal(deleted.init.method, "DELETE");
+    assert.equal(deleted.init.headers.Authorization, "Bearer guest-token");
+    const again = await worker.fetch(req(path), env);
+    assert.equal(again.status, 404);
+  });
+
+  await test("deletion links for catbox call deletefiles with the userhash", async () => {
+    const made = await worker.fetch(req(`/links?key=${key}`, { method: "POST", body: JSON.stringify({ service: "catbox", name: "a.png", url: "https://files.catbox.moe/x1.png", file: "x1.png", userhash: "uh" }) }), env);
+    const path = new URL((await made.text()).trim()).pathname;
+    let form = null;
+    const saved = globalThis.fetch;
+    globalThis.fetch = async (input, init) => { form = init.body; return new Response("Files successfully deleted."); };
+    try { assert.equal((await worker.fetch(req(path, { method: "POST" }), env)).status, 200); } finally { globalThis.fetch = saved; }
+    assert.equal(form.get("reqtype"), "deletefiles");
+    assert.equal(form.get("userhash"), "uh");
+    assert.equal(form.get("files"), "x1.png");
+  });
+
+  await test("a failed deletion keeps the link", async () => {
+    const made = await worker.fetch(req(`/links?key=${key}`, { method: "POST", body: JSON.stringify({ service: "gofile", name: "b", url: "https://gofile.io/d/b", id: "i", token: "t" }) }), env);
+    const path = new URL((await made.text()).trim()).pathname;
+    const saved = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ status: "error-notFound" }));
+    try { assert.equal((await worker.fetch(req(path, { method: "POST" }), env)).status, 502); } finally { globalThis.fetch = saved; }
+    assert.equal((await worker.fetch(req(path), env)).status, 200);
+  });
+
+  await test("links: javascript: or foreign URLs and non-object bodies are refused", async () => {
+    for (const body of [
+      JSON.stringify({ service: "gofile", name: "x", url: "javascript:alert(1)", id: "i", token: "t" }),
+      JSON.stringify({ service: "gofile", name: "x", url: "https://evil.example/d/x", id: "i", token: "t" }),
+      JSON.stringify({ service: "catbox", name: "x", url: "https://files.catbox.moe.evil.example/x", file: "x", userhash: "u" }),
+      "null", "[]"
+    ]) {
+      const r = await worker.fetch(req(`/links?key=${key}`, { method: "POST", body }), env);
+      assert.equal(r.status, 400, body);
+    }
   });
 
   await test("missing STORE binding returns 503", async () => {

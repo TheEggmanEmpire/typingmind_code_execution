@@ -89,14 +89,16 @@ const serveFileSpec = {
   description:
     "Show a file from /workspace to the user directly in the chat, without its contents passing through your context: " +
     "images appear inline, small text/code/CSV/JSON files as a code block, anything else (PDF, XLSX, DOCX, ZIP, audio...) as a download link. " +
-    "Create the file with run_code first, then call serve_file with its path. Use it instead of pasting file contents into your answer, and whenever the user wants to download a file. Files up to 20 MB.",
+    "Create the file with run_code first, then call serve_file with its path. Use it instead of pasting file contents into your answer, and whenever the user wants to download a file (up to 20 MB inline). " +
+    "With share it uploads the file to catbox.moe / gofile.io / litterbox and returns a public link with a deletion link: use that whenever the user wants to share a file or get a link.",
   parameters: {
     type: "object",
     properties: {
       path: { type: "string", description: "Path of the file in /workspace, e.g. 'chart.png', 'out/report.csv' or '/workspace/data.xlsx'." },
       filename: { type: "string", description: "Optional download name shown to the user. Defaults to the file's own name." },
       mime: { type: "string", description: "Optional MIME type, e.g. text/csv. Guessed from the extension when omitted." },
-      as: { type: "string", enum: ["auto", "image", "link", "text"], description: "How to present it. auto (default): image inline, small text files as a code block, otherwise a download link." }
+      as: { type: "string", enum: ["auto", "image", "link", "text"], description: "How to present it. auto (default): image inline, small text files as a code block, otherwise a download link." },
+      share: { type: "string", enum: ["auto", "catbox", "gofile", "litterbox"], description: "Upload the file to a public file host and give the user a share link plus a deletion link (or a way to delete it). Use when the user wants a link to share, or the file is too big to embed. auto tries catbox.moe (when configured), gofile.io, then litterbox (expires). Do not use other tools to upload files." }
     },
     required: ["path"]
   }
@@ -164,11 +166,12 @@ const manageFilesSpec = {
     "List, delete, rename or clear the files in /workspace without running code. " +
     "list shows every file with its size (including the user's attachments in uploads/) and what state is saved between calls. " +
     "delete takes paths or globs (\"tmp/*\", \"out/\"); rename moves a file or folder; clear empties the workspace; reset_variables forgets saved Python/R variables and DuckDB tables but keeps the files; " +
-    "export_notebook writes the session's runs (code and output) as notebook.ipynb or Markdown, for serve_file.",
+    "export_notebook writes the session's runs (code and output) as notebook.ipynb or Markdown, for serve_file; shares lists files shared with serve_file share, unshare deletes one from its host.",
   parameters: {
     type: "object",
     properties: {
-      action: { type: "string", enum: ["list", "delete", "rename", "clear", "reset_variables", "export_notebook"], description: "Default list." },
+      action: { type: "string", enum: ["list", "delete", "rename", "clear", "reset_variables", "export_notebook", "shares", "unshare"], description: "Default list." },
+      url: { type: "string", description: "unshare: the share link (or file name) to delete; see action shares." },
       paths: { type: "array", items: { type: "string" }, description: "delete: files, folders (ending in /) or globs (* and **)." },
       from: { type: "string", description: "rename: current path." },
       to: { type: "string", description: "rename: new path." },
@@ -191,6 +194,7 @@ const USAGE_GUIDE = [
   "- Across languages: share_table('sales', df) in python or r, then SELECT ... FROM sales in duckdb, get_table('sales') in r/python, tables.get('sales') in javascript. read_text('uploads/report.pdf') (python) extracts document text.",
   "- API keys the user configured are environment variables (list them with os.environ keys); use them in requests, never print them.",
   "- manage_files export_notebook turns the session's runs into notebook.ipynb for the user (then serve_file).",
+  "- To give the user a shareable link to a file, call serve_file with share (it returns the link and a deletion link); never use other upload tools for /workspace files. manage_files shares lists them and unshare deletes one.",
   "- Output is capped at 40,000 characters: print summaries (df.head(), describe(), counts), not whole datasets.",
   "- Internet works over HTTP from the browser. Blocked sites are retried through proxies; for a web page's readable text fetch https://r.jina.ai/<url>. Requests with API keys never go through public proxies.",
   "- Each run has a time limit (default 120 s, `timeout` up to 900). A stopped run keeps /workspace as it was before the call.",
@@ -215,7 +219,7 @@ const browserStateSpec = {
       selector: { type: "string", description: "text: CSS selector of the part to read, e.g. 'article' or '#results'." },
       max_chars: { type: "number", description: "Size cap of the returned text (elements default 14000, text default 20000)." },
       full_page: { type: "boolean", description: "screenshot: the whole page (JPEG) instead of the visible part." },
-      highlight: { type: "boolean", description: "screenshot: draw the element numbers (default true)." },
+      highlight: { type: "boolean", description: "Draw the numbered element boxes on the page (and on a screenshot). Default: the plugin setting (on)." },
       path: { type: "string", description: "screenshot: file name in /workspace (default screenshot_<time>.png)." },
       save_to: { type: "string", description: "Append the elements or text to this /workspace file (.md, .jsonl, .json)." }
     }
@@ -275,10 +279,12 @@ const userSettings = [
   { name: "publicProxies", label: "Allow public CORS proxies", description: "Default on. Requests to sites that block browsers are retried through public CORS proxies (never requests carrying keys, tokens or passwords). Set \"off\" for a private-only setup: only your personal proxy is used.", placeholder: "on", required: false },
   { name: "keepVariables", label: "Keep variables between calls", description: "Default on. Python and R variables, functions and imports, and DuckDB tables are saved with the workspace and restored in the next call. Set \"off\" to start every call with a clean interpreter (files still persist).", placeholder: "on", required: false },
   { name: "secrets", label: "Secrets (API keys for code)", type: "password", description: "Optional. API keys the code may use, as NAME=value pairs separated by semicolons (or a JSON object). They become environment variables (os.environ in Python, Sys.getenv in R, ENV in Ruby, `env` in JavaScript), are replaced by [secret NAME] in anything the AI reads, are never saved with the workspace, and requests carrying them never go through public proxies.", placeholder: "OPENAI_API_KEY=sk-...; GITHUB_TOKEN=ghp_...", required: false },
-  { name: "browserKey", label: "Browser pairing key", type: "password", description: "Needed for the browser tools (browser_run, browser_tabs, browser_state, browser_act). Copy it from the companion extension's options page (chrome://extensions -> Code Runner Browser Bridge -> Details -> Extension options). The extension refuses requests without it, so other websites cannot drive your tabs.", required: false },
   { name: "browserAllowSites", label: "Browser: allowed sites", description: "Optional. If set, the browser tools may only read or operate tabs on these sites (comma-separated, subdomains included, e.g. github.com, *.wikipedia.org).", required: false },
   { name: "browserBlockSites", label: "Browser: blocked sites", description: "Optional. The browser tools never read or operate tabs on these sites (comma-separated, e.g. mybank.com, mail.google.com).", required: false },
+  { name: "browserHighlight", label: "Browser: show element numbers", description: "Default on. Like nanobrowser, the numbered boxes the AI works with are drawn on the page itself after each look (browser_state, browser_act), and on screenshots. Set \"off\" to hide them.", placeholder: "on", required: false },
   { name: "browserConfirm", label: "Browser: confirm risky actions", description: "Default on. Clicks and Enter presses that look like buying, paying, deleting, sending or submitting password/payment forms are held until the user confirms. Set \"off\" to disable (not recommended).", placeholder: "on", required: false },
+  { name: "catboxUserhash", label: "Catbox userhash (sharing)", type: "password", description: "Optional. Your catbox.moe account userhash (catbox.moe -> Manage account). With it (and the personal CORS proxy) shared files go to catbox.moe permanently and can be deleted; without it sharing uses gofile.io, then litterbox.", required: false },
+  { name: "shareExpiry", label: "Litterbox expiry (sharing)", description: "1h, 12h, 24h or 72h (default 72h): how long files shared through litterbox stay online.", placeholder: "72h", required: false },
   { name: "importAttachments", label: "Import attached files", description: "Default on. Files the user attaches to a message are saved to /workspace/uploads so code can read them. Set \"off\" to disable.", placeholder: "on", required: false },
   { name: "workspaceTtlMin", label: "Offloaded workspace lifetime (minutes)", description: "Default 1440 (24 hours). An offloaded workspace older than this is not restored.", type: "number", required: false },
   { name: "fetchTimeoutMs", label: "HTTP request timeout (ms)", description: "Default 30000. Per-request timeout for fetch / requests from Python and JavaScript before fallbacks are tried.", type: "number", required: false },

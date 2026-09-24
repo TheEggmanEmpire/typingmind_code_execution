@@ -30,11 +30,11 @@ function findChrome() {
   throw new Error("Chrome/Chromium not found; set CHROME=/path/to/chrome");
 }
 
-// A copy of the extension with a test pairing key and 127.0.0.1 as trusted host
-// (localhost stays untrusted, for the refusal test).
+// A copy of the extension with 127.0.0.1 as trusted host (localhost stays
+// untrusted, for the refusal test).
 const EXT_COPY = fs.mkdtempSync(path.join(os.tmpdir(), "cr-ext-"));
 for (const f of fs.readdirSync(EXT)) fs.copyFileSync(path.join(EXT, f), path.join(EXT_COPY, f));
-fs.writeFileSync(path.join(EXT_COPY, "config.json"), JSON.stringify({ pairingKey: "test-key", trustedHosts: ["127.0.0.1"] }));
+fs.writeFileSync(path.join(EXT_COPY, "config.json"), JSON.stringify({ trustedHosts: ["127.0.0.1"] }));
 
 const results = [];
 let untrusted = null;

@@ -19,10 +19,9 @@ this extension provides the eyes and hands. `page-agent.js` is an independent, c
 1. Open `chrome://extensions` in Chrome or Chromium desktop (**130 or newer**: the bridge relies on
    `match_origin_as_fallback` reaching sandboxed frames).
 2. Turn on **Developer mode**, click **Load unpacked** and pick this `extension/` folder.
-3. Click **Details -> Extension options**. Copy the **pairing key** into the Code Runner plugin setting
-   **Browser pairing key**. If you use TypingMind on another domain (self-hosted, custom domain), add that host under
-   **Trusted hosts** and save.
-4. Reload your TypingMind tab.
+3. Reload your TypingMind tab. No key or sign-in: the extension answers typingmind.com pages. If you use TypingMind
+   on another domain (self-hosted, custom domain), add that host under **Trusted hosts** on the options page
+   (**Details -> Extension options**).
 
 After editing the extension, press its reload icon in `chrome://extensions`, then reload the TypingMind tab.
 
@@ -45,8 +44,10 @@ plugin (sandboxed iframe) --window.postMessage--> content.js (same frame) --chro
 
 - `content.js` is injected into every frame (`all_frames` + `match_origin_as_fallback`) so it reaches the plugin's
   opaque-origin iframe. It only relays messages a frame posts to itself.
-- `background.js` checks every request: the requesting tab must be on a trusted host and the request must carry the
-  pairing key; the plugin's site policy is checked before any tab is read or touched, and again for navigation targets.
+- `background.js` checks every request: the requesting tab must be on a trusted host; the plugin's site policy is
+  checked before any tab is read or touched, and again for navigation targets, redirects and history.
+- After each snapshot the numbered boxes are drawn on the page itself (nanobrowser style) until the next snapshot;
+  they are ignored by the snapshot and by reading, and never catch clicks.
 - `page-agent.js` runs in the extension's isolated world: page scripts cannot see or alter it, and the page's CSP
   does not apply. The element map lives there until the next snapshot or navigation.
 - Clicks and typing use the DevTools protocol (`chrome.debugger`), so they are real input events; Chrome shows a
@@ -55,9 +56,10 @@ plugin (sandboxed iframe) --window.postMessage--> content.js (same frame) --chro
 
 ## Safety
 
-- **Pairing key + trusted hosts:** without both, the extension refuses every request except a status ping. A
-  random website (or a page being automated) cannot drive your tabs. Rotate the key with **New key** on the options
-  page.
+- **Trusted hosts and frame level:** only a frame placed directly in a trusted page (where TypingMind runs its
+  plugins) is answered. Other websites, pages being automated, the TypingMind page itself and anything nested
+  deeper (the plugin's rendered previews and charts) are refused. Other plugins' HTML outputs sit at the plugin
+  level and could use the bridge; install only plugins you trust.
 - **Site policy:** the plugin settings **Browser: allowed sites** / **blocked sites** are sent with each request and
   enforced here, including `goto`, `open_tab`, `switch_tab` and pages reached by clicks.
 - **Confirmation:** clicks and Enter presses whose element, form or text suggests buying, paying, deleting,
@@ -75,11 +77,11 @@ plugin (sandboxed iframe) --window.postMessage--> content.js (same frame) --chro
 | `content.js` | postMessage <-> chrome.runtime relay, injected into every frame |
 | `background.js` | service worker: authorization, site policy, tabs, actions, screenshots, `browser_run` |
 | `page-agent.js` | isolated-world agent: numbered snapshot, element geometry, dropdowns, scrolling, Markdown, risk checks |
-| `options.html` / `options.js` | pairing key and trusted hosts |
-| `config.json` (optional) | `{ "pairingKey": "...", "trustedHosts": [...] }` defaults, used by the tests |
+| `options.html` / `options.js` | trusted hosts |
+| `config.json` (optional) | `{ "trustedHosts": [...] }` default, used by the tests |
 
 ## Test
 
-`node test/run-browser-e2e.js` loads a copy of this folder (with a test key) into Chrome for Testing / Chromium and
+`node test/run-browser-e2e.js` loads a copy of this folder (trusting 127.0.0.1) into Chrome for Testing / Chromium and
 runs the tools against `test/fixture.html` (branded Chrome ignores `--load-extension`; the runner finds Playwright's
 Chromium automatically, or set `CHROME=`).

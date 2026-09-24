@@ -1,12 +1,12 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>CR-BRIDGE-TEST-TITLE</title>
-<!-- Loads the unpacked extension/ (a copy with a test pairing key) and drives the
+<!-- Loads the unpacked extension/ (a copy trusting 127.0.0.1) and drives the
      browser tools from a sandboxed iframe, exactly like TypingMind. Driven by
      run-browser-e2e.js. -->
 <script>
 const report = (o) => fetch("/report", { method: "POST", body: JSON.stringify(o) });
-const KEY = { browserKey: "test-key" };
+const KEY = {};
 
 (async () => {
   const impl = await (await fetch("/implementation.js")).text();
@@ -50,10 +50,6 @@ const KEY = { browserKey: "test-key" };
   // Give the freshly loaded extension/service worker time to come up.
   for (let i = 0; i < 30; i++) { if (!/not responding/.test(String(await call("warmup", "browser_tabs", { action: "list" })))) break; await new Promise((r) => setTimeout(r, 400)); }
 
-  // --- pairing and trust ---
-  await step("no pairing key: explained, nothing done", "browser_tabs", { action: "list" }, (s) => /Browser pairing key/.test(s) && !/Open tabs/.test(s), {});
-  await step("wrong pairing key: refused", "browser_tabs", { action: "list" }, (s) => /does not match/.test(s), { browserKey: "nope" });
-
   // --- the existing tools still work ---
   await step("bridge reachable (tabs.list)", "browser_tabs", { action: "list" }, (s) => /Open tabs/.test(s) && /CR-BRIDGE-TEST-TITLE/.test(s) && /\(this chat\)/.test(s));
   await step("run returns the page title", "browser_run", { code: "return document.title" }, (s) => /result: CR-BRIDGE-TEST-TITLE/.test(s));
@@ -65,8 +61,21 @@ const KEY = { browserKey: "test-key" };
   const untrustedTab = Number((/tab #(\d+)/.exec(opened) || [])[1]);
   await new Promise((r) => setTimeout(r, 3000));
   const u = await (await fetch("/untrusted-result")).json().catch(() => null);
-  await check("an untrusted page is refused even with the key", JSON.stringify(u), (s) => /"code":"untrusted"/.test(s) && !/"tabs"/.test(s));
+  await check("an untrusted page is refused", JSON.stringify(u), (s) => /"code":"untrusted"/.test(s) && !/"tabs"/.test(s));
   await call("close the untrusted page", "browser_tabs", { action: "close", tabId: untrustedTab });
+
+  // --- a frame nested inside the plugin frame (e.g. a rendered preview) cannot use the bridge ---
+  const nested = await new Promise((resolve) => {
+    const f = document.createElement("iframe");
+    f.setAttribute("sandbox", "allow-scripts");
+    const inner2 = "<script>const id='n'+Math.random();addEventListener('message',(e)=>{if(e.data&&e.data.__crbRes&&e.data.id===id)parent.parent.postMessage({nestedResult:e.data.response},'*')});setTimeout(()=>postMessage({__crbReq:true,id,request:{op:'tabs.list'}},'*'),800)<\/script>";
+    f.srcdoc = "<iframe sandbox='allow-scripts' srcdoc=\"" + inner2.replace(/"/g, "&quot;") + "\"></iframe>";
+    const on = (e) => { if (e.data && e.data.nestedResult) { removeEventListener("message", on); f.remove(); resolve(e.data.nestedResult); } };
+    addEventListener("message", on);
+    setTimeout(() => { removeEventListener("message", on); f.remove(); resolve({ timeout: true }); }, 8000);
+    document.body.appendChild(f);
+  });
+  await check("a frame nested inside the plugin frame is refused", JSON.stringify(nested), (s) => /"code":"untrusted"/.test(s) && /nested/.test(s) && !/"tabs"/.test(s));
 
   // --- snapshot, typing, clicking, dropdowns, keys ---
   const o = await call("open the fixture", "browser_tabs", { action: "open", url: location.origin + "/test/fixture.html", active: true });
@@ -74,6 +83,13 @@ const KEY = { browserKey: "test-key" };
   await check("fixture opened", o, (s) => tab > 0 && /Fixture page/.test(s));
   const snap = await call("snapshot", "browser_state", { tabId: tab });
   await check("snapshot numbers the interactive elements", snap, (s) => /URL: http/.test(s) && /\[\d+\]<input type="text" name="name" placeholder="Your name"/.test(s) && /\[\d+\]<button>Delete account<\/button>/.test(s) && /Intro paragraph/.test(s) && /px below/.test(s));
+  await step("the numbers are drawn on the live page", "browser_run", { tabId: tab, code: "const h = document.querySelector('[data-crb-hl]'); return h ? h.querySelectorAll('span').length : 0" }, (s) => /result: ([5-9]|\d\d)/.test(s));
+  await step("reading the page ignores the drawn numbers", "browser_state", { tabId: tab, mode: "text", selector: "h1" }, (s) => /# Fixture/.test(s) && !/^\d+$/m.test(s.split("URL:")[1]));
+  await step("the setting \"Browser: show element numbers\" off draws nothing", "browser_state", { tabId: tab }, (s) => /\[\d+\]<input/.test(s), { browserHighlight: "off" });
+  await step("nothing drawn with the setting off", "browser_run", { tabId: tab, code: "return !!document.querySelector('[data-crb-hl]')" }, (s) => /result: false/.test(s));
+  await call("draw them again", "browser_state", { tabId: tab });
+  await step("highlight: false removes them", "browser_state", { tabId: tab, highlight: false }, (s) => /\[\d+\]<input/.test(s));
+  await step("gone from the page", "browser_run", { tabId: tab, code: "return !!document.querySelector('[data-crb-hl]')" }, (s) => /result: false/.test(s));
   const iName = indexOf(snap, /<input type="text" name="name"/), iColor = indexOf(snap, /<select name="color"/), iGo = indexOf(snap, /<button>Go</),
     iDel = indexOf(snap, /<button>Delete account/), iQ = indexOf(snap, /<input type="text" name="q"/);
   await step("options lists a dropdown", "browser_act", { tabId: tab, actions: [{ action: "options", index: iColor }], state: "none" }, (s) => /\*Red \(r\) \| Green \(g\) \| Blue \(b\)/.test(s));

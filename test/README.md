@@ -66,8 +66,8 @@ Needs a Chrome/Chromium that supports unpacked extensions in `--headless=new` (C
 node test/run-browser-e2e.js        # needs Chrome for Testing / Chromium (Playwright's is found automatically)
 ```
 
-Loads a copy of `extension/` with a test pairing key and drives `browser_tabs`, `browser_run`, `browser_state` and
-`browser_act` from a sandboxed iframe against `test/fixture.html`: pairing (missing and wrong key, an untrusted host
-refused even with the key), the numbered snapshot, typing, dropdowns, clicks, key combos, the risky-action guard,
+Loads a copy of `extension/` (trusting 127.0.0.1) and drives `browser_tabs`, `browser_run`, `browser_state` and
+`browser_act` from a sandboxed iframe against `test/fixture.html`: an untrusted host refused, the numbered boxes
+drawn on the live page, the numbered snapshot, typing, dropdowns, clicks, key combos, the risky-action guard,
 scrolling, Markdown reading, navigation, screenshots and `save_to` into `/workspace`, and the site allow/block lists.
 

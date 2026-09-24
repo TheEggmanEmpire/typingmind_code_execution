@@ -15,7 +15,8 @@ Eight functions:
   Parquet and SQLite as sortable, filterable tables; HTML pages and charts rendered live; Markdown, Word, PowerPoint
   and Jupyter notebooks rendered; audio and video with players; images and PDFs.
 - **serve_file** shows a file in the chat: images inline, small text as a code block, anything else
-  (PDF, XLSX, ZIP, ...) as a download link.
+  (PDF, XLSX, ZIP, ...) as a download link. With `share` it uploads the file and returns a public link plus a
+  deletion link (see Sharing files).
 - **manage_files** lists, deletes, renames or clears the files in `/workspace` without running code, and exports
   the session as a Jupyter notebook (`export_notebook`).
 - **browser_state** looks at one of *your own open tabs*: every visible button, link and field numbered
@@ -49,21 +50,23 @@ file (the `files` parameter) instead of copying it into the code.
 actually have open, load the companion extension in the [`extension/`](extension/) folder:
 
 1. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, pick the `extension/` folder.
-2. Open the extension's options page (**Details -> Extension options**) and copy the **pairing key** into the plugin
-   setting **Browser pairing key**. On a self-hosted or custom TypingMind domain, add it under **Trusted hosts** there.
-3. Reload your TypingMind tab.
+2. Reload your TypingMind tab. On a self-hosted or custom TypingMind domain, first add that host under
+   **Trusted hosts** on the extension's options page (**Details -> Extension options**).
 
 How the AI uses it (the same loop as [nanobrowser](https://github.com/nanobrowser/nanobrowser), with TypingMind's
 model as the agent): `browser_state` shows the page with numbered elements, `browser_act` clicks, types, presses keys,
 selects options, scrolls or navigates by number and returns a fresh snapshot, and so on until the task is done.
-`browser_state` can also return the page as Markdown or save a screenshot (with the element numbers drawn on it)
-into `/workspace`. `save_to` collects what was read, or rows returned by `browser_run`, into a `/workspace` file
+Like nanobrowser, the numbered boxes are drawn on the page itself after each look, so you see exactly what the AI
+works with (**Browser: show element numbers**). `browser_state` can also return the page as Markdown or save a
+screenshot (with the numbers drawn on it) into `/workspace`. `save_to` collects what was read, or rows returned by `browser_run`, into a `/workspace` file
 (`.csv`, `.jsonl`, `.json`, `.md`) for analysis with `run_code`.
 
 Safety:
 
-- **Pairing:** the extension only answers pages on its trusted hosts (TypingMind by default) that also send the
-  pairing key, so other websites cannot drive your tabs.
+- **Trusted hosts:** the extension only answers the plugin frame of pages on its trusted hosts (TypingMind by
+  default), so other websites cannot drive your tabs, and neither can content nested inside the plugin (rendered
+  previews, charts). No setup is needed on typingmind.com. Other plugins' HTML output on TypingMind sits at the
+  same level as this plugin and could use the bridge too; install only plugins you trust.
 - **Sites:** **Browser: allowed sites** / **Browser: blocked sites** limit which sites the tools may read or operate,
   including navigation targets.
 - **Confirmation:** clicks and Enter presses that look like buying, paying, deleting, sending or submitting a
@@ -71,6 +74,21 @@ Safety:
 - **Untrusted content:** the AI is told to treat page text as data and never follow instructions found in pages.
 - Chrome shows a "started debugging" banner while a click, keystroke or screenshot is sent. Chrome/Chromium desktop
   only (Chrome 130 or newer). Details in [`extension/README.md`](extension/README.md).
+
+### Sharing files
+
+`serve_file` with `share` uploads a `/workspace` file to a public file host and returns the link, plus a deletion
+link where the host allows deleting:
+
+| Host | Used when | Deleting |
+|---|---|---|
+| catbox.moe | a **Catbox userhash** and the personal CORS proxy are set (catbox sends no CORS headers) | permanent until deleted |
+| gofile.io | otherwise first | deletable; gofile removes files that are not downloaded for a while |
+| litterbox.catbox.moe | when the others fail | deletes itself after 1-72 h (**Litterbox expiry**, default 72 h) |
+
+With the companion Worker (personal CORS proxy set to it), every deletable upload gets a real **deletion link**: a
+page on your Worker with a Delete button (a link preview cannot delete anything). Without it, ask the AI to remove the
+shared file (`manage_files` with `unshare`); `manage_files` with `shares` lists what was shared from the chat.
 
 ### Secrets
 
@@ -170,7 +188,8 @@ Single-file programs with a normal `main`, input via `stdin`, a run-time limit o
 - Python: `requests`, `urllib.request`, `pyodide.http.pyfetch`. JavaScript: `fetch`, `fs.download`. R: `download.file`
   and `url()` work for sites that allow browser access.
 - Requests go straight from the browser first. If the browser blocks one, it is retried through GitHub's raw file
-  mirror (for github.com links), your personal proxy, then public proxies. A host that fails every route is
+  mirror (for github.com links), your personal proxy, then public proxies (corsmirror.com and cors.eu.org answered
+  at the last check, cors.lol, allorigins and codetabs are kept as later tries; none of them relays file uploads). A host that fails every route is
   remembered for 3 minutes so later requests fail fast, and the output names each unreachable host.
 - Requests carrying credentials are only ever sent through your own proxy: Authorization, cookie and API-key/token
   headers, and URLs or form/JSON bodies with fields such as `key`, `api_key`, `token`, `password` or `secret`.
@@ -235,9 +254,11 @@ are out of reach. Lua and PHP stay remote: the in-browser Lua has no file access
 | Keep variables between calls | on | Save Python/R variables and DuckDB tables |
 | Import attached files | on | Save the user's attachments to `/workspace/uploads` |
 | Secrets | - | API keys for code, as environment variables (redacted, never saved) |
-| Browser pairing key | - | The key from the extension's options page; needed for the browser tools |
 | Browser: allowed sites / blocked sites | - | Limit the sites the browser tools may touch |
+| Browser: show element numbers | on | Draw the numbered element boxes on the page (nanobrowser style) |
 | Browser: confirm risky actions | on | Hold buy/pay/delete/send clicks for the user's approval |
+| Catbox userhash (sharing) | - | Share to catbox.moe, deletable (needs the personal CORS proxy) |
+| Litterbox expiry (sharing) | 72h | How long litterbox shares stay online |
 | Offloaded workspace lifetime (minutes) | 1440 | Older offloaded workspaces are not restored |
 | HTTP request timeout (ms) | 30000 | Per request, before fallbacks |
 | Pyodide CDN / sql.js CDN | - | Put a mirror in front of the built-in CDN lists |

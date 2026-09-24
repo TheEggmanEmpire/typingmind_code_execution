@@ -57,6 +57,18 @@ are rejected with `413`; a declared oversized `Content-Length` is rejected befor
 Rotate the key with
 `npx wrangler secret put PROXY_KEY` and update both plugin settings.
 
+### Deletion links for shared files
+
+`serve_file` with `share` registers each deletable upload (gofile.io, or catbox.moe with a userhash) here:
+
+| Request | Effect |
+|---|---|
+| `POST /links?key=KEY` (JSON `{service, name, url, id+token \| file+userhash}`) | Stores what is needed to delete it (90 days) and returns `https://<worker>/unshare/<id>`. |
+| `GET /unshare/<id>` | A page naming the file with a **Delete it** button (no key: the link is the permission). |
+| `POST /unshare/<id>` | Deletes the file at the host, then forgets the link. |
+
+A GET never deletes, so chat link previews and scanners cannot remove files.
+
 ### Sites that refuse Cloudflare
 
 Some sites (for example python.org and w3.org) answer requests coming from Cloudflare Workers with `403`.

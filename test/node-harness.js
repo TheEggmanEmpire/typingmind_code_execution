@@ -72,6 +72,29 @@ routes.push(async (url, init) => {
   if (url === "https://dpaste.com/api/v2/") return text("blocked", 400);
 });
 
+// File hosts for serve_file share.
+const shareLog = [];
+routes.push(async (url, init) => {
+  const method = (init.method || "GET").toUpperCase();
+  if (url === "https://upload.gofile.io/uploadfile") {
+    if (globalThis.__gofileDown) return text("down", 503);
+    const f = init.body.get("file"); shareLog.push({ host: "gofile", name: f.name, size: f.size });
+    return text(JSON.stringify({ status: "ok", data: { downloadPage: "https://gofile.io/d/G" + shareLog.length, id: "id-" + shareLog.length, guestToken: "tok-" + shareLog.length } }));
+  }
+  if (url === "https://api.gofile.io/contents" && method === "DELETE") {
+    shareLog.push({ host: "gofile-delete", auth: init.headers.Authorization, body: init.body });
+    return text(JSON.stringify({ status: "ok" }));
+  }
+  if (url.startsWith("https://proxy.test/links?key=k")) {
+    shareLog.push({ host: "worker-link", body: JSON.parse(init.body) });
+    return text("https://proxy.test/unshare/L" + shareLog.length + "abcdefghijklmnopqrstuvwxyz", 201);
+  }
+  if (url === "https://proxy.test/?key=k&url=" + encodeURIComponent("https://catbox.moe/user/api.php")) {
+    const b = init.body; shareLog.push({ host: "catbox", reqtype: b.get("reqtype"), userhash: b.get("userhash"), files: b.get("files") });
+    return b.get("reqtype") === "deletefiles" ? text("Files successfully deleted.", 200, { "x-cr-proxy": "1" }) : text("https://files.catbox.moe/c" + shareLog.length + ".csv", 200, { "x-cr-proxy": "1" });
+  }
+});
+
 // TypeScript standard library files (typecheck), from the installed package.
 const tsLib = path.dirname(require.resolve("typescript"));
 routes.push(async (url) => {
@@ -456,7 +479,28 @@ const big = { stateLimitKB: "500" };   // keep test workspaces inline unless a t
   check("and restored from the parts", await run("python", "import os; print(os.path.getsize('big.bin'))", {}, chunky), "2600000");
   globalThis.__litterOnlyDown = false;
 
-  // 13. Never throws, always explains --------------------------------------------------------------
+  // 13. Sharing, Excel --------------------------------------------------------------------------------
+  prev = undefined;
+  await run("python", "open('share.csv','w').write('a,b\\n1,2\\n'); print('w')", {}, big);
+  check("share without a Worker: gofile, delete on request", await serve({ path: "share.csv", share: "auto" }, big),
+    (s) => /\*\*Shared:\*\* \[share\.csv \(1 KB\)\]\(https:\/\/gofile\.io\/d\/G1\)/.test(s) && /ask me to remove the shared file/.test(s));
+  check("manage_files shares lists it", await tool(manage_files, { action: "shares" }, big), (s) => /share\.csv  https:\/\/gofile\.io\/d\/G1  \(gofile/.test(s) && /deletable with unshare/.test(s));
+  check("unshare deletes it from gofile", await tool(manage_files, { action: "unshare", url: "https://gofile.io/d/G1" }, big),
+    (s) => /Deleted from the file host: share\.csv/.test(s) && shareLog.some((x) => x.host === "gofile-delete" && x.auth === "Bearer tok-1"));
+  check("and it is no longer listed", await tool(manage_files, { action: "shares" }, big), (s) => /No files have been shared/.test(s));
+  const wk = { ...big, corsProxy: "https://proxy.test/?key=k&url=" };
+  check("with the Worker: a real deletion link", await serve({ path: "share.csv", share: true }, wk),
+    (s) => /\[Delete this upload\]\(https:\/\/proxy\.test\/unshare\/L/.test(s) && shareLog.some((x) => x.host === "worker-link" && x.body.token));
+  check("with a catbox userhash: catbox first, deletable", await serve({ path: "share.csv", share: "auto" }, { ...wk, catboxUserhash: "uh1" }),
+    (s) => /files\.catbox\.moe/.test(s) && /catbox \(permanent until deleted\)/.test(s) && /Delete this upload/.test(s) && shareLog.some((x) => x.host === "catbox" && x.userhash === "uh1"));
+  check("unshare on catbox uses deletefiles", await tool(manage_files, { action: "unshare", url: shareLog.filter((x) => x.host === "catbox").length ? "https://files.catbox.moe/c" + (shareLog.findIndex((x) => x.host === "catbox" && x.reqtype === "fileupload") + 1) + ".csv" : "" }, { ...wk, catboxUserhash: "uh1" }),
+    (s) => /Deleted from the file host/.test(s) && shareLog.some((x) => x.host === "catbox" && x.reqtype === "deletefiles"));
+  globalThis.__gofileDown = true;
+  check("gofile down: litterbox, which expires", await serve({ path: "share.csv", share: "auto" }, { ...big, shareExpiry: "24h" }), (s) => /litter\.catbox\.moe/.test(s) && /deletes itself after 24h/.test(s) && /cannot be deleted by hand/.test(s));
+  globalThis.__gofileDown = false;
+  check("pandas to_excel installs openpyxl", await run("python", "import pandas as pd\npd.DataFrame({'a': [1, 2]}).to_excel('t.xlsx', index=False)\nprint(pd.read_excel('t.xlsx')['a'].sum())", {}, big), (s) => /^3/.test(s));
+
+  // 14. Never throws, always explains --------------------------------------------------------------
   check("null params", await run_code(null, null, null), (s) => /No code was provided/.test(s));
   check("unsupported language", await run("brainfuck", "+", {}, big), (s) => /Unsupported language "brainfuck"/.test(s) && /python/.test(s));
   check("empty code", await run("python", "  ", {}, big), (s) => /No code was provided/.test(s));

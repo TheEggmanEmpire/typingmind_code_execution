@@ -4,12 +4,74 @@
 //   GET|POST|... /?key=KEY&url=<encoded target>   proxy any http(s) request
 //   POST /store?key=KEY[&ttl=seconds]              store the body, returns its URL
 //   GET|DELETE /store/<id>?key=KEY                 read / delete a stored blob
+//   POST /links?key=KEY                             register a shared file, returns its deletion link
+//   GET|POST /unshare/<id>                          deletion page (GET) / delete the shared file (POST)
 //
 // The proxy and all store operations require KEY (secret PROXY_KEY).
 
 const STRIP_REQUEST = /^(host|origin|referer|cookie|content-length|connection|accept-encoding|x-forwarded-.*|x-real-ip|cf-.*|sec-fetch-.*|x-cr-key)$/i;
 const STORE_ID = /^\/store\/([A-Za-z0-9_-]{24,80})$/;
 const MAX_STORE_BYTES = 24 * 1024 * 1024;   // KV values are capped at 25 MB
+const LINK_ID = /^\/unshare\/([A-Za-z0-9_-]{24,80})$/;
+const LINK_TTL = 90 * 86400;               // deletion links live 90 days
+
+function html(title, body, status = 200) {
+  const page = "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>" + title +
+    "</title><body style='font:15px/1.5 system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 16px'>" + body + "</body>";
+  return new Response(page, { status, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Robots-Tag": "noindex" } });
+}
+const esc = (s) => String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+// Stores what is needed to delete a shared file; the link itself is the permission.
+async function registerLink(request, url, env) {
+  if (!env.STORE) return text("links: KV binding STORE is not configured", 503);
+  let d;
+  try { d = await request.json(); } catch (e) { return text("links: send JSON", 400); }
+  if (!d || typeof d !== "object" || Array.isArray(d)) return text("links: send a JSON object", 400);
+  const rec = { service: String(d.service || ""), name: String(d.name || "file").slice(0, 200), url: String(d.url || "").slice(0, 500), time: Date.now() };
+  // The page links to the shared file: only https links on the service's own hosts.
+  const hosts = { gofile: /^(www\.)?gofile\.io$/, catbox: /^files\.catbox\.moe$/ }[rec.service];
+  let u = null;
+  try { u = new URL(rec.url); } catch (e) {}
+  if (!hosts || !u || u.protocol !== "https:" || !hosts.test(u.hostname)) return text("links: url must be an https link on " + (rec.service || "the service") + "'s host", 400);
+  if (rec.service === "gofile") { if (!d.id || !d.token) return text("links: gofile needs id and token", 400); rec.id = String(d.id); rec.token = String(d.token); }
+  else if (rec.service === "catbox") { if (!d.file || !d.userhash) return text("links: catbox needs file and userhash", 400); rec.file = String(d.file); rec.userhash = String(d.userhash); }
+  else return text("links: service must be gofile or catbox", 400);
+  const id = newId();
+  await env.STORE.put("link:" + id, JSON.stringify(rec), { expirationTtl: LINK_TTL });
+  return text(url.origin + "/unshare/" + id, 201);
+}
+
+async function deleteShared(rec) {
+  if (rec.service === "gofile") {
+    const r = await fetch("https://api.gofile.io/contents", { method: "DELETE", headers: { "Authorization": "Bearer " + rec.token, "Content-Type": "application/json" }, body: JSON.stringify({ contentsId: rec.id }) });
+    const d = await r.json().catch(() => null);
+    if (!d || d.status !== "ok") throw new Error("gofile.io refused (" + (d && d.status || "HTTP " + r.status) + ")");
+    return;
+  }
+  const form = new FormData();
+  form.append("reqtype", "deletefiles"); form.append("userhash", rec.userhash); form.append("files", rec.file);
+  const r = await fetch("https://catbox.moe/user/api.php", { method: "POST", body: form });
+  const t = (await r.text()).trim();
+  if (!r.ok || !/success/i.test(t)) throw new Error("catbox.moe refused (" + (t.slice(0, 100) || "HTTP " + r.status) + ")");
+}
+
+// GET shows a confirmation page (link previews must not delete anything); POST deletes.
+async function unshare(request, id, env) {
+  if (!env.STORE) return html("Not available", "<p>This deletion service is not configured.</p>", 503);
+  const raw = await env.STORE.get("link:" + id);
+  if (!raw) return html("Link expired", "<h2>Nothing to delete</h2><p>This file was already deleted, or the deletion link has expired.</p>", 404);
+  const rec = JSON.parse(raw);
+  if (request.method === "POST") {
+    try { await deleteShared(rec); }
+    catch (e) { return html("Not deleted", "<h2>Could not delete</h2><p>" + esc(e.message) + "</p><p>Try again later.</p>", 502); }
+    await env.STORE.delete("link:" + id);
+    return html("Deleted", "<h2>Deleted</h2><p><b>" + esc(rec.name) + "</b> was removed from " + esc(rec.service) + ".</p>");
+  }
+  return html("Delete shared file", "<h2>Delete shared file?</h2><p><b>" + esc(rec.name) + "</b><br><a href='" + esc(rec.url) + "'>" + esc(rec.url) + "</a><br>" +
+    "on " + esc(rec.service) + ", shared " + esc(new Date(rec.time).toISOString().slice(0, 16).replace("T", " ")) + " UTC</p>" +
+    "<form method=post><button style='font:inherit;padding:8px 16px;background:#cf222e;color:#fff;border:0;border-radius:6px;cursor:pointer'>Delete it</button></form>");
+}
 
 function cors(headers = new Headers()) {
   headers.set("Access-Control-Allow-Origin", "*");
@@ -86,6 +148,13 @@ export default {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors() });
     try {
+      const lm = url.pathname.match(LINK_ID);
+      if (lm) return await unshare(request, lm[1], env);
+      if (url.pathname === "/links") {
+        if (request.method !== "POST") return text("links: POST JSON to /links", 405);
+        if (!keyOk(request, url, env)) return authError("links: missing or wrong key");
+        return await registerLink(request, url, env);
+      }
       const m = url.pathname.match(STORE_ID);
       if (m) {
         if (!keyOk(request, url, env)) return authError("store: missing or wrong key");

@@ -303,6 +303,21 @@ const R_HELPERS = String.raw`local({
 })
 `;
 
+// pandas (and friends) import optional dependencies only inside the call, so
+// they are installed from the calls the code makes.
+const PY_CALL_PACKAGES = [
+  [/\.to_excel\s*\(|\bExcelWriter\s*\(|\bread_excel\s*\([^)]*\.xlsx|\bread_excel\s*\(/, ["openpyxl"]],
+  [/engine\s*=\s*["']xlsxwriter["']/, ["xlsxwriter"]],
+  [/\bread_excel\s*\([^)]*\.xls["']/, ["xlrd"]],
+  [/\bread_excel\s*\([^)]*\.ods["']|engine\s*=\s*["']odf["']/, ["odfpy"]],
+  [/\.to_markdown\s*\(/, ["tabulate"]],
+  [/\bread_html\s*\(/, ["lxml", "beautifulsoup4", "html5lib"]],
+  [/\.to_xml\s*\(|\bread_xml\s*\(/, ["lxml"]],
+  [/\.to_parquet\s*\(|\bread_parquet\s*\(/, ["pyarrow"]],
+  [/\.to_feather\s*\(|\bread_feather\s*\(/, ["pyarrow"]],
+  [/\.style\b/, ["jinja2"]]
+];
+
 // Packages read_text() needs, installed when the code names such a file.
 const READ_TEXT_PKGS = { pdf: "pypdf", docx: "python-docx", pptx: "python-pptx", xlsx: "openpyxl", xlsm: "openpyxl" };
 
@@ -476,17 +491,17 @@ function isAbort(e) { return !!e && (e.name === "AbortError" || e.name === "Time
 // remembered for a few minutes so later requests fail fast.
 // ---------------------------------------------------------------------------
 
-// Public proxies, re-verified 2026-09 from a sandboxed (Origin: null) page.
-// Few survive; the first is the only one that reliably passed text and POST.
+// Public proxies, re-verified 2026-09-24 from Origin: null: corsmirror and
+// cors.eu.org answered; cors.lol was rate-limited, allorigins and codetabs timed
+// out (kept as later tries). None of them relays file uploads (multipart).
 // `sync: false` marks proxies that may hang without answering: a synchronous
 // XHR cannot be timed out on the page thread, so they are only raced from fetch.
 const BUILTIN_PROXIES = [
   { u: "https://corsmirror.com/v1?url=",            enc: "q" },
-  { u: "https://api.allorigins.win/raw?url=",       enc: "q", sync: false },
-  { u: "https://api.codetabs.com/v1/proxy/?quest=", enc: "q", sync: false },
-  { u: "https://api.cors.lol/?url=",                enc: "q" },
   { u: "https://cors.eu.org/",                      enc: "raw" },
-  { u: "https://test.cors.workers.dev/?",           enc: "raw" }
+  { u: "https://api.cors.lol/?url=",                enc: "q" },
+  { u: "https://api.allorigins.win/raw?url=",       enc: "q", sync: false },
+  { u: "https://api.codetabs.com/v1/proxy/?quest=", enc: "q", sync: false }
 ];
 const PROXY_PARALLEL = 3;
 const DEAD_HOST_TTL_MS = 3 * 60 * 1000;
@@ -1277,6 +1292,16 @@ function crEngine(post, env) {
       const missing = missingProxy.toJs(); missingProxy.destroy();
       for (const n of missing) if (PY_PIP_ALIASES[n]) wanted.push(PY_PIP_ALIASES[n]);
     } catch (e) {}
+    // Optional dependencies of pandas calls: Pyodide packages load directly, the rest via micropip.
+    for (const [re, pkgs] of PY_CALL_PACKAGES) {
+      if (!re.test(code)) continue;
+      for (const pkg of pkgs) {
+        const mod = { beautifulsoup4: "bs4", odfpy: "odf" }[pkg] || pkg;
+        try { await p.loadPackage(pkg, { ...quiet, errorCallback: () => {} }); } catch (e) {}
+        try { const m = p.globals.get("_cr_missing")([mod]); const miss = m.toJs(); m.destroy(); if (miss.length) wanted.push(pkg); }
+        catch (e) { wanted.push(pkg); }
+      }
+    }
     if (/\bread_text\s*\(/.test(code)) {
       for (const m of code.matchAll(/\.(pdf|docx|pptx|xlsx|xlsm)\b/gi)) wanted.push(READ_TEXT_PKGS[m[1].toLowerCase()]);
       if (/\.html?\b/i.test(code)) { try { await p.loadPackage("beautifulsoup4", quiet); } catch (e) {} }
@@ -2184,6 +2209,8 @@ function workerSource() {
   for (const [k, v] of Object.entries(workerConstants())) s += "const " + k + " = " + JSON.stringify(v) + ";\n";
   s += "const AUTH_HEADER = " + String(AUTH_HEADER) + ";\n";
   s += "const SECRET_FIELD = " + String(SECRET_FIELD) + ";\n";
+  // Regexes do not survive JSON: this table goes in as source.
+  s += "const PY_CALL_PACKAGES = [" + PY_CALL_PACKAGES.map(([re, p]) => "[" + String(re) + ", " + JSON.stringify(p) + "]").join(", ") + "];\n";
   s += SHARED_FUNCTIONS.map((f) => f.toString()).join("\n\n");
   s += "\nlet __crEngine = null;\n";
   // Native functions captured now, before any user code can patch the prototypes.
@@ -2351,7 +2378,7 @@ function decodeContainer(body) {
     if (!snap || snap.v !== 1) throw new Error("unknown workspace format");
     const files = (snap.files || []).map(([p, b64]) => [p, base64ToBytes(b64)]);
     if (snap.sql && !files.some(([p]) => p === DB_REL)) files.push([DB_REL, base64ToBytes(snap.sql)]);
-    return { files, kv: snap.kv || {}, hosts: snap.net && snap.net.hosts, ext: snap.ext || null, att: [], hist: [] };
+    return { files, kv: snap.kv || {}, hosts: snap.net && snap.net.hosts, ext: snap.ext || null, att: [], hist: [], shares: [] };
   }
   const len = new DataView(body.buffer, body.byteOffset, body.byteLength).getUint32(0);
   const header = JSON.parse(new TextDecoder().decode(body.subarray(4, 4 + len)));
@@ -2360,7 +2387,8 @@ function decodeContainer(body) {
   const files = [];
   for (const [p, n] of header.files || []) { files.push([p, body.slice(off, off + n)]); off += n; }
   return { files, kv: header.kv || {}, hosts: header.net && header.net.hosts, ext: header.ext || null,
-    att: Array.isArray(header.att) ? header.att : [], hist: Array.isArray(header.hist) ? header.hist : [] };
+    att: Array.isArray(header.att) ? header.att : [], hist: Array.isArray(header.hist) ? header.hist : [],
+    shares: Array.isArray(header.shares) ? header.shares : [] };
 }
 
 async function decodeState(b64) {
@@ -2412,7 +2440,7 @@ async function restoreSnapshot(b64, cfg) {
   try { snap = await decodeState(b64); }
   catch (e) { throw new Error("the saved workspace data is damaged"); }
   if (snap.ext) {
-    const ext = snap.ext, hist = snap.hist, att = snap.att;
+    const ext = snap.ext, hist = snap.hist, att = snap.att, shares = snap.shares;
     if (!ext.exp || Date.now() > ext.exp) throw new Error("the saved workspace expired");
     let text = "";
     const urls = Array.isArray(ext.parts) ? ext.parts : [ext.url];
@@ -2426,6 +2454,7 @@ async function restoreSnapshot(b64, cfg) {
     // uploaded workspace, so an unchanged workspace is not uploaded again.
     if (hist && hist.length) snap.hist = hist;
     if (att && att.length) snap.att = att;
+    if (shares && shares.length) snap.shares = shares;
     globalThis.__crExtIn = { ptr: ext, trailer: b64 };
   }
   mergeHosts(snap.hosts);
@@ -2532,7 +2561,7 @@ async function buildTrailer(snap, cfg, notes) {
   let files = snap.files || [];
   const kvObj = snap.kv || {};
   const hosts = hostHealthSnapshot();
-  if (!files.length && !Object.keys(kvObj).length && !hosts && !(snap.att && snap.att.length) && !(snap.hist && snap.hist.length)) return null;
+  if (!files.length && !Object.keys(kvObj).length && !hosts && !(snap.att && snap.att.length) && !(snap.hist && snap.hist.length) && !(snap.shares && snap.shares.length)) return null;
   const secretVals = secretValues(cfg.secrets);
   if (secretVals.length) {
     const leaking = files.filter(([, b]) => bytesContainSecret(b, secretVals)).map(([p]) => p);
@@ -2557,6 +2586,7 @@ async function buildTrailer(snap, cfg, notes) {
   const outer = {};
   if (snap.att && snap.att.length) outer.att = snap.att.slice(-50);
   if (snap.hist && snap.hist.length) outer.hist = snap.hist;
+  if (snap.shares && snap.shares.length) outer.shares = snap.shares.slice(-200);
   Object.assign(header, outer);
   const limit = cfg.limitKB * 1024;
   const inner = { kv: kvObj };
@@ -2700,7 +2730,9 @@ function readSettings(us) {
     publicStores: flag("publicStores", false),
     keepVars: flag("keepVariables", true),
     importAttachments: flag("importAttachments", true),
-    secrets: parseSecrets(us && us.secrets)
+    secrets: parseSecrets(us && us.secrets),
+    catboxUserhash: s("catboxUserhash"),
+    shareExpiry: s("shareExpiry").toLowerCase()
   };
 }
 
@@ -3110,7 +3142,7 @@ async function runCodeInner(params, userSettings, resources, ctx) {
   added += given.length;
   // Anything added here must survive even if the run itself fails or times out.
   if (added && cfg.carry) {
-    const t = await buildTrailer({ files: startFiles, kv: restored ? restored.kv : {}, att, hist: restored ? restored.hist : [] }, cfg, []).catch(() => null);
+    const t = await buildTrailer({ files: startFiles, kv: restored ? restored.kv : {}, att, hist: restored ? restored.hist : [], shares: restored ? restored.shares : [] }, cfg, []).catch(() => null);
     if (t) ctx.incoming = t;
   }
 
@@ -3189,7 +3221,7 @@ async function runCodeInner(params, userSettings, resources, ctx) {
     const shown = redactSecrets(out, cfg.secrets);
     const entry = { t: Date.now(), lang: language, code: redactSecrets(code.slice(0, 20000), cfg.secrets), out: shown.length > 4000 ? shown.slice(0, 3000) + "\n...\n" + shown.slice(-900) : shown };
     const hist = addHistory(restored ? restored.hist : [], entry, cfg);
-    const trailer = await buildTrailer({ ...snap, att, hist }, cfg, ctx.notes);
+    const trailer = await buildTrailer({ ...snap, att, hist, shares: restored ? restored.shares : [] }, cfg, ctx.notes);
     return finish(out, ctx, trailer);
   } finally {
     engine.terminate();
@@ -3200,6 +3232,121 @@ async function runCodeInner(params, userSettings, resources, ctx) {
 // serve_file: render a /workspace file for the user (render_markdown output).
 // The carried state passes through in an invisible HTML comment.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Sharing: upload a /workspace file to a public file host and hand out its link
+// plus a way to delete it. Hosts, in order:
+//   catbox.moe  - permanent; only with a catbox account userhash (the only way to
+//                 delete there) and the personal proxy (catbox sends no CORS headers)
+//   gofile.io   - deletable with the guest token it returns; removed when unused
+//   litterbox   - catbox's temporary host; deletes itself after up to 72 h
+// With the companion Worker, each upload also gets a real deletion link
+// (<worker>/unshare/<id>, a page with a Delete button); otherwise the AI deletes
+// on request (manage_files unshare). Share records travel in the trailer.
+// ---------------------------------------------------------------------------
+const SHARE_HOSTS = ["catbox", "gofile", "litterbox"];
+
+function workerBase(cfg) {
+  // The companion Worker's origin and key, when the personal proxy is it.
+  try {
+    const u = new URL(String(cfg.corsProxy || "").replace("{url}", ""));
+    const key = u.searchParams.get("key");
+    return key && (u.pathname === "/" || u.pathname === "") ? { origin: u.origin, key } : null;
+  } catch (e) { return null; }
+}
+
+async function uploadForm(url, form, cfg, viaProxy) {
+  const target = viaProxy ? applyProxy({ u: cfg.corsProxy, enc: "q" }, url) : url;
+  return timedFetch(rawFetch(), target, { method: "POST", body: form }, Math.max(fetchTimeoutMs(), 180000));
+}
+
+async function shareUpload(host, name, bytes, mime, cfg, expiry) {
+  const blob = () => new Blob([bytes], { type: mime || "application/octet-stream" });
+  if (host === "catbox") {
+    if (!cfg.corsProxy) throw new Error("catbox.moe needs the personal CORS proxy (it sends no CORS headers)");
+    const form = new FormData();
+    form.append("reqtype", "fileupload");
+    if (cfg.catboxUserhash) form.append("userhash", cfg.catboxUserhash);
+    form.append("fileToUpload", blob(), name);
+    const r = await uploadForm("https://catbox.moe/user/api.php", form, cfg, true);
+    const url = (await r.text()).trim();
+    if (!r.ok || !/^https:\/\/files\.catbox\.moe\//.test(url)) throw new Error("catbox.moe: " + (url.slice(0, 120) || "HTTP " + r.status));
+    return { service: "catbox", url, file: url.split("/").pop(), deletable: !!cfg.catboxUserhash, note: cfg.catboxUserhash ? "permanent until deleted" : "permanent, and anonymous uploads cannot be deleted" };
+  }
+  if (host === "gofile") {
+    const form = new FormData();
+    form.append("file", blob(), name);
+    const r = await uploadForm("https://upload.gofile.io/uploadfile", form, cfg, false);
+    let d = null;
+    try { d = await r.json(); } catch (e) {}
+    if (!r.ok || !d || d.status !== "ok" || !d.data || !d.data.downloadPage) throw new Error("gofile.io: " + (d && d.status || "HTTP " + r.status));
+    return { service: "gofile", url: d.data.downloadPage, id: d.data.id, token: d.data.guestToken, deletable: true, note: "removed by gofile after a period without downloads" };
+  }
+  if (host === "litterbox") {
+    const time = ["1h", "12h", "24h", "72h"].includes(expiry) ? expiry : "72h";
+    const form = new FormData();
+    form.append("reqtype", "fileupload");
+    form.append("time", time);
+    form.append("fileToUpload", blob(), name);
+    const r = await uploadForm("https://litterbox.catbox.moe/resources/internals/api.php", form, cfg, false);
+    const url = (await r.text()).trim();
+    if (!r.ok || !/^https:\/\//.test(url)) throw new Error("litterbox: " + (url.slice(0, 120) || "HTTP " + r.status));
+    return { service: "litterbox", url, deletable: false, note: "deletes itself after " + time };
+  }
+  throw new Error("unknown host " + host);
+}
+
+// A clickable deletion link from the companion Worker (needs its /links endpoint).
+async function workerDeleteLink(share, name, cfg) {
+  const w = workerBase(cfg);
+  if (!w || !share.deletable) return null;
+  const body = { service: share.service, name, url: share.url, id: share.id, token: share.token, file: share.file, userhash: share.service === "catbox" ? cfg.catboxUserhash : undefined };
+  try {
+    const r = await timedFetch(rawFetch(), w.origin + "/links?key=" + encodeURIComponent(w.key),
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 30000);
+    const t = (await r.text()).trim();
+    return r.ok && /^https:\/\//.test(t) ? t : null;
+  } catch (e) { return null; }
+}
+
+async function shareFile(name, bytes, mime, cfg, wanted, expiry) {
+  const order = wanted && SHARE_HOSTS.includes(wanted) ? [wanted] :
+    SHARE_HOSTS.filter((h) => h !== "catbox" || (cfg.catboxUserhash && cfg.corsProxy));
+  const errors = [];
+  for (const host of order) {
+    try {
+      const s = await shareUpload(host, name, bytes, mime, cfg, expiry);
+      s.name = name; s.time = Date.now();
+      s.deleteLink = await workerDeleteLink(s, name, cfg);
+      // The Worker keeps the credentials for its deletion link; the chat does not need them.
+      if (s.deleteLink) { delete s.token; delete s.id; }
+      return s;
+    } catch (e) { errors.push(e.message || String(e)); }
+  }
+  throw new Error("could not share the file (" + errors.join("; ") + ")");
+}
+
+async function deleteShare(s, cfg) {
+  if (s.deleteLink && !s.token && s.service !== "catbox") throw new Error("delete it with its deletion link: " + s.deleteLink);
+  if (s.service === "gofile") {
+    const r = await timedFetch(rawFetch(), "https://api.gofile.io/contents",
+      { method: "DELETE", headers: { "Authorization": "Bearer " + s.token, "Content-Type": "application/json" }, body: JSON.stringify({ contentsId: s.id }) }, 30000);
+    const d = await r.json().catch(() => null);
+    if (!d || d.status !== "ok") throw new Error("gofile.io refused the deletion" + (d && d.status ? " (" + d.status + ")" : ""));
+    return;
+  }
+  if (s.service === "catbox") {
+    if (!cfg.catboxUserhash) throw new Error("catbox.moe deletes only with the account userhash (plugin setting Catbox userhash)");
+    if (!cfg.corsProxy) throw new Error("catbox.moe needs the personal CORS proxy");
+    const form = new FormData();
+    form.append("reqtype", "deletefiles"); form.append("userhash", cfg.catboxUserhash); form.append("files", s.file);
+    const r = await uploadForm("https://catbox.moe/user/api.php", form, cfg, true);
+    const t = (await r.text()).trim();
+    if (!r.ok || !/success/i.test(t)) throw new Error("catbox.moe: " + (t.slice(0, 120) || "HTTP " + r.status));
+    return;
+  }
+  throw new Error(s.service + " uploads cannot be deleted by hand (" + (s.note || "they expire") + ")");
+}
+
 const MIME_BY_EXT = {
   txt: "text/plain", log: "text/plain", md: "text/markdown", csv: "text/csv", tsv: "text/tab-separated-values",
   json: "application/json", geojson: "application/json", xml: "application/xml", yaml: "text/yaml", yml: "text/yaml",
@@ -3260,8 +3407,18 @@ async function serve_file(params, userSettings, resources) {
     const mime = /^[\w.+-]+\/[\w.+-]+$/.test(String(params.mime || "")) ? String(params.mime).toLowerCase() : guessMime(name);
     const kb = Math.max(1, Math.ceil(bytes.length / 1024));
     const size = kb >= 1024 ? (kb / 1024).toFixed(1) + " MB" : kb + " KB";
-    if (bytes.length > SERVE_MAX_BYTES) {
-      return serveFinish("**serve_file:** `" + rel + "` is " + size + ", too large to embed in the chat (limit " + (SERVE_MAX_BYTES >> 20) + " MB). Compress it (zip) or reduce it with run_code first.", ctx);
+    if (bytes.length > SERVE_MAX_BYTES && !params.share) {
+      return serveFinish("**serve_file:** `" + rel + "` is " + size + ", too large to embed in the chat (limit " + (SERVE_MAX_BYTES >> 20) + " MB). Share it instead (serve_file with share), or compress it (zip) first.", ctx);
+    }
+    if (params.share) {
+      const want = String(params.share).toLowerCase();
+      const s = await shareFile(name, bytes, mime, cfg, SHARE_HOSTS.includes(want) ? want : null, cfg.shareExpiry);
+      const shares = (snap.shares || []).concat([s]);
+      const t = await buildTrailer({ ...snap, shares }, cfg, []).catch(() => null);
+      if (t) ctx.incoming = t;
+      const del = s.deleteLink ? "[Delete this upload](" + s.deleteLink + ")" :
+        s.deletable ? "To delete it later, ask me to remove the shared file." : "It cannot be deleted by hand: " + s.note + ".";
+      return serveFinish("**Shared:** [" + mdEscape(name) + " (" + size + ")](" + s.url + ")  \n" + "Hosted on " + s.service + " (" + s.note + "). " + del, ctx);
     }
     const dataURI = "data:" + mime + ";base64," + bytesToBase64(bytes);
     const link = "[Download " + mdEscape(name) + " (" + size + ")](" + dataURI + ")";
@@ -3289,8 +3446,9 @@ async function serve_file(params, userSettings, resources) {
 // These functions reach OUT of the sandboxed plugin iframe to the companion
 // Chrome extension (extension/ folder of this repository), which the user loads
 // unpacked. The extension injects a content script into this very frame; we talk
-// to it with window.postMessage and it drives the tabs on our behalf. Every
-// request carries the pairing key and the site policy from the plugin settings.
+// to it with window.postMessage and it drives the tabs on our behalf. The
+// extension only answers trusted hosts (TypingMind); every request carries the
+// site policy from the plugin settings.
 // With no extension present the ping times out and we return install steps.
 
 const BROWSER_PING_MS = 800;
@@ -3324,17 +3482,16 @@ const BROWSER_INSTALL_HINT =
   "One-time setup (Chrome/Chromium desktop):\n" +
   "1. Get this plugin's repository and open chrome://extensions .\n" +
   "2. Turn on \"Developer mode\" (top right), click \"Load unpacked\" and select the extension/ folder.\n" +
-  "3. Open the extension's options page (Details -> Extension options), copy the pairing key into the plugin setting \"Browser pairing key\".\n" +
-  "4. Reload the TypingMind tab and try again.";
+  "3. Reload the TypingMind tab and try again. (TypingMind on a custom domain: add it on the extension's options page.)";
 
 function browserSettings(userSettings) {
   const s = (k) => String(userSettings && userSettings[k] != null ? userSettings[k] : "").trim();
   const list = (k) => s(k).split(/[\s,;]+/).map((x) => x.trim()).filter(Boolean);
   const flag = s("browserConfirm").toLowerCase();
   return {
-    key: s("browserKey"),
     policy: { allow: list("browserAllowSites"), block: list("browserBlockSites") },
-    confirmRisky: !/^(off|false|0|no)$/.test(flag)
+    confirmRisky: !/^(off|false|0|no)$/.test(flag),
+    highlight: !/^(off|false|0|no)$/.test(s("browserHighlight").toLowerCase())
   };
 }
 
@@ -3354,15 +3511,14 @@ function browserFinish(md, ctx) {
   return ctx.incoming ? md + "\n\n[[cr-state:" + ctx.incoming + "]]" : md;
 }
 
-// One request with the key and policy attached; a short ping first so a missing
-// extension, an untrusted page or a wrong key comes back as a clear message.
+// One request with the site policy attached; a short ping first so a missing
+// extension or an untrusted page comes back as a clear message.
 async function browserCall(ctx, request, timeoutMs) {
-  const pong = await browserBridgeCall({ op: "ping", key: ctx.bs.key }, BROWSER_PING_MS);
+  const pong = await browserBridgeCall({ op: "ping" }, BROWSER_PING_MS);
   if (!pong || !pong.ok) return { ok: false, error: BROWSER_INSTALL_HINT, setup: true };
-  if (pong.trusted === false) return { ok: false, error: "The browser bridge does not trust this page (" + (pong.host || "unknown host") + "). Add it under \"Trusted hosts\" on the extension's options page.", setup: true };
-  if (!ctx.bs.key) return { ok: false, error: "Set the plugin setting \"Browser pairing key\": copy it from the extension's options page (chrome://extensions -> Code Runner Browser Bridge -> Details -> Extension options).", setup: true };
-  if (pong.paired === false) return { ok: false, error: "The browser pairing key in the plugin settings does not match the extension's key. Copy it again from the extension's options page.", setup: true };
-  const r = await browserBridgeCall({ ...request, key: ctx.bs.key, policy: ctx.bs.policy, confirmRisky: ctx.bs.confirmRisky }, timeoutMs || BROWSER_CALL_MS);
+  if (pong.nested) return { ok: false, error: "The browser tools only work from the plugin itself, not from content nested inside it.", setup: true };
+  if (pong.trusted === false) return { ok: false, error: "The browser bridge does not trust this page (" + (pong.host || "unknown host") + "). Add it under \"Trusted hosts\" on the extension's options page (chrome://extensions -> Code Runner Browser Bridge -> Details -> Extension options).", setup: true };
+  const r = await browserBridgeCall({ ...request, policy: ctx.bs.policy, confirmRisky: ctx.bs.confirmRisky, highlight: request.highlight == null ? ctx.bs.highlight : request.highlight }, timeoutMs || BROWSER_CALL_MS);
   if (r && r.error === "__timeout") return { ok: false, error: "the extension did not answer in time. The page may be busy or still loading; try again, or reload the TypingMind tab." };
   return r || { ok: false, error: "no answer from the extension" };
 }
@@ -3506,7 +3662,7 @@ async function browser_state(params, userSettings, resources) {
     const mode = String(params.mode || "elements").toLowerCase();
     if (!["elements", "text", "screenshot"].includes(mode)) return browserFinish("**browser_state:** mode must be elements, text or screenshot.", ctx);
     const req = { op: "page.state", mode, scope: params.scope === "page" ? "page" : "viewport", selector: params.selector || undefined,
-      maxChars: params.max_chars, fullPage: !!params.full_page, highlight: params.highlight !== false && mode === "screenshot" };
+      maxChars: params.max_chars, fullPage: !!params.full_page, highlight: params.highlight === false ? false : params.highlight === true ? true : null };
     if (params.tabId != null) req.tabId = Number(params.tabId);
     const r = await browserCall(ctx, req, 45000);
     if (!r.ok) return browserFinish(r.setup ? r.error : "**browser_state failed:** " + (r.error || "unknown error") + ".", ctx);
@@ -3630,9 +3786,16 @@ async function manage_files(params, userSettings, resources) {
     let snap = { files: [], kv: {}, att: [] };
     if (ctx.incoming) {
       try { snap = await restoreSnapshot(ctx.incoming, cfg); }
-      catch (e) { ctx.incoming = null; return finish("The saved workspace could not be loaded (" + (e.message || e) + "). /workspace is empty.", ctx, null); }
+      catch (e) {
+        // Share records live in the small pointer: they stay usable after the workspace itself expired.
+        let outer = null;
+        try { outer = await decodeState(ctx.incoming); } catch (e2) {}
+        const action0 = String(params.action || "list").toLowerCase();
+        if (!outer || !["shares", "unshare"].includes(action0)) { ctx.incoming = null; return finish("The saved workspace could not be loaded (" + (e.message || e) + "). /workspace is empty.", ctx, null); }
+        snap = { files: [], kv: {}, att: outer.att || [], hist: outer.hist || [], shares: outer.shares || [], expired: true };
+      }
     }
-    let files = snap.files.slice(), att = snap.att || [];
+    let files = snap.files.slice(), att = snap.att || [], shares = (snap.shares || []).slice();
     if (cfg.importAttachments) {
       const imp = await importAttachments(resources, new Set(att), ctx.notes);
       files = mergeFileLists(files, imp.files);
@@ -3680,6 +3843,20 @@ async function manage_files(params, userSettings, resources) {
     } else if (action === "reset_variables") {
       files = files.filter(([p]) => !isInternal(p));
       text = "Saved Python/R variables and DuckDB tables were cleared; files are kept.";
+    } else if (action === "shares") {
+      text = shares.length ? "Shared files:\n" + shares.map((s) => "  " + s.name + "  " + s.url + "  (" + s.service + ", " + new Date(s.time).toISOString().slice(0, 16).replace("T", " ") + " UTC" +
+        (s.deleteLink ? ", deletion link " + s.deleteLink : s.deletable ? ", deletable with unshare" : ", " + (s.note || "not deletable")) + ")").join("\n") : "No files have been shared from this chat.";
+    } else if (action === "unshare") {
+      const want = String(params.url || params.path || "").trim();
+      const pick = shares.filter((s) => !want || s.url === want || s.name === relPath(want) || s.name === want);
+      if (!pick.length) return finish("manage_files unshare: no shared file matches \"" + want + "\". Use action shares to list them.", ctx);
+      if (!want && pick.length > 1) return finish("manage_files unshare: several files are shared; pass `url` (see action shares).", ctx);
+      const done = [], failed = [];
+      for (const s of pick) {
+        try { await deleteShare(s, cfg); done.push(s.name + " (" + s.url + ")"); shares = shares.filter((x) => x !== s); }
+        catch (e) { failed.push(s.name + ": " + (e.message || e)); }
+      }
+      text = (done.length ? "Deleted from the file host: " + done.join(", ") + "." : "") + (failed.length ? (done.length ? "\n" : "") + "Not deleted: " + failed.join("; ") : "");
     } else if (action === "export_notebook") {
       const list = snap.hist || [];
       if (!list.length) return finish("There are no recorded runs to export yet (runs in the in-browser languages are recorded; remote languages are not).", ctx);
@@ -3689,7 +3866,7 @@ async function manage_files(params, userSettings, resources) {
       files = mergeFileLists(files, [[out, new TextEncoder().encode(buildNotebook(list, format))]]);
       text = "Wrote " + out + " with " + list.length + " run" + (list.length === 1 ? "" : "s") + ". Call serve_file to give it to the user, or preview_file to show it.";
     } else if (action !== "list") {
-      return finish("Unknown action \"" + action + "\". Use list, delete, rename, clear, reset_variables or export_notebook.", ctx);
+      return finish("Unknown action \"" + action + "\". Use list, delete, rename, clear, reset_variables, export_notebook, shares or unshare.", ctx);
     }
 
     const rows = visible().sort((a, b) => (a[0] < b[0] ? -1 : 1));
@@ -3703,8 +3880,10 @@ async function manage_files(params, userSettings, resources) {
     if (snap.hist && snap.hist.length) saved.push(snap.hist.length + " recorded runs for export_notebook");
     const extra = [saved.length ? "saved between calls: " + saved.join(", ") : "", keys.length ? "JavaScript storage keys: " + keys.slice(0, 20).join(", ") : ""].filter(Boolean);
     const out = (text ? text + "\n\n" : "") + listing + (extra.length ? "\n(" + extra.join("; ") + ")" : "");
-    if (action === "list" && files === snap.files) return finish(out, ctx);
-    const trailer = await buildTrailer({ files, kv, att, hist: action === "clear" && !(params.keep_variables === true || params.keep_variables === "true") ? [] : snap.hist }, cfg, ctx.notes);
+    if ((action === "list" || action === "shares") && files === snap.files) return finish(out, ctx);
+    if (snap.expired) return finish(out + "\n(the workspace itself has expired; only the share records were available)", ctx, null);
+    const trailer = await buildTrailer({ files, kv, att, shares,
+      hist: action === "clear" && !(params.keep_variables === true || params.keep_variables === "true") ? [] : snap.hist }, cfg, ctx.notes);
     return finish(out, ctx, trailer);
   } catch (e) {
     return finish("manage_files failed: " + (e && e.message || e), ctx);
@@ -3769,6 +3948,20 @@ const v = document.getElementById("v"), m = document.getElementById("m");
 document.getElementById("t").textContent = D.name;
 const size = bytes.length < 1024 ? bytes.length + " B" : bytes.length < 1048576 ? Math.ceil(bytes.length / 1024) + " KB" : (bytes.length / 1048576).toFixed(1) + " MB";
 m.textContent = size;
+// Markdown and Word files are untrusted: parse their HTML inertly and drop
+// scripts, frames, event handlers and javascript: links before showing it.
+const safeHtml = (html) => {
+  const doc = new DOMParser().parseFromString("<body>" + html, "text/html");
+  doc.querySelectorAll("script,iframe,frame,object,embed,link,meta,base,form,style").forEach((n) => n.remove());
+  for (const n of doc.body.querySelectorAll("*")) {
+    for (const a of [...n.attributes]) {
+      if (/^on/i.test(a.name) || (/^(href|src|xlink:href|action|formaction|srcdoc)$/i.test(a.name) && /^\s*(javascript|data:text\/html|vbscript):/i.test(a.value))) n.removeAttribute(a.name);
+    }
+  }
+  const frag = document.createDocumentFragment();
+  for (const c of [...doc.body.childNodes]) frag.append(document.importNode(c, true));
+  return frag;
+};
 const el = (tag, props, kids) => { const e = document.createElement(tag); Object.assign(e, props || {}); for (const k of kids || []) e.append(k); return e; };
 const dl = () => el("a", { href: blobUrl(), download: D.name, textContent: "Download " + D.name });
 const load = (src) => new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej(new Error("could not load " + src)); document.head.append(s); });
@@ -3864,7 +4057,7 @@ try {
   else if (D.kind === "docx") {
     await load("https://cdn.jsdelivr.net/npm/mammoth@1.12.3/mammoth.browser.min.js");
     const r = await mammoth.convertToHtml({ arrayBuffer: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) });
-    const d = el("div", { className: "md" }); d.innerHTML = r.value; d.querySelectorAll("script").forEach((s) => s.remove());
+    const d = el("div", { className: "md" }); d.append(safeHtml(r.value));
     v.replaceChildren(d, el("p", {}, [dl()]));
   }
   else if (D.kind === "pptx") {
@@ -3885,7 +4078,7 @@ try {
     const src = (x) => (Array.isArray(x) ? x.join("") : String(x || ""));
     const box = el("div", { className: "md" });
     for (const c of nb.cells || []) {
-      if (c.cell_type === "markdown") { const d = el("div"); d.innerHTML = typeof marked !== "undefined" ? marked.parse(src(c.source)) : ""; if (typeof marked === "undefined") d.textContent = src(c.source); d.querySelectorAll("script").forEach((s) => s.remove()); box.append(d); }
+      if (c.cell_type === "markdown") { const d = el("div"); if (typeof marked !== "undefined") d.append(safeHtml(marked.parse(src(c.source)))); else d.textContent = src(c.source); box.append(d); }
       else if (c.cell_type === "code") {
         box.append(el("pre", { textContent: src(c.source) }));
         for (const o of c.outputs || []) {
@@ -3906,7 +4099,7 @@ try {
   }
   else if (D.kind === "html") { const f = el("iframe", { sandbox: "allow-scripts allow-popups allow-forms allow-modals" }); f.srcdoc = text(); v.replaceChildren(f); }
   else if (D.kind === "markdown") {
-    try { await load("https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"); const d = el("div", { className: "md" }); d.innerHTML = marked.parse(text()); d.querySelectorAll("script").forEach((s) => s.remove()); v.replaceChildren(d); }
+    try { await load("https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"); const d = el("div", { className: "md" }); d.append(safeHtml(marked.parse(text()))); v.replaceChildren(d); }
     catch (e) { v.replaceChildren(el("pre", { textContent: text() })); }
   }
   else if (D.kind === "image") v.replaceChildren(el("img", { src: blobUrl(), alt: D.name }));

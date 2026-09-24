@@ -53,6 +53,8 @@ const STEPS = [
   ["preview the sqlite database", "preview_file", { path: "data.sqlite" }, (s) => /"kind":"sqlite"/.test(s)],
   ["python chart for preview", "run_code", { language: "python", code: "chart({'a': 3, 'b': 5}, kind='pie', title='Share')" }, (s) => /chart\.html/.test(s)],
   ["preview the chart page", "preview_file", { path: "chart.html" }, (s) => /"kind":"html"/.test(s)],
+  ["write a hostile markdown file", "run_code", { language: "python", code: "open('evil.md','w').write('# Title\\n\\n<img src=x onerror=\"document.getElementById(\\'v\\').textContent=\\'PWNED\\'\">\\n\\n<a href=\"javascript:alert(1)\">x</a> safe text')\nprint('w')" }, (s) => s === "w"],
+  ["markdown preview does not run embedded code", "preview_file", { path: "evil.md" }, (s) => /"kind":"markdown"/.test(s)],
   ["export the session as a notebook", "manage_files", { action: "export_notebook" }, (s) => /Wrote notebook\.ipynb/.test(s)],
   ["preview the notebook", "preview_file", { path: "notebook.ipynb" }, (s) => /"kind":"notebook"/.test(s)]
 ];
@@ -116,7 +118,7 @@ const rendered = (html) => new Promise((resolve) => {
     try { ok = pred(clean); } catch (e) {}
     if (ok && fn === "preview_file") {
       const shown = await rendered(String(r.out));
-      ok = !/^Loading|Could not preview|NO PROBE|Chart error/.test(shown) && shown.trim().length > 0;
+      ok = !/^Loading|Could not preview|NO PROBE|Chart error|PWNED/.test(shown) && shown.trim().length > 0;
       if (!ok) { await report({ name: name + " (rendered)", ok: false, live: true, ms: 0, out: shown }); continue; }
     }
     await report({ name, ok, live: !!live, ms: r.ms, out: clean.replace(/data:[a-z/+.-]+;base64,[A-Za-z0-9+/=]{40,}/g, "data:...").slice(0, 800) });

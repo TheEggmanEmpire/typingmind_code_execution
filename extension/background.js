@@ -7,31 +7,25 @@
 //   - real mouse clicks, keystrokes, typed text, screenshots and the model's own
 //     scripts: the DevTools protocol (chrome.debugger), attached per call
 //
-// Every request must come from a trusted page (TypingMind by default, see the
-// options page) and carry the pairing key; otherwise any website could drive
-// your tabs through this extension. Each request also carries the plugin's site
-// policy (allow / block lists), checked before a tab is touched.
+// Every request must come from a trusted page (TypingMind by default; more hosts
+// on the options page), so other websites cannot drive your tabs through this
+// extension. Each request also carries the plugin's site policy (allow / block
+// lists), checked before a tab is touched.
 //
 // Every reply is { ok: true, ... } or { ok: false, error, code? }.
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const DEFAULT_TRUSTED = ["typingmind.com", "*.typingmind.com"];
 
-// ---- settings: pairing key and trusted hosts ------------------------------------
+// ---- settings: trusted hosts -----------------------------------------------------
 let settingsCache = null;
 async function settings() {
   if (settingsCache) return settingsCache;
   let file = {};
   try { const r = await fetch(chrome.runtime.getURL("config.json")); if (r.ok) file = await r.json(); } catch (e) {}
-  const s = await chrome.storage.local.get(["pairingKey", "trustedHosts"]);
-  let key = s.pairingKey || file.pairingKey;
-  if (!key) {
-    const b = new Uint8Array(18); crypto.getRandomValues(b);
-    key = "crb-" + [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
-    await chrome.storage.local.set({ pairingKey: key });
-  }
+  const s = await chrome.storage.local.get(["trustedHosts"]);
   const hosts = Array.isArray(s.trustedHosts) && s.trustedHosts.length ? s.trustedHosts : Array.isArray(file.trustedHosts) && file.trustedHosts.length ? file.trustedHosts : DEFAULT_TRUSTED;
-  settingsCache = { key, hosts };
+  settingsCache = { hosts };
   return settingsCache;
 }
 chrome.storage.onChanged.addListener(() => { settingsCache = null; });
@@ -47,21 +41,12 @@ function hostMatches(host, pattern) {
 }
 function hostOf(url) { try { return new URL(url).hostname; } catch (e) { return ""; } }
 
-function sameKey(a, b) {
-  a = String(a || ""); b = String(b || "");
-  if (!a || a.length !== b.length) return false;
-  let d = 0;
-  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return d === 0;
-}
-
 async function authorize(req, sender) {
   const s = await settings();
   const pageUrl = sender && sender.tab && sender.tab.url || "";
   const host = hostOf(pageUrl);
   const trusted = !!host && s.hosts.some((p) => hostMatches(host, p));
-  const keyOk = sameKey(req.key, s.key);
-  return { trusted, keyOk, host };
+  return { trusted, host };
 }
 
 // ---- site policy (plugin settings) ---------------------------------------------------
@@ -88,7 +73,7 @@ function checkUrl(url, policy) {
 // ---- messaging ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.type !== "crb") return;
-  handle(msg.request || {}, sender)
+  handle(msg.request || {}, sender, msg.depth)
     .then((r) => sendResponse(r))
     .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e), code: e && e.code }));
   return true; // async sendResponse
@@ -118,11 +103,15 @@ function tabView(t) {
   return { id: t.id, windowId: t.windowId, index: t.index, active: t.active, url: t.url || t.pendingUrl || "", title: t.title || "", status: t.status };
 }
 
-async function handle(req, sender) {
+async function handle(req, sender, depth) {
   const auth = await authorize(req, sender);
-  if (req.op === "ping") return { ok: true, version: VERSION, trusted: auth.trusted, paired: auth.keyOk, host: auth.host };
+  // Only a frame placed directly in the trusted page (where TypingMind runs its
+  // plugins) may use the bridge: not the page itself, not frames nested deeper
+  // (rendered previews, charts, embedded content).
+  if (auth.trusted && depth !== 1) auth.trusted = false, auth.nested = true;
+  if (req.op === "ping") return { ok: true, version: VERSION, trusted: auth.trusted, nested: !!auth.nested, host: auth.host };
+  if (auth.nested) return { ok: false, code: "untrusted", error: "only the plugin frame itself may use the Code Runner bridge (this request came from a frame nested inside it, or from the page)." };
   if (!auth.trusted) return { ok: false, code: "untrusted", error: "this page (" + (auth.host || "unknown") + ") is not a trusted host of the Code Runner bridge. Add it on the extension's options page." };
-  if (!auth.keyOk) return { ok: false, code: "key", error: "wrong or missing pairing key. Copy the key from the extension's options page into the plugin's \"Browser pairing key\" setting." };
   const policy = req.policy || null;
 
   switch (req.op) {
@@ -253,6 +242,9 @@ async function pageState(tabId, tab, req) {
   if (mode === "screenshot") return await screenshot(tabId, req);
   const snap = await agent(tabId, "snapshot", [{ scope: req.scope, maxChars: req.maxChars }]);
   await noteSnapshot(tabId);
+  // Like nanobrowser: numbered boxes on the page itself, so the user sees what
+  // the AI sees. They stay until the next snapshot (or highlight: false).
+  try { await agent(tabId, "highlight", [req.highlight !== false, "page"]); } catch (e) {}
   return { ok: true, tabId, mode: "elements", ...snap, tabs: await otherTabs(tabId, req.policy) };
 }
 
@@ -367,7 +359,7 @@ async function screenshot(tabId, req) {
     if (req.highlight) {
       await agent(tabId, "snapshot", [{ scope: "viewport" }]);
       marked = await agent(tabId, "highlight", [true]);
-    }
+    } else { try { await agent(tabId, "highlight", [false]); } catch (e) {} }
     return await withDebugger(tabId, async (target) => {
       const full = !!req.fullPage;
       const params = { format: full ? "jpeg" : "png", captureBeyondViewport: full };
@@ -541,6 +533,7 @@ async function pageAct(tabId, req, policy, sender) {
       await checkTab(current, policy);
       const snap = await agent(current, "snapshot", [{ scope: "viewport", maxChars: req.maxChars || 8000 }]);
       await noteSnapshot(current);
+      try { await agent(current, "highlight", [req.highlight !== false, "page"]); } catch (e) {}
       out.state = { ...snap, tabs: await otherTabs(current, policy) };
     } catch (e) { out.stateError = String(e && e.message || e); }
   }
