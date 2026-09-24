@@ -1,25 +1,28 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>CR-BRIDGE-TEST-TITLE</title>
-<!-- Loads the unpacked extension/ and drives browser_run / browser_tabs from a
-     sandboxed iframe, exactly like TypingMind. Driven by run-browser-e2e.js. -->
+<!-- Loads the unpacked extension/ (a copy with a test pairing key) and drives the
+     browser tools from a sandboxed iframe, exactly like TypingMind. Driven by
+     run-browser-e2e.js. -->
 <script>
 const report = (o) => fetch("/report", { method: "POST", body: JSON.stringify(o) });
+const KEY = { browserKey: "test-key" };
 
 (async () => {
   const impl = await (await fetch("/implementation.js")).text();
-  // Minimal inner harness: eval the plugin, run one browser tool, post the result back.
+  // Minimal inner harness: eval the plugin, run one tool, post the result back.
   const inner =
     "window.addEventListener('message', async (e) => {" +
-    "  const { impl, fn, params, name } = e.data || {};" +
+    "  const { impl, fn, params, settings, prev, name } = e.data || {};" +
     "  try { (0, eval)(impl);" +
-    "    const f = { browser_run: browser_run, browser_tabs: browser_tabs }[fn];" +
-    "    const out = await f(params, {}, {});" +
+    "    const f = { browser_run, browser_tabs, browser_state, browser_act, run_code, manage_files }[fn];" +
+    "    const out = await f(params, settings || {}, { previousRunOutput: prev });" +
     "    parent.postMessage({ name, out }, '*');" +
     "  } catch (err) { parent.postMessage({ name, out: 'THROW: ' + (err && err.stack || err) }, '*'); }" +
     "});";
 
-  const call = (name, fn, params) => new Promise((resolve) => {
+  let prev;
+  const call = (name, fn, params, settings) => new Promise((resolve) => {
     const f = document.createElement("iframe");
     f.setAttribute("sandbox", "allow-scripts");
     f.srcdoc = "<!doctype html><script>" + inner + "<\/script>";
@@ -27,35 +30,101 @@ const report = (o) => fetch("/report", { method: "POST", body: JSON.stringify(o)
       if (e.source !== f.contentWindow || !e.data || e.data.name !== name) return;
       window.removeEventListener("message", onMsg);
       f.remove();
+      prev = e.data.out;
       resolve(e.data.out);
     };
     window.addEventListener("message", onMsg);
-    f.onload = () => f.contentWindow.postMessage({ impl, fn, params, name }, "*");
+    f.onload = () => f.contentWindow.postMessage({ impl, fn, params, settings: settings === undefined ? KEY : settings, prev, name }, "*");
     document.body.appendChild(f);
   });
-
-  const STEPS = [
-    ["bridge reachable (tabs.list)", "browser_tabs", { action: "list" }, (s) => /Open tabs/.test(s) && /CR-BRIDGE-TEST-TITLE/.test(s)],
-    ["run returns the page title", "browser_run", { code: "return document.title" }, (s) => /result: CR-BRIDGE-TEST-TITLE/.test(s)],
-    ["run captures console output", "browser_run", { code: "console.log('hello from page'); return 1 + 1" }, (s) => /result: 2/.test(s) && /hello from page/.test(s)],
-    ["run reads the DOM", "browser_run", { code: "return document.querySelectorAll('*').length > 0" }, (s) => /result: true/.test(s)],
-    ["run returns JSON values", "browser_run", { code: "return { a: 1, b: [2, 3] }" }, (s) => /result: \{"a":1,"b":\[2,3\]\}/.test(s)],
-    ["await works in the page", "browser_run", { code: "await new Promise(r => setTimeout(r, 10)); return 'waited'" }, (s) => /result: waited/.test(s)]
-  ];
-
-  for (const [name, fn, params, pred] of STEPS) {
-    let out = "";
-    // Give the freshly loaded extension/service worker time to come up.
-    for (let i = 0; i < 30; i++) {
-      out = await call(name, fn, params);
-      if (!/not responding/.test(String(out))) break;
-      await new Promise((r) => setTimeout(r, 400));
-    }
+  const clean = (s) => String(s).replace(/\s*\[\[cr-state:[^\]]*\]\]\s*$/, "");
+  const check = async (name, out, pred) => {
     let ok = false;
-    const clean = String(out).replace(/\s*\[\[cr-state:[^\]]*\]\]\s*$/, "");
-    try { ok = pred(clean); } catch (e) {}
-    await report({ name, ok, out: clean.slice(0, 400) });
-  }
+    try { ok = pred(clean(out)); } catch (e) {}
+    await report({ name, ok, out: clean(out).slice(0, 700) });
+    return ok;
+  };
+  const step = async (name, fn, params, pred, settings) => check(name, await call(name, fn, params, settings), pred);
+  const indexOf = (snap, re) => { const m = new RegExp("\\[(\\d+)\\]" + re.source).exec(snap); return m ? Number(m[1]) : null; };
+
+  // Give the freshly loaded extension/service worker time to come up.
+  for (let i = 0; i < 30; i++) { if (!/not responding/.test(String(await call("warmup", "browser_tabs", { action: "list" })))) break; await new Promise((r) => setTimeout(r, 400)); }
+
+  // --- pairing and trust ---
+  await step("no pairing key: explained, nothing done", "browser_tabs", { action: "list" }, (s) => /Browser pairing key/.test(s) && !/Open tabs/.test(s), {});
+  await step("wrong pairing key: refused", "browser_tabs", { action: "list" }, (s) => /does not match/.test(s), { browserKey: "nope" });
+
+  // --- the existing tools still work ---
+  await step("bridge reachable (tabs.list)", "browser_tabs", { action: "list" }, (s) => /Open tabs/.test(s) && /CR-BRIDGE-TEST-TITLE/.test(s) && /\(this chat\)/.test(s));
+  await step("run returns the page title", "browser_run", { code: "return document.title" }, (s) => /result: CR-BRIDGE-TEST-TITLE/.test(s));
+  await step("run captures console output", "browser_run", { code: "console.log('hello from page'); return 1 + 1" }, (s) => /result: 2/.test(s) && /hello from page/.test(s));
+  await step("await works in the page", "browser_run", { code: "await new Promise(r => setTimeout(r, 10)); return 'waited'" }, (s) => /result: waited/.test(s));
+
+  // --- an untrusted host cannot use the bridge ---
+  const opened = await call("open the untrusted page", "browser_tabs", { action: "open", url: "http://localhost:" + location.port + "/test/untrusted.html", active: false });
+  const untrustedTab = Number((/tab #(\d+)/.exec(opened) || [])[1]);
+  await new Promise((r) => setTimeout(r, 3000));
+  const u = await (await fetch("/untrusted-result")).json().catch(() => null);
+  await check("an untrusted page is refused even with the key", JSON.stringify(u), (s) => /"code":"untrusted"/.test(s) && !/"tabs"/.test(s));
+  await call("close the untrusted page", "browser_tabs", { action: "close", tabId: untrustedTab });
+
+  // --- snapshot, typing, clicking, dropdowns, keys ---
+  const o = await call("open the fixture", "browser_tabs", { action: "open", url: location.origin + "/test/fixture.html", active: true });
+  const tab = Number((/tab #(\d+)/.exec(o) || [])[1]);
+  await check("fixture opened", o, (s) => tab > 0 && /Fixture page/.test(s));
+  const snap = await call("snapshot", "browser_state", { tabId: tab });
+  await check("snapshot numbers the interactive elements", snap, (s) => /URL: http/.test(s) && /\[\d+\]<input type="text" name="name" placeholder="Your name"/.test(s) && /\[\d+\]<button>Delete account<\/button>/.test(s) && /Intro paragraph/.test(s) && /px below/.test(s));
+  const iName = indexOf(snap, /<input type="text" name="name"/), iColor = indexOf(snap, /<select name="color"/), iGo = indexOf(snap, /<button>Go</),
+    iDel = indexOf(snap, /<button>Delete account/), iQ = indexOf(snap, /<input type="text" name="q"/);
+  await step("options lists a dropdown", "browser_act", { tabId: tab, actions: [{ action: "options", index: iColor }], state: "none" }, (s) => /\*Red \(r\) \| Green \(g\) \| Blue \(b\)/.test(s));
+  const acted = await call("type, select and click in one call", "browser_act", { tabId: tab, actions: [{ action: "type", index: iName, text: "Ada" }, { action: "select", index: iColor, option: "blue" }, { action: "click", index: iGo }] });
+  await check("type, select and click in one call", acted, (s) => /all actions done/.test(s) && /selected "Blue"/.test(s) && /clicked 1 Ada b/.test(s) && /value="Ada"/.test(s));
+  await step("type with append", "browser_act", { tabId: tab, actions: [{ action: "type", index: iName, text: " L.", mode: "append" }, { action: "click", index: iGo }] }, (s) => /clicked 2 Ada L\. b/.test(s));
+  await step("type and Enter submits a form", "browser_act", { tabId: tab, actions: [{ action: "type", index: iQ, text: "shoes", submit: true }] }, (s) => /Enter pressed/.test(s) && /submitted shoes/.test(s));
+  await step("key combo selects all, then Backspace clears", "browser_act", { tabId: tab, actions: [{ action: "click", index: iName }, { action: "key", keys: "Control+a" }, { action: "key", keys: "Backspace" }] }, (s) => /all actions done/.test(s) && /name="name" placeholder="Your name">/.test(s));
+
+  // --- the risky-action guard ---
+  await step("a risky click is held for confirmation", "browser_act", { tabId: tab, actions: [{ action: "click", index: iDel }] }, (s) => /NOT DONE: needs confirmation/.test(s) && /delete/.test(s) && /idle|submitted/.test(s) && !/deleted/.test(s));
+  await step("with confirm it is done", "browser_act", { tabId: tab, actions: [{ action: "click", index: iDel }], confirm: true }, (s) => /all actions done/.test(s) && /deleted/.test(s));
+  await step("Space on a focused risky button is held", "browser_act", { tabId: tab, actions: [{ action: "scroll", to: "top" }, { action: "key", keys: "Tab" }, { action: "key", keys: "Escape" }, { action: "click", index: iGo }, { action: "key", keys: "Tab" }, { action: "key", keys: "Space" }] },
+    (s) => /Space -> NOT DONE: needs confirmation/.test(s));
+  await step("Control+Enter on it is held too", "browser_act", { tabId: tab, actions: [{ action: "key", keys: " Control+Enter " }], state: "none" }, (s) => /NOT DONE: needs confirmation/.test(s));
+  await step("the guard can be turned off in the settings", "browser_act", { tabId: tab, actions: [{ action: "click", index: iGo }, { action: "click", index: iDel }] }, (s) => /all actions done/.test(s), { ...KEY, browserConfirm: "off" });
+
+  // --- scrolling, reading ---
+  await step("scroll to text", "browser_act", { tabId: tab, actions: [{ action: "scroll", to: "text", text: "Section two" }] }, (s) => /scrolled to "Section two"/.test(s) && /Bottom button/.test(s));
+  await step("scroll to top", "browser_act", { tabId: tab, actions: [{ action: "scroll", to: "top" }] }, (s) => /Scroll: 0 px above/.test(s));
+  await step("scope page lists everything", "browser_state", { tabId: tab, scope: "page" }, (s) => /Bottom button/.test(s) && /on the page/.test(s));
+  await step("text mode reads the page as Markdown", "browser_state", { tabId: tab, mode: "text" }, (s) => /# Fixture/.test(s) && /## Section two/.test(s) && /\| Apple \| 1\.20 \|/.test(s) && /\[Next page\]\(http/.test(s));
+  await step("text mode with a selector", "browser_state", { tabId: tab, mode: "text", selector: "table" }, (s) => /\| Pear \| 0\.90 \|/.test(s) && !/Intro paragraph/.test(s));
+
+  // --- navigation ---
+  const snap2 = await call("snapshot for the link", "browser_state", { tabId: tab });
+  const iNext = indexOf(snap2, /<a href="fixture\.html\?page=2">/);
+  await step("clicking a link navigates", "browser_act", { tabId: tab, actions: [{ action: "click", index: iNext }] }, (s) => /now at http.*page=2/.test(s) && /Fixture page 2/.test(s));
+  await step("back and forward", "browser_act", { tabId: tab, actions: [{ action: "back" }, { action: "forward" }, { action: "back" }] }, (s) => /all actions done/.test(s) && /Tab #\d+ - Fixture page\n/.test(s));
+  await step("goto and wait for text", "browser_act", { tabId: tab, actions: [{ action: "goto", url: location.origin + "/test/fixture.html?page=2" }, { action: "wait", text: "Section two", seconds: 5 }] }, (s) => /found/.test(s) && /Fixture page 2/.test(s));
+  await call("reload without a snapshot", "browser_act", { tabId: tab, actions: [{ action: "reload" }], state: "none" });
+  await step("indexes without a snapshot are explained", "browser_act", { tabId: tab, actions: [{ action: "click", index: 3 }] }, (s) => /browser_state first/.test(s));
+
+  // --- screenshots and saved findings (workspace) ---
+  await step("screenshot saved to /workspace", "browser_state", { tabId: tab, mode: "screenshot", path: "shot.png" }, (s) => /saved to \/workspace\/shot\.png/.test(s) && /element numbers drawn/.test(s));
+  await step("save_to collects page text", "browser_state", { tabId: tab, mode: "text", selector: "table", save_to: "notes.md" }, (s) => /saved to \/workspace\/notes\.md/.test(s));
+  await step("browser_run rows saved to a CSV", "browser_run", { tabId: tab, code: "return [...document.querySelectorAll('tr')].slice(1).map(r => ({ item: r.cells[0].innerText, price: Number(r.cells[1].innerText) }))", save_to: "prices.csv" }, (s) => /saved to \/workspace\/prices\.csv: 2 rows/.test(s));
+  await step("the files are in the workspace for run_code", "run_code", { language: "javascript", code: "console.log((await fs.readFile('prices.csv')).trim().replace(/\\n/g, ' / '), (await fs.stat('shot.png')).size > 1000, (await fs.readFile('notes.md')).includes('| Apple | 1.20 |'))" },
+    (s) => /^item,price \/ Apple,1\.2 \/ Pear,0\.9 true true/.test(s));
+
+  // --- site policy ---
+  await step("blocked tabs are hidden from the tab list", "browser_tabs", { action: "list" }, (s) => !/Fixture page/.test(s) && /hidden by the blocked-sites setting/.test(s) && /\(this chat\)/.test(s), { ...KEY, browserBlockSites: "127.0.0.1:" + location.port });
+  await step("a blocked tab cannot be closed", "browser_tabs", { action: "close", tabId: tab }, (s) => /not allowed/.test(s), { ...KEY, browserBlockSites: "127.0.0.1" });
+  const chatTab = Number((/#(\d+)[ *]+CR-BRIDGE-TEST-TITLE/.exec(await call("list for the chat tab", "browser_tabs", { action: "list" })) || [])[1]);
+  await call("snapshot the chat tab", "browser_state", { tabId: chatTab });
+  await step("element numbers are refused on a tab that was not snapshotted", "browser_act", { actions: [{ action: "click", index: 1 }] }, (s) => /last snapshot was of tab #\d+, but this would act on tab #\d+/.test(s));
+  await step("blocked sites are refused", "browser_state", { tabId: tab }, (s) => /not allowed: 127\.0\.0\.1 is on the plugin's blocked sites list/.test(s), { ...KEY, browserBlockSites: "127.0.0.1" });
+  await step("sites outside the allow list are refused", "browser_act", { tabId: tab, actions: [{ action: "scroll", to: "down" }] }, (s) => /not on the plugin's allowed sites list/.test(s), { ...KEY, browserAllowSites: "example.com" });
+  await step("goto to a blocked site is refused", "browser_act", { tabId: tab, actions: [{ action: "goto", url: "https://example.com/" }] }, (s) => /FAILED: not allowed: example\.com/.test(s), { ...KEY, browserBlockSites: "example.com" });
+
+  await call("close the fixture", "browser_tabs", { action: "close", tabId: tab });
   await report({ done: true });
 })();
 </script>

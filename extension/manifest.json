@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "Code Runner Browser Bridge (dev)",
-  "version": "0.1.0",
-  "description": "Development companion for the Code Runner TypingMind plugin. Lets the plugin's browser_run / browser_tabs tools read and script your open tabs. Load unpacked, enable, done.",
-  "permissions": ["tabs", "scripting", "debugger"],
+  "name": "Code Runner Browser Bridge",
+  "version": "0.3.0",
+  "description": "Companion for the Code Runner TypingMind plugin: lets its browser tools read, snapshot and operate your open tabs. Paired to TypingMind with a key.",
+  "permissions": ["tabs", "scripting", "debugger", "storage"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
+  "options_page": "options.html",
   "content_scripts": [
     {
       "matches": ["<all_urls>"],

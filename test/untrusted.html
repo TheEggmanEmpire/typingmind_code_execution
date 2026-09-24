@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Untrusted page</title>
+<!-- Served from a host the extension does not trust: it tries to use the bridge
+     directly and reports what happened. -->
+<script>
+const id = "x" + Math.random();
+addEventListener("message", (e) => {
+  if (!e.data || e.data.__crbRes !== true || e.data.id !== id) return;
+  fetch("/report-untrusted", { method: "POST", body: JSON.stringify(e.data.response) });
+});
+setTimeout(() => postMessage({ __crbReq: true, id, request: { op: "tabs.list", key: "test-key" } }, "*"), 1500);
+</script>

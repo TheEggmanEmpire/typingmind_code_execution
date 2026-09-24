@@ -8,7 +8,7 @@ Lets the AI run code, work with your files and show you the results. 35 language
 | Compiler Explorer (godbolt.org) | c, c++, rust, go, java, kotlin, csharp, fsharp, swift, zig, d, haskell, ocaml, perl, lua, dart, fortran, pascal, crystal, julia, cobol, ada, objc | no | no | no |
 | Wandbox (best effort) | bash, php, scala, nim, elixir | no | no | no |
 
-Six functions:
+Eight functions:
 
 - **run_code** runs a program and returns its output to the AI.
 - **preview_file** shows a file to you as an interactive page: CSV, TSV, JSON, Excel (with a formulas toggle),
@@ -18,9 +18,12 @@ Six functions:
   (PDF, XLSX, ZIP, ...) as a download link.
 - **manage_files** lists, deletes, renames or clears the files in `/workspace` without running code, and exports
   the session as a Jupyter notebook (`export_notebook`).
-- **browser_run** runs JavaScript in one of *your own open browser tabs* and returns the value plus console output:
-  read the page, click, fill forms, scroll, change the view. Needs the companion extension (below).
-- **browser_tabs** lists / activates / opens / closes / reloads / navigates your tabs. Needs the companion extension.
+- **browser_state** looks at one of *your own open tabs*: every visible button, link and field numbered
+  (`[12]<button>Search</button>`), the page's text as Markdown, or a screenshot saved to `/workspace`.
+- **browser_act** operates that tab by those numbers with real mouse and keyboard input: click, type, press keys,
+  pick dropdown options, scroll, navigate, switch tabs, several actions per call.
+- **browser_run** runs custom JavaScript in a tab; **browser_tabs** lists, opens, switches, reloads and closes tabs.
+  The four browser tools need the companion extension (below).
 
 The contents of files you are shown never pass through the AI's context.
 
@@ -42,16 +45,32 @@ file (the `files` parameter) instead of copying it into the code.
 
 ### Browser control (optional, Chrome desktop only)
 
-`run_code` runs in a locked-down sandbox with no access to your tabs. To let the AI read and drive the pages you
-actually have open, load the small companion extension in the [`extension/`](extension/) folder:
+`run_code` runs in a locked-down sandbox with no access to your tabs. To let the AI read and operate the pages you
+actually have open, load the companion extension in the [`extension/`](extension/) folder:
 
 1. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, pick the `extension/` folder.
-2. Reload your TypingMind tab. `browser_run` and `browser_tabs` now work.
+2. Open the extension's options page (**Details -> Extension options**) and copy the **pairing key** into the plugin
+   setting **Browser pairing key**. On a self-hosted or custom TypingMind domain, add it under **Trusted hosts** there.
+3. Reload your TypingMind tab.
 
-It runs the AI's script through the browser's debugger, so it works even on strict-CSP sites and captures the real
-console; Chrome shows a "started debugging" banner while a script runs. It is **Chrome/Chromium desktop only**, and
-while enabled any page you visit can drive your tabs through it, so keep it on only while you need it. See
-[`extension/README.md`](extension/README.md) for details, scope and safety.
+How the AI uses it (the same loop as [nanobrowser](https://github.com/nanobrowser/nanobrowser), with TypingMind's
+model as the agent): `browser_state` shows the page with numbered elements, `browser_act` clicks, types, presses keys,
+selects options, scrolls or navigates by number and returns a fresh snapshot, and so on until the task is done.
+`browser_state` can also return the page as Markdown or save a screenshot (with the element numbers drawn on it)
+into `/workspace`. `save_to` collects what was read, or rows returned by `browser_run`, into a `/workspace` file
+(`.csv`, `.jsonl`, `.json`, `.md`) for analysis with `run_code`.
+
+Safety:
+
+- **Pairing:** the extension only answers pages on its trusted hosts (TypingMind by default) that also send the
+  pairing key, so other websites cannot drive your tabs.
+- **Sites:** **Browser: allowed sites** / **Browser: blocked sites** limit which sites the tools may read or operate,
+  including navigation targets.
+- **Confirmation:** clicks and Enter presses that look like buying, paying, deleting, sending or submitting a
+  password or payment form are held until you approve them in the chat (**Browser: confirm risky actions**).
+- **Untrusted content:** the AI is told to treat page text as data and never follow instructions found in pages.
+- Chrome shows a "started debugging" banner while a click, keystroke or screenshot is sent. Chrome/Chromium desktop
+  only (Chrome 130 or newer). Details in [`extension/README.md`](extension/README.md).
 
 ### Secrets
 
@@ -216,6 +235,9 @@ are out of reach. Lua and PHP stay remote: the in-browser Lua has no file access
 | Keep variables between calls | on | Save Python/R variables and DuckDB tables |
 | Import attached files | on | Save the user's attachments to `/workspace/uploads` |
 | Secrets | - | API keys for code, as environment variables (redacted, never saved) |
+| Browser pairing key | - | The key from the extension's options page; needed for the browser tools |
+| Browser: allowed sites / blocked sites | - | Limit the sites the browser tools may touch |
+| Browser: confirm risky actions | on | Hold buy/pay/delete/send clicks for the user's approval |
 | Offloaded workspace lifetime (minutes) | 1440 | Older offloaded workspaces are not restored |
 | HTTP request timeout (ms) | 30000 | Per request, before fallbacks |
 | Pyodide CDN / sql.js CDN | - | Put a mirror in front of the built-in CDN lists |

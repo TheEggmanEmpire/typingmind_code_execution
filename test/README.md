@@ -59,3 +59,15 @@ CHROME=/path/to/chrome node test/run-browser-e2e.js
 ```
 
 Needs a Chrome/Chromium that supports unpacked extensions in `--headless=new` (Chrome 130+).
+
+### Browser tools (companion extension)
+
+```sh
+node test/run-browser-e2e.js        # needs Chrome for Testing / Chromium (Playwright's is found automatically)
+```
+
+Loads a copy of `extension/` with a test pairing key and drives `browser_tabs`, `browser_run`, `browser_state` and
+`browser_act` from a sandboxed iframe against `test/fixture.html`: pairing (missing and wrong key, an untrusted host
+refused even with the key), the numbered snapshot, typing, dropdowns, clicks, key combos, the risky-action guard,
+scrolling, Markdown reading, navigation, screenshots and `save_to` into `/workspace`, and the site allow/block lists.
+

@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture page</title>
+<!-- A page for the browser tool tests: fields, a dropdown, buttons (one risky),
+     an Enter-to-submit form, a table and content far below the fold. -->
+<style>body { font: 15px sans-serif; margin: 20px; } .far { margin-top: 2400px; }</style>
+<h1>Fixture</h1>
+<p>Intro paragraph for reading.</p>
+<label>Name <input id="name" name="name" placeholder="Your name"></label>
+<select id="color" name="color"><option value="r">Red</option><option value="g">Green</option><option value="b">Blue</option></select>
+<button id="go" onclick="document.getElementById('out').textContent = 'clicked ' + (++window.n || (window.n = 1)) + ' ' + document.getElementById('name').value + ' ' + document.getElementById('color').value">Go</button>
+<button id="del" onclick="document.getElementById('out').textContent = 'deleted'">Delete account</button>
+<form id="f" onsubmit="event.preventDefault(); document.getElementById('out').textContent = 'submitted ' + this.q.value"><input name="q" placeholder="Search"><button type="button">Help</button></form>
+<a href="fixture.html?page=2">Next page</a>
+<p id="out">idle</p>
+<table><tr><th>Item</th><th>Price</th></tr><tr><td>Apple</td><td>1.20</td></tr><tr><td>Pear</td><td>0.90</td></tr></table>
+<div class="far"><h2>Section two</h2><p>Far below the fold.</p><button id="bottom">Bottom button</button></div>
+<script>if (location.search.includes("page=2")) document.title = "Fixture page 2";</script>
