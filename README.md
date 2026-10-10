@@ -100,6 +100,9 @@ through public proxies. Values shorter than 6 characters are refused.
 
 ### Recommended setup (5 minutes, free)
 
+For local REA tools through a WSL MCP connector, including access from mobile over Tailscale,
+see [REA setup for TypingMind](docs/rea-typingmind-wsl.md).
+
 Deploy the small companion Cloudflare Worker from the `worker/` folder of this plugin's repository
 (see `worker/README.md`), then set:
 
