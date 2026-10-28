@@ -14,7 +14,7 @@
 //
 // Every reply is { ok: true, ... } or { ok: false, error, code? }.
 
-const VERSION = "0.4.1";
+const VERSION = "0.4.2";
 const DEFAULT_TRUSTED = ["typingmind.com", "*.typingmind.com"];
 
 // ---- settings: trusted hosts -----------------------------------------------------
@@ -105,16 +105,13 @@ function tabView(t) {
 
 async function handle(req, sender, depth, ancestors) {
   const auth = await authorize(req, sender);
-  // Only a frame whose every ancestor is a trusted page (where TypingMind runs its
-  // plugins, possibly inside its own wrapper frames) may use the bridge: not the
-  // page itself, and not frames nested inside an opaque plugin frame (rendered
-  // previews, charts), whose parent origin reads "null".
+  // Any frame inside a trusted page may use the bridge, but not the page itself.
+  // TypingMind's plugin frame sits behind sandboxed wrapper frames, so a stricter
+  // frame-position check cannot tell it apart from previews nested inside it.
   const frame = { depth, ancestors: Array.isArray(ancestors) ? ancestors.map(String).slice(0, 20) : [] };
-  const s = await settings();
-  const ancestorsTrusted = frame.ancestors.length === depth && frame.ancestors.every((o) => { const h = hostOf(o); return !!h && s.hosts.some((p) => hostMatches(h, p)); });
-  if (auth.trusted && !(depth === 1 || (depth > 1 && ancestorsTrusted))) auth.trusted = false, auth.nested = true;
+  if (auth.trusted && !(depth >= 1)) auth.trusted = false, auth.nested = true;
   if (req.op === "ping") return { ok: true, version: VERSION, trusted: auth.trusted, nested: !!auth.nested, host: auth.host, frame };
-  if (auth.nested) return { ok: false, code: "untrusted", error: "only the plugin frame itself may use the Code Runner bridge (this request came from a frame nested inside it, or from the page; frame depth " + depth + ", ancestors " + JSON.stringify(frame.ancestors) + ")." };
+  if (auth.nested) return { ok: false, code: "untrusted", error: "only frames inside the page may use the Code Runner bridge, not the page itself (frame depth " + depth + ", ancestors " + JSON.stringify(frame.ancestors) + ")." };
   if (!auth.trusted) return { ok: false, code: "untrusted", error: "this page (" + (auth.host || "unknown") + ") is not a trusted host of the Code Runner bridge. Add it on the extension's options page." };
   const policy = req.policy || null;
 

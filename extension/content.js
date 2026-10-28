@@ -21,8 +21,8 @@
     if (!d || d.__crbReq !== true || typeof d.id !== "string") return;
     // Only messages a frame posts to itself (the plugin posts to its own window).
     if (e.source !== window) return;
-    // How deep this frame sits: TypingMind runs plugins in frames placed directly
-    // in its page; anything nested deeper (previews, charts, ads) is refused.
+    // How deep this frame sits (the page itself, depth 0, is refused) and its
+    // ancestor origins, reported back in diagnostics.
     var depth = 0, w = window;
     try { while (w !== w.top && depth < 20) { w = w.parent; depth++; } } catch (x) { depth = 99; }
     var ancestors = [];

@@ -64,7 +64,7 @@ const KEY = {};
   await check("an untrusted page is refused", JSON.stringify(u), (s) => /"code":"untrusted"/.test(s) && !/"tabs"/.test(s));
   await call("close the untrusted page", "browser_tabs", { action: "close", tabId: untrustedTab });
 
-  // --- a frame nested inside the plugin frame (e.g. a rendered preview) cannot use the bridge ---
+  // --- a frame nested inside the plugin frame is answered (TypingMind wraps its plugin frame) ---
   const nested = await new Promise((resolve) => {
     const f = document.createElement("iframe");
     f.setAttribute("sandbox", "allow-scripts");
@@ -75,7 +75,7 @@ const KEY = {};
     setTimeout(() => { removeEventListener("message", on); f.remove(); resolve({ timeout: true }); }, 8000);
     document.body.appendChild(f);
   });
-  await check("a frame nested inside the plugin frame is refused", JSON.stringify(nested), (s) => /"code":"untrusted"/.test(s) && /nested/.test(s) && !/"tabs"/.test(s));
+  await check("a frame nested inside the plugin frame is answered", JSON.stringify(nested), (s) => /"ok":true/.test(s) && /"tabs"/.test(s));
 
   // --- a plugin frame inside a trusted wrapper frame (TypingMind's own nesting) can use the bridge ---
   const wrapped = await new Promise((resolve) => {

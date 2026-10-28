@@ -56,10 +56,11 @@ plugin (sandboxed iframe) --window.postMessage--> content.js (same frame) --chro
 
 ## Safety
 
-- **Trusted hosts and frame level:** only a frame placed directly in a trusted page (where TypingMind runs its
-  plugins) is answered. Other websites, pages being automated, the TypingMind page itself and anything nested
-  deeper (the plugin's rendered previews and charts) are refused. Other plugins' HTML outputs sit at the plugin
-  level and could use the bridge; install only plugins you trust.
+- **Trusted hosts:** only frames inside a trusted page (where TypingMind runs its plugins) are answered. Other
+  websites, pages being automated and the TypingMind page itself are refused. **Frames nested inside the plugin
+  (rendered previews and charts) and other plugins' HTML outputs can also use the bridge**: TypingMind wraps its
+  plugin frame in sandboxed frames, so the plugin cannot be told apart from content nested in it by position.
+  Preview only content you trust, and install only plugins you trust.
 - **Site policy:** the plugin settings **Browser: allowed sites** / **blocked sites** are sent with each request and
   enforced here, including `goto`, `open_tab`, `switch_tab` and pages reached by clicks.
 - **Confirmation:** clicks and Enter presses whose element, form or text suggests buying, paying, deleting,
