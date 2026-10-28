@@ -77,6 +77,18 @@ const KEY = {};
   });
   await check("a frame nested inside the plugin frame is refused", JSON.stringify(nested), (s) => /"code":"untrusted"/.test(s) && /nested/.test(s) && !/"tabs"/.test(s));
 
+  // --- a plugin frame inside a trusted wrapper frame (TypingMind's own nesting) can use the bridge ---
+  const wrapped = await new Promise((resolve) => {
+    const f = document.createElement("iframe");
+    const inner2 = "<script>const id='w'+Math.random();addEventListener('message',(e)=>{if(e.data&&e.data.__crbRes&&e.data.id===id)parent.parent.postMessage({wrappedResult:e.data.response},'*')});setTimeout(()=>postMessage({__crbReq:true,id,request:{op:'tabs.list'}},'*'),800)<\/script>";
+    f.srcdoc = "<iframe sandbox='allow-scripts' srcdoc=\"" + inner2.replace(/"/g, "&quot;") + "\"></iframe>";
+    const on = (e) => { if (e.data && e.data.wrappedResult) { removeEventListener("message", on); f.remove(); resolve(e.data.wrappedResult); } };
+    addEventListener("message", on);
+    setTimeout(() => { removeEventListener("message", on); f.remove(); resolve({ timeout: true }); }, 8000);
+    document.body.appendChild(f);
+  });
+  await check("a plugin frame inside a trusted wrapper frame is answered", JSON.stringify(wrapped), (s) => /"ok":true/.test(s) && /"tabs"/.test(s));
+
   // --- snapshot, typing, clicking, dropdowns, keys ---
   const o = await call("open the fixture", "browser_tabs", { action: "open", url: location.origin + "/test/fixture.html", active: true });
   const tab = Number((/tab #(\d+)/.exec(o) || [])[1]);
