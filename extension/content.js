@@ -25,8 +25,10 @@
     // in its page; anything nested deeper (previews, charts, ads) is refused.
     var depth = 0, w = window;
     try { while (w !== w.top && depth < 20) { w = w.parent; depth++; } } catch (x) { depth = 99; }
+    var ancestors = [];
+    try { ancestors = Array.prototype.slice.call(location.ancestorOrigins || []); } catch (x) {}
     try {
-      chrome.runtime.sendMessage({ type: "crb", request: d.request, depth: depth }, function (resp) {
+      chrome.runtime.sendMessage({ type: "crb", request: d.request, depth: depth, ancestors: ancestors }, function (resp) {
         var err = chrome.runtime.lastError;
         window.postMessage({
           __crbRes: true,

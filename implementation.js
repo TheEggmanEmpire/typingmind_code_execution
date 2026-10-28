@@ -3516,7 +3516,7 @@ function browserFinish(md, ctx) {
 async function browserCall(ctx, request, timeoutMs) {
   const pong = await browserBridgeCall({ op: "ping" }, BROWSER_PING_MS);
   if (!pong || !pong.ok) return { ok: false, error: BROWSER_INSTALL_HINT, setup: true };
-  if (pong.nested) return { ok: false, error: "The browser tools only work from the plugin itself, not from content nested inside it.", setup: true };
+  if (pong.nested) return { ok: false, error: "The browser tools only work from the plugin itself, not from content nested inside it." + (pong.frame ? " (Bridge saw frame depth " + pong.frame.depth + ", ancestor origins " + JSON.stringify(pong.frame.ancestors || []) + "; TypingMind runs plugins at depth 1.)" : ""), setup: true };
   if (pong.trusted === false) return { ok: false, error: "The browser bridge does not trust this page (" + (pong.host || "unknown host") + "). Add it under \"Trusted hosts\" on the extension's options page (chrome://extensions -> Code Runner Browser Bridge -> Details -> Extension options).", setup: true };
   const r = await browserBridgeCall({ ...request, policy: ctx.bs.policy, confirmRisky: ctx.bs.confirmRisky, highlight: request.highlight == null ? ctx.bs.highlight : request.highlight }, timeoutMs || BROWSER_CALL_MS);
   if (r && r.error === "__timeout") return { ok: false, error: "the extension did not answer in time. The page may be busy or still loading; try again, or reload the TypingMind tab." };

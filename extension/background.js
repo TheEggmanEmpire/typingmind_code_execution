@@ -73,7 +73,7 @@ function checkUrl(url, policy) {
 // ---- messaging ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.type !== "crb") return;
-  handle(msg.request || {}, sender, msg.depth)
+  handle(msg.request || {}, sender, msg.depth, msg.ancestors)
     .then((r) => sendResponse(r))
     .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e), code: e && e.code }));
   return true; // async sendResponse
@@ -103,14 +103,15 @@ function tabView(t) {
   return { id: t.id, windowId: t.windowId, index: t.index, active: t.active, url: t.url || t.pendingUrl || "", title: t.title || "", status: t.status };
 }
 
-async function handle(req, sender, depth) {
+async function handle(req, sender, depth, ancestors) {
   const auth = await authorize(req, sender);
   // Only a frame placed directly in the trusted page (where TypingMind runs its
   // plugins) may use the bridge: not the page itself, not frames nested deeper
   // (rendered previews, charts, embedded content).
   if (auth.trusted && depth !== 1) auth.trusted = false, auth.nested = true;
-  if (req.op === "ping") return { ok: true, version: VERSION, trusted: auth.trusted, nested: !!auth.nested, host: auth.host };
-  if (auth.nested) return { ok: false, code: "untrusted", error: "only the plugin frame itself may use the Code Runner bridge (this request came from a frame nested inside it, or from the page)." };
+  const frame = { depth, ancestors: Array.isArray(ancestors) ? ancestors.map(String).slice(0, 20) : [] };
+  if (req.op === "ping") return { ok: true, version: VERSION, trusted: auth.trusted, nested: !!auth.nested, host: auth.host, frame };
+  if (auth.nested) return { ok: false, code: "untrusted", error: "only the plugin frame itself may use the Code Runner bridge (this request came from a frame nested inside it, or from the page; frame depth " + depth + ", ancestors " + JSON.stringify(frame.ancestors) + ")." };
   if (!auth.trusted) return { ok: false, code: "untrusted", error: "this page (" + (auth.host || "unknown") + ") is not a trusted host of the Code Runner bridge. Add it on the extension's options page." };
   const policy = req.policy || null;
 
