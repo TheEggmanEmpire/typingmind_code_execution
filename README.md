@@ -53,6 +53,10 @@ actually have open, load the companion extension in the [`extension/`](extension
 2. Reload your TypingMind tab. On a self-hosted or custom TypingMind domain, first add that host under
    **Trusted hosts** on the extension's options page (**Details -> Extension options**).
 
+After pulling a new version, press the extension's reload icon and check the version on its card. If the browser
+tools still fail with "only work from the plugin itself", Chrome is running an old copy: see
+[Troubleshooting](extension/README.md#troubleshooting).
+
 How the AI uses it (the same loop as [nanobrowser](https://github.com/nanobrowser/nanobrowser), with TypingMind's
 model as the agent): `browser_state` shows the page with numbered elements, `browser_act` clicks, types, presses keys,
 selects options, scrolls or navigates by number and returns a fresh snapshot, and so on until the task is done.
@@ -63,10 +67,10 @@ screenshot (with the numbers drawn on it) into `/workspace`. `save_to` collects 
 
 Safety:
 
-- **Trusted hosts:** the extension only answers the plugin frame of pages on its trusted hosts (TypingMind by
-  default), so other websites cannot drive your tabs, and neither can content nested inside the plugin (rendered
-  previews, charts). No setup is needed on typingmind.com. Other plugins' HTML output on TypingMind sits at the
-  same level as this plugin and could use the bridge too; install only plugins you trust.
+- **Trusted hosts:** the extension only answers frames inside pages on its trusted hosts (TypingMind by default), so
+  other websites cannot drive your tabs. No setup is needed on typingmind.com. TypingMind wraps the plugin in
+  sandboxed frames, so content nested inside it (rendered previews, charts) and other plugins' HTML output can use
+  the bridge too; preview only content you trust and install only plugins you trust.
 - **Sites:** **Browser: allowed sites** / **Browser: blocked sites** limit which sites the tools may read or operate,
   including navigation targets.
 - **Confirmation:** clicks and Enter presses that look like buying, paying, deleting, sending or submitting a

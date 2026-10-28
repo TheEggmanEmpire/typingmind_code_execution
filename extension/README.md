@@ -25,6 +25,30 @@ this extension provides the eyes and hands. `page-agent.js` is an independent, c
 
 After editing the extension, press its reload icon in `chrome://extensions`, then reload the TypingMind tab.
 
+## Troubleshooting
+
+- **"The browser tools only work from the plugin itself, not from content nested inside it."** Chrome is running
+  an extension older than 0.4.2. Versions 0.4.0 and 0.4.1 refused TypingMind's real plugin frame, which sits behind
+  sandboxed wrapper frames. Update and reload as below.
+- **Updated, but nothing changed.** Chrome runs the copy in the folder it was loaded from, not your repository.
+  Open **Details** on the extension card and check **Source**. A common trap on Windows with WSL: `git pull` runs
+  in WSL while Chrome loads a separate `C:\...` copy. Either copy the folder over
+  (`cp -r ~/path/to/repo/extension/. /mnt/c/path/to/extension/`) or remove the extension and **Load unpacked**
+  straight from `\\wsl$\<distro>\home\<you>\...\extension`. Then press reload and check that the card shows the
+  new version.
+- **Self-diagnosis from the chat.** Models tend to reword errors and drop the details. Ask:
+
+  ```
+  Diagnostic only, do not summarize or reword anything.
+  1. Call the browser_tabs tool with {"action": "list"}.
+  2. Reply with ONLY the exact, complete text the tool returned, inside a code block, character for character.
+  3. Then state the exact tool name you called and the exact arguments you passed.
+  ```
+
+  "not responding" means the extension is missing or disabled; "does not trust this page" means the host needs
+  adding under **Trusted hosts**; a refusal that ends without "(Bridge saw frame depth ...)" means an old extension.
+- After any update: reload the extension, then reload the TypingMind tab.
+
 ## Try it
 
 - "What's on my active tab?" -> `browser_state {}`
