@@ -134,6 +134,29 @@ routes.push(async (url, init) => {
   }
 });
 
+// OmniRoute image routes.
+const PNG = new Uint8Array(40000).map((_, i) => i < 8 ? [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a][i] : (i * 7) % 251);
+const imgB64 = Buffer.from(PNG).toString("base64");
+const IMG = { codex: "ok", chatgpt: "ok", polls: 0, last: {} };
+routes.push(async (url, init) => {
+  if (url === "https://files.test/photo.png") return new Response(PNG);
+  if (url === "https://wrapper.test/s/signed") return new Response(PNG, { headers: { "content-type": "image/png" } });
+  if (url.startsWith("https://wrapper.test/api/jobs/")) { count("img:job"); return text("no"); }
+  if (url.endsWith("/api/v1/responses")) {
+    count("img:codex"); IMG.last.codex = JSON.parse(init.body); IMG.last.auth = init.headers.Authorization;
+    if (IMG.codex === "down") return text("upstream broke", 500);
+    if (IMG.codex === "sentinel") return text(JSON.stringify({ output: [{ type: "message", content: [{ text: "NO REFERENCE IMAGE" }] }] }));
+    return text(JSON.stringify({ output: [{ type: "image_generation_call", result: imgB64 }] }));
+  }
+  if (url.endsWith("/api/v1/chat/completions")) {
+    count("img:chatgpt"); IMG.last.chatgpt = JSON.parse(init.body);
+    if (IMG.chatgpt === "down") return text("nope", 503);
+    if (IMG.chatgpt === "sentinel") return text(JSON.stringify({ choices: [{ message: { content: "NO REFERENCE IMAGE" } }] }));
+    if (IMG.chatgpt === "poll" && IMG.polls++ < 2) return text(JSON.stringify({ choices: [{ message: { content: "Your image is being generated" } }] }));
+    return text(JSON.stringify({ choices: [{ message: { content: "see https://wrapper.test/api/jobs/1 and https://wrapper.test/s/signed" } }] }));
+  }
+});
+
 // Compiler Explorer and Wandbox.
 let ceLast = null, ceRetired = new Set(), ceDown = false, wbDown = false;
 routes.push(async (url, init) => {
@@ -185,7 +208,7 @@ globalThis.crossOriginIsolated = false;
 
 // --- plugin ---------------------------------------------------------------------
 const src = fs.readFileSync(path.join(__dirname, "..", "implementation.js"), "utf8");
-vm.runInThisContext(src + "\nglobalThis.run_code = run_code; globalThis.serve_file = serve_file; globalThis.preview_file = preview_file; globalThis.manage_files = manage_files; globalThis.__cr_packBytes = packBytes; globalThis.__cr_b64 = bytesToBase64;", { filename: "implementation.js" });
+vm.runInThisContext(src + "\nglobalThis.run_code = run_code; globalThis.serve_file = serve_file; globalThis.preview_file = preview_file; globalThis.manage_files = manage_files; globalThis.make_image = make_image; globalThis.edit_image = edit_image; globalThis.__cr_packBytes = packBytes; globalThis.__cr_b64 = bytesToBase64;", { filename: "implementation.js" });
 
 let prev;
 function freshSandbox() {
@@ -499,6 +522,44 @@ const big = { stateLimitKB: "500" };   // keep test workspaces inline unless a t
   check("gofile down: litterbox, which expires", await serve({ path: "share.csv", share: "auto" }, { ...big, shareExpiry: "24h" }), (s) => /litter\.catbox\.moe/.test(s) && /deletes itself after 24h/.test(s) && /cannot be deleted by hand/.test(s));
   globalThis.__gofileDown = false;
   check("pandas to_excel installs openpyxl", await run("python", "import pandas as pd\npd.DataFrame({'a': [1, 2]}).to_excel('t.xlsx', index=False)\nprint(pd.read_excel('t.xlsx')['a'].sum())", {}, big), (s) => /^3/.test(s));
+
+  // 13b. make_image / edit_image --------------------------------------------------------------------
+  {
+    const key = "omni-secret-key-123";
+    const ok = { secrets: "OMNIROUTE_API_KEY=" + key };
+    const photo = { userMessage: { attachments: [{ url: "https://files.test/photo.png", name: "photo.png", type: "image/png" }] } };
+    const img = async (fn, params, settings = ok, extra = {}) => { freshSandbox(); globalThis.__crImagePollMs = 1; const out = await fn(params, settings, { previousRunOutput: prev, ...extra }); prev = out; return out; };
+    const shown = (s) => /!\[generated image\]\(data:image\/png;base64,/.test(s);
+    const noLeak = (s) => !s.includes(key) && !s.includes("Bearer");
+    prev = undefined;
+    check("missing key gives a setup message", await img(make_image, { prompt: "x" }, {}), (s) => /OMNIROUTE_API_KEY/.test(s) && /no image was made/.test(s));
+    check("missing prompt is explained", await img(make_image, {}), (s) => /No `prompt`/.test(s));
+    check("edit_image with nothing to edit refuses", await img(edit_image, { prompt: "x" }), (s) => /no image to edit/.test(s) && !hits["img:codex"]);
+    check("generate through codex", await img(make_image, { prompt: "a lighthouse" }), (s) => shown(s) && /cx\/gpt-6\.1-sol/.test(s) && /image_1\.png/.test(s) && noLeak(s));
+    check("generation sends no image and the key as a bearer", IMG.last, (s, raw) => IMG.last.codex.input[0].content.length === 1 && IMG.last.auth === "Bearer " + key);
+    const big = await img(make_image, { prompt: "edit" }, ok, photo);
+    check("attached photo over the inline limit is edited with no store", big, (s) => shown(s) && /Edited uploads\/photo\.png/.test(s.replace(/\\/g, "")));
+    check("the attachment reached the model as a data URL", 1, () => IMG.last.codex.input[0].content[1].image_url.startsWith("data:image/png;base64,") && /NO REFERENCE IMAGE/.test(IMG.last.codex.input[0].content[0].text));
+    prev = undefined;
+    await img(make_image, { prompt: "new", src: "none" }, ok, photo);
+    check("src none ignores the attachment", 1, () => IMG.last.codex.input[0].content.length === 1);
+    await img(edit_image, { prompt: "now blue" });
+    check("edit_image follows up on the last result", 1, () => IMG.last.codex.input[0].content.length === 2);
+    await img(edit_image, { prompt: "x", src: "https://files.test/photo.png" });
+    check("an https source goes to codex as a URL", 1, () => IMG.last.codex.input[0].content[1].image_url === "https://files.test/photo.png");
+    check("unknown src does not generate", await img(edit_image, { prompt: "x", src: "nope.png" }), (s) => /nope\.png` was not found/.test(s) && !shown(s));
+    IMG.codex = "down";
+    const jobsBefore = hits["img:job"] || 0;
+    check("falls back to chatgpt and reports why", await img(make_image, { prompt: "y" }), (s) => shown(s) && /chatgpt_web\/chatgpt_image/.test(s) && /codex: HTTP 500/.test(s));
+    check("job links are never followed", 1, () => (hits["img:job"] || 0) === jobsBefore);
+    IMG.chatgpt = "poll"; IMG.polls = 0;
+    check("chatgpt is polled while generating", await img(make_image, { prompt: "y" }), (s) => shown(s) && IMG.polls === 3);
+    IMG.codex = "sentinel"; IMG.chatgpt = "sentinel";
+    check("a source that never arrived is a failure", await img(edit_image, { prompt: "x", src: "https://files.test/photo.png" }), (s) => !shown(s) && /did not reach the model/.test(s) && /Stop here/.test(s) && noLeak(s));
+    IMG.codex = "ok"; IMG.chatgpt = "down";
+    check("route order setting", await img(make_image, { prompt: "y" }, { ...ok, imageRoutes: "broken,codex" }), (s) => shown(s) && /broken: unknown route/.test(s));
+    IMG.chatgpt = "ok"; prev = undefined;
+  }
 
   // 14. Never throws, always explains --------------------------------------------------------------
   check("null params", await run_code(null, null, null), (s) => /No code was provided/.test(s));

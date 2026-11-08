@@ -20,7 +20,7 @@ const sandbox = {};
 vm.createContext(sandbox);
 vm.runInContext(code + "\n;globalThis.__langs = { all: ALL_LANGS, ce: Object.keys(CE_LANGS), wb: Object.keys(WB_LANGS), local: LOCAL_LANGS };", sandbox);
 const { all: LANGS, ce: CE, wb: WB } = sandbox.__langs;
-for (const fn of ["run_code", "serve_file", "preview_file", "manage_files", "browser_run", "browser_tabs", "browser_state", "browser_act"]) {
+for (const fn of ["run_code", "serve_file", "preview_file", "manage_files", "browser_run", "browser_tabs", "browser_state", "browser_act", "make_image", "edit_image"]) {
   if (vm.runInContext("typeof " + fn, sandbox) !== "function") throw new Error(fn + " is not defined in implementation.js");
 }
 
@@ -182,9 +182,39 @@ const manageFilesSpec = {
   }
 };
 
+const imageParams = (srcDoc) => ({
+  type: "object",
+  properties: {
+    prompt: { type: "string", description: "What the image should show. For an edit write: Change: <what to change>. Preserve: <what must stay the same>." },
+    src: { type: "string", description: srcDoc },
+    out: { type: "string", description: "Optional /workspace file name for the result. Default image_N.png." },
+    share: { type: "string", enum: ["auto", "catbox", "gofile", "litterbox"], description: "Optional: also upload the result to a public host and show a link. Only when the user asks for a link." }
+  },
+  required: ["prompt"]
+});
+
+const makeImageSpec = {
+  name: "make_image",
+  description:
+    "Use this for ANY request to create, draw or generate an image, including with a text-only model. One call does everything: it reads any attached photo, makes the image and shows it in the chat. " +
+    "If the user's latest message has an attached image, that image is edited; to ignore it and create something new, pass src: \"none\". For changing an existing image prefer edit_image. " +
+    "Do not view or describe an image first. Do not use MCP tools, other models or run_code for images. Do not call it again after a failure: report the error to the user.",
+  parameters: imageParams("Optional source image to edit: a file such as uploads/photo.jpg, or an https URL. Omit to use the image attached to the latest message, if any. \"none\" forces a new image from the prompt alone.")
+};
+
+const editImageSpec = {
+  name: "edit_image",
+  description:
+    "Use this for ANY request to edit, change, retouch, clean up, restyle or remove something from an existing image, including with a text-only model. One call does everything: it finds the image, edits it and shows it in the chat. " +
+    "With no src it uses the image attached to the latest message, otherwise the last generated image or last upload, so follow-ups such as 'now make it blue' need no src. " +
+    "Do not view or describe the image first. Do not use MCP tools, other models or run_code for images. Do not call it again after a failure: report the error to the user.",
+  parameters: imageParams("Optional image to edit: a file such as uploads/photo.jpg, or an https URL. Omit to use the attached image, or the last result.")
+};
+
 // Always in the model's context while the plugin is enabled: how to use the tools well.
 const USAGE_GUIDE = [
-  "Code Runner tools: run_code, preview_file, serve_file, manage_files.",
+  "Code Runner tools: run_code, preview_file, serve_file, manage_files, make_image, edit_image.",
+  "- Images: for ANY request to create an image call make_image; to edit, retouch or restyle one call edit_image. One short call does everything and shows the result; text-only models are fine. Never view or describe the image first, never use MCP tools, other models or run_code for images, and after a failure report the error instead of trying other routes.",
   "- Work in steps. /workspace files, Python and R variables, DuckDB tables and JavaScript storage persist between run_code calls, so load data once and reuse it; pass reset: true to start clean.",
   "- Files the user attaches to their message are saved to /workspace/uploads/<name> automatically; check with manage_files (action list) when unsure what exists.",
   "- Data the user pastes as text: pass it in run_code `files` instead of embedding it in code.",
@@ -279,6 +309,8 @@ const userSettings = [
   { name: "publicProxies", label: "Allow public CORS proxies", description: "Default on. Requests to sites that block browsers are retried through public CORS proxies (never requests carrying keys, tokens or passwords). Set \"off\" for a private-only setup: only your personal proxy is used.", placeholder: "on", required: false },
   { name: "keepVariables", label: "Keep variables between calls", description: "Default on. Python and R variables, functions and imports, and DuckDB tables are saved with the workspace and restored in the next call. Set \"off\" to start every call with a clean interpreter (files still persist).", placeholder: "on", required: false },
   { name: "secrets", label: "Secrets (API keys for code)", type: "password", description: "Optional. API keys the code may use, as NAME=value pairs separated by semicolons (or a JSON object). They become environment variables (os.environ in Python, Sys.getenv in R, ENV in Ruby, `env` in JavaScript), are replaced by [secret NAME] in anything the AI reads, are never saved with the workspace, and requests carrying them never go through public proxies.", placeholder: "OPENAI_API_KEY=sk-...; GITHUB_TOKEN=ghp_...", required: false },
+  { name: "imageRoutes", label: "Images: route order", description: "Optional. Default codex,chatgpt: which OmniRoute routes make_image and edit_image try, in order. They need the secret OMNIROUTE_API_KEY.", placeholder: "codex,chatgpt", required: false },
+  { name: "imageApiBase", label: "Images: OmniRoute API base", description: "Optional. Base URL of the OmniRoute API used by make_image and edit_image.", placeholder: "https://omniroute.example/api/v1", required: false },
   { name: "browserAllowSites", label: "Browser: allowed sites", description: "Optional. If set, the browser tools may only read or operate tabs on these sites (comma-separated, subdomains included, e.g. github.com, *.wikipedia.org).", required: false },
   { name: "browserBlockSites", label: "Browser: blocked sites", description: "Optional. The browser tools never read or operate tabs on these sites (comma-separated, e.g. mybank.com, mail.google.com).", required: false },
   { name: "browserHighlight", label: "Browser: show element numbers", description: "Default on. Like nanobrowser, the numbered boxes the AI works with are drawn on the page itself after each look (browser_state, browser_act), and on screenshots. Set \"off\" to hide them.", placeholder: "on", required: false },
@@ -313,7 +345,9 @@ const plugin = {
     { id: "browser-state-fn-fa4fdbb3", name: "browser_state", implementationType: "javascript", openaiSpec: browserStateSpec, code, outputType: "respond_to_ai" },
     { id: "browser-act-fn-fa4fdbb3", name: "browser_act", implementationType: "javascript", openaiSpec: browserActSpec, code, outputType: "respond_to_ai" },
     { id: "preview-file-fn-fa4fdbb3", name: "preview_file", implementationType: "javascript", openaiSpec: previewFileSpec, code, outputType: "render_html" },
-    { id: "manage-files-fn-fa4fdbb3", name: "manage_files", implementationType: "javascript", openaiSpec: manageFilesSpec, code, outputType: "respond_to_ai" }
+    { id: "manage-files-fn-fa4fdbb3", name: "manage_files", implementationType: "javascript", openaiSpec: manageFilesSpec, code, outputType: "respond_to_ai" },
+    { id: "make-image-fn-fa4fdbb3", name: "make_image", implementationType: "javascript", openaiSpec: makeImageSpec, code, outputType: "render_markdown" },
+    { id: "edit-image-fn-fa4fdbb3", name: "edit_image", implementationType: "javascript", openaiSpec: editImageSpec, code, outputType: "render_markdown" }
   ],
   overviewMarkdown
 };

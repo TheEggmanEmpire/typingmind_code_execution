@@ -8,7 +8,7 @@ Lets the AI run code, work with your files and show you the results. 35 language
 | Compiler Explorer (godbolt.org) | c, c++, rust, go, java, kotlin, csharp, fsharp, swift, zig, d, haskell, ocaml, perl, lua, dart, fortran, pascal, crystal, julia, cobol, ada, objc | no | no | no |
 | Wandbox (best effort) | bash, php, scala, nim, elixir | no | no | no |
 
-Eight functions:
+Ten functions:
 
 - **run_code** runs a program and returns its output to the AI.
 - **preview_file** shows a file to you as an interactive page: CSV, TSV, JSON, Excel (with a formulas toggle),
@@ -17,6 +17,7 @@ Eight functions:
 - **serve_file** shows a file in the chat: images inline, small text as a code block, anything else
   (PDF, XLSX, ZIP, ...) as a download link. With `share` it uploads the file and returns a public link plus a
   deletion link (see Sharing files).
+- **make_image** and **edit_image** create or edit an image in one call and show it in the chat (see Images).
 - **manage_files** lists, deletes, renames or clears the files in `/workspace` without running code, and exports
   the session as a Jupyter notebook (`export_notebook`).
 - **browser_state** looks at one of *your own open tabs*: every visible button, link and field numbered
@@ -93,6 +94,17 @@ link where the host allows deleting:
 With the companion Worker (personal CORS proxy set to it), every deletable upload gets a real **deletion link**: a
 page on your Worker with a Delete button (a link preview cannot delete anything). Without it, ask the AI to remove the
 shared file (`manage_files` with `unshare`); `manage_files` with `shares` lists what was shared from the chat.
+
+### Images
+
+`make_image` creates an image and `edit_image` changes one. Add `OMNIROUTE_API_KEY=<key>` to **Secrets**; nothing else is needed, and
+no Workspace store is required, because the source is read inside the same call. Routes, in order: OmniRoute Codex, then ChatGPT web.
+The caption names the model that made the image and any route that failed first.
+
+The source is `src` (a `/workspace` or `uploads/` file, or an https URL), otherwise the image attached to the latest message.
+`make_image` with no source generates from the prompt; `src: "none"` forces that even when a photo is attached. `edit_image` also
+falls back to the last generated image or the last upload, and refuses when there is nothing to edit. A route that reports it
+received no source image counts as failed, so a picture made without your photo is never passed off as an edit.
 
 ### Secrets
 

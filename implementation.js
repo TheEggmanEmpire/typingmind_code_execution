@@ -3441,6 +3441,238 @@ async function serve_file(params, userSettings, resources) {
 }
 
 // ---------------------------------------------------------------------------
+// make_image / edit_image: one call from prompt to picture in the chat, through
+// OmniRoute. Plain fetch on the plugin thread (OmniRoute allows Origin: null), so
+// no Python runtime and no second call. The source is read inside this call, so
+// a photo too big to carry between calls still works without a Workspace store.
+// ---------------------------------------------------------------------------
+const IMAGE_API_BASE = "https://omniroute-production-601d.up.railway.app/api/v1";
+const IMAGE_ROUTES_DEFAULT = ["codex", "chatgpt"];
+const IMAGE_SENTINEL = "NO REFERENCE IMAGE";
+const IMAGE_CODEX_MODEL = "cx/gpt-6.1-sol";
+const IMAGE_CHATGPT_MODEL = "chatgpt_web/chatgpt_image";
+const IMAGE_MARK = "generated image";   // alt text; finds the last result for a follow-up edit
+
+function sniffImage(b) {
+  if (!b || b.length < 12) return null;
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return "image/png";
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return "image/gif";
+  if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return "image/webp";
+  return null;
+}
+function imageMimeOf(name, bytes) {
+  const m = sniffImage(bytes) || guessMime(name);
+  return /^image\//.test(m) && m !== "image/svg+xml" ? m : null;
+}
+function lastImageIn(files) {
+  for (let i = files.length - 1; i >= 0; i--) {
+    const mime = imageMimeOf(files[i][0], files[i][1]);
+    if (mime) return { name: files[i][0], bytes: files[i][1], mime };
+  }
+  return null;
+}
+function previousGeneratedImage(prevText) {
+  const re = /!\[generated image\]\(data:(image\/[\w+.-]+);base64,([A-Za-z0-9+/=]+)\)/g;
+  let m, last = null;
+  while ((m = re.exec(prevText)) !== null) last = m;
+  return last ? { name: "the previous result", mime: last[1], bytes: base64ToBytes(last[2]) } : null;
+}
+
+// Returns {source} (null = generate from the prompt), or {error}.
+async function resolveImageSource(editing, raw, resources, files, imported, cfg, prevText) {
+  if (/^none$/i.test(raw) && !editing) return { source: null };
+  if (raw && !/^none$/i.test(raw)) {
+    if (/^https?:\/\//i.test(raw)) return { source: { url: raw, name: raw } };
+    const rel = relPath(raw), base = rel.split("/").pop();
+    const pool = files.filter(([p]) => !isInternal(p));
+    const hit = pool.find(([p]) => p === rel) || pool.find(([p]) => p === UPLOADS_DIR + "/" + rel) || pool.slice().reverse().find(([p]) => p.split("/").pop() === base);
+    if (!hit) {
+      const names = pool.filter(([p, b]) => imageMimeOf(p, b)).map(([p]) => "`" + p + "`");
+      return { error: "`" + rel + "` was not found." + (names.length ? " Images available: " + names.slice(0, 20).join(", ") + "." : " Omit `src` to use the image attached to the latest message.") };
+    }
+    const mime = imageMimeOf(hit[0], hit[1]);
+    if (!mime) return { error: "`" + hit[0] + "` is not a PNG, JPEG, WebP or GIF image." };
+    return { source: { name: hit[0], bytes: hit[1], mime } };
+  }
+  let attached = lastImageIn(imported);
+  const list = cfg.importAttachments && resources && resources.userMessage && Array.isArray(resources.userMessage.attachments) ? resources.userMessage.attachments : [];
+  if (!attached && list.length) attached = lastImageIn((await importAttachments(resources, new Set(), [])).files);   // already imported by an earlier call
+  if (attached) return { source: attached };
+  if (!editing) return { source: null };
+  const earlier = previousGeneratedImage(prevText) || lastImageIn(files.filter(([p]) => p.startsWith(UPLOADS_DIR + "/")));
+  if (earlier) return { source: earlier };
+  return { error: "there is no image to edit. Ask the user to attach the image to their message, or pass `src` with an https URL." };
+}
+
+async function sourceBytes(source) {
+  if (source.bytes) return source;
+  const r = await netFetch(source.url);
+  if (!r.ok) throw new Error("the source URL answered HTTP " + r.status);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  const mime = sniffImage(bytes) || (r.headers.get("content-type") || "").split(";")[0];
+  if (!/^image\//.test(mime)) throw new Error("the source URL is not an image");
+  source.bytes = bytes; source.mime = mime;
+  return source;
+}
+function bytesToDataUrl(bytes, mime) { return "data:" + mime + ";base64," + bytesToBase64(bytes); }
+
+// ChatGPT web takes a small JPEG. Without canvas support the original is sent.
+async function imageAsSmallJpeg(source, maxPx) {
+  await sourceBytes(source);
+  if (typeof createImageBitmap !== "function" || typeof OffscreenCanvas !== "function") return bytesToDataUrl(source.bytes, source.mime);
+  const bmp = await createImageBitmap(new Blob([source.bytes], { type: source.mime }));
+  const scale = Math.min(1, maxPx / Math.max(bmp.width, bmp.height));
+  const canvas = new OffscreenCanvas(Math.max(1, Math.round(bmp.width * scale)), Math.max(1, Math.round(bmp.height * scale)));
+  const g = canvas.getContext("2d");
+  g.fillStyle = "#fff"; g.fillRect(0, 0, canvas.width, canvas.height);   // JPEG has no transparency
+  g.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.88 });
+  return bytesToDataUrl(new Uint8Array(await blob.arrayBuffer()), "image/jpeg");
+}
+
+async function imagePost(base, key, endpoint, body, ms) {
+  const r = await timedFetch(rawFetch(), base + endpoint, {
+    method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key }, body: JSON.stringify(body)
+  }, ms);
+  const text = await r.text();
+  if (!r.ok) throw new Error("HTTP " + r.status + " " + text.replace(/data:[^"\s]+/g, "[data]").slice(0, 150));
+  return text;
+}
+
+async function imageViaCodex(base, key, prompt, source) {
+  const text = source
+    ? "Use the image_generation tool to edit the attached image as follows.\n" + prompt + "\nIf you received no image, reply exactly " + IMAGE_SENTINEL + " and do not call the tool."
+    : "Use the image_generation tool to generate this image.\n" + prompt;
+  const content = [{ type: "input_text", text }];
+  if (source) content.push({ type: "input_image", image_url: source.url && !source.bytes ? source.url : bytesToDataUrl(source.bytes, source.mime) });
+  const reply = await imagePost(base, key, "/responses", { model: IMAGE_CODEX_MODEL, tools: [{ type: "image_generation" }], input: [{ role: "user", content }] }, 150000);
+  if (source && reply.includes(IMAGE_SENTINEL)) throw new Error("the image did not reach the model");
+  const item = (JSON.parse(reply).output || []).find((it) => it.type === "image_generation_call" && it.result);
+  if (!item) throw new Error("no image in the reply");
+  return { bytes: base64ToBytes(item.result), model: IMAGE_CODEX_MODEL };
+}
+
+async function imageViaChatgpt(base, key, prompt, source) {
+  const content = source
+    ? [{ type: "text", text: "Generate an image using the attached reference image: " + prompt + "\nIf you received no image attachment, reply with exactly " + IMAGE_SENTINEL + " and generate nothing." },
+       { type: "image_url", image_url: { url: await imageAsSmallJpeg(source, 768) } }]
+    : "Generate an image: " + prompt;
+  const body = { model: IMAGE_CHATGPT_MODEL, stream: false, messages: [{ role: "user", content }] };
+  const pollMs = globalThis.__crImagePollMs || 30000;
+  const deadline = Date.now() + 240000;
+  let text;
+  for (;;) {   // an unfinished image answers "is being generated": resend the same request
+    const msg = JSON.parse(await imagePost(base, key, "/chat/completions", body, 200000)).choices[0].message;
+    text = JSON.stringify(msg);
+    if (!text.includes("image is being generated")) break;
+    if (Date.now() + pollMs > deadline) throw new Error("still generating after 240 s");
+    await new Promise((res) => setTimeout(res, pollMs));
+  }
+  if (source && text.includes(IMAGE_SENTINEL)) throw new Error("the image did not reach the model");
+  const m = /data:image\/[\w+.-]+;base64,([A-Za-z0-9+/=]+)/.exec(text);
+  if (m) return { bytes: base64ToBytes(m[1]), model: IMAGE_CHATGPT_MODEL };
+  for (const url of text.match(/https?:\/\/[^\s"')\]\\]+/g) || []) {
+    if (/\/api\/jobs\/|\/artifacts\//.test(url)) continue;   // bearer-only wrapper links: never follow
+    try {
+      const r = await netFetch(url);   // signed /s/ link: no auth header
+      const bytes = new Uint8Array(await r.arrayBuffer());
+      if (r.ok && (sniffImage(bytes) || /^image\//.test(r.headers.get("content-type") || ""))) return { bytes, model: IMAGE_CHATGPT_MODEL };
+    } catch (e) {}
+  }
+  throw new Error("no usable image in the reply");
+}
+
+function nextImageName(files) {
+  const have = new Set(files.map(([p]) => p));
+  let n = 1;
+  while (have.has("image_" + n + ".png") || have.has("image_" + n + ".jpg") || have.has("image_" + n + ".webp")) n++;
+  return "image_" + n + ".png";
+}
+
+async function imageTool(editing, params, userSettings, resources) {
+  const label = editing ? "edit_image" : "make_image";
+  const ctx = { notes: [], incoming: null };
+  let cfg = { secrets: {} };
+  const stop = (why) => serveFinish(redactSecrets("**" + label + " failed; no image was made.** " + why, cfg.secrets), ctx);
+  try {
+    params = params || {}; resources = resources || {};
+    cfg = readSettings(userSettings || {});
+    applyNetSettings(cfg);
+    globalThis.__crNetLog = new Map();
+    const prevText = previousOutputText(resources.previousRunOutput);
+    if (cfg.carry) ctx.incoming = extractTrailer(prevText);
+
+    const prompt = String(params.prompt == null ? "" : params.prompt).trim();
+    if (!prompt) return stop("No `prompt` was given. Describe the image, or for an edit say what to change and what to preserve.");
+    const key = cfg.secrets.OMNIROUTE_API_KEY;
+    if (!key) return stop("The secret OMNIROUTE_API_KEY is not set. In the Code Runner plugin settings add to Secrets: `OMNIROUTE_API_KEY=<your key>`. Tell the user this; do not try other image tools.");
+
+    let snap = null, restoreFailed = false;
+    if (ctx.incoming) { try { snap = await restoreSnapshot(ctx.incoming, cfg); } catch (e) { restoreFailed = true; } }
+    let files = snap ? snap.files : [];
+    let att = snap ? snap.att || [] : [];
+    let imported = [];
+    if (cfg.importAttachments) {
+      const imp = await importAttachments(resources, new Set(att), ctx.notes);
+      imported = imp.files; att = att.concat(imp.ids);
+      files = mergeFileLists(files, imported);
+    }
+
+    const resolved = await resolveImageSource(editing, String(params.src == null ? "" : params.src).trim(), resources, files, imported, cfg, prevText);
+    if (resolved.error) return stop(resolved.error + " Do not try other image tools.");
+    const source = resolved.source;
+
+    const base = (String(userSettings && userSettings.imageApiBase || "").trim() || IMAGE_API_BASE).replace(/\/+$/, "");
+    const wanted = String(userSettings && userSettings.imageRoutes || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+    const ways = { codex: imageViaCodex, chatgpt: imageViaChatgpt };
+    const failed = [];
+    let made = null;
+    for (const route of wanted.length ? wanted : IMAGE_ROUTES_DEFAULT) {
+      try {
+        if (!ways[route]) throw new Error("unknown route");
+        made = await ways[route](base, key, prompt, source);
+        if (made.bytes.length < 100) { made = null; throw new Error("the image came back empty"); }
+        break;
+      } catch (e) { failed.push(route + ": " + (isAbort(e) ? "timed out" : String(e && e.message || e)).slice(0, 180)); }
+    }
+    if (!made) return stop("Every route failed:\n" + failed.map((f) => "- " + f).join("\n") + "\n\nStop here. Do not try other image tools, models or MCP routes. Tell the user these errors.");
+
+    const mime = sniffImage(made.bytes) || "image/png";
+    const ext = mime.split("/")[1].replace("jpeg", "jpg");
+    let rel = relPath(params.out);
+    if (!rel || isInternal(rel) || rel.split("/").includes("..")) rel = nextImageName(files);
+    rel = rel.replace(/\.[A-Za-z0-9]{1,5}$/, "") + "." + ext;
+    files = mergeFileLists(files, [[rel, made.bytes]]);
+    const name = rel.split("/").pop();
+
+    let shares = snap ? snap.shares || [] : [], shareLine = "";
+    if (params.share) {
+      try {
+        const want = String(params.share).toLowerCase();
+        const s = await shareFile(name, made.bytes, mime, cfg, SHARE_HOSTS.includes(want) ? want : null, cfg.shareExpiry);
+        shares = shares.concat([s]);
+        shareLine = "  \n**Shared:** " + s.url + (s.deleteLink ? " ([delete](" + s.deleteLink + "))" : "") + " on " + s.service;
+      } catch (e) { shareLine = "  \nSharing failed: " + (e && e.message || e); }
+    }
+
+    // A file too large to carry without a store is simply dropped from the trailer; this call is already done with it.
+    if (cfg.carry && !restoreFailed) {
+      const t = await buildTrailer({ files, kv: snap ? snap.kv : {}, att, hist: snap ? snap.hist : [], shares }, cfg, []).catch(() => null);
+      if (t) ctx.incoming = t;
+    }
+    const caption = (source ? "Edited " + mdEscape(source.name.length > 80 ? "the image from the URL" : source.name) : "Generated") + " with `" + made.model + "`; saved as `" + rel + "` (" + fmtSize(made.bytes.length) + ")" +
+      (failed.length ? ". Earlier route failed: " + mdEscape(failed.join("; ")) : "") + shareLine;
+    return serveFinish("![" + IMAGE_MARK + "](" + bytesToDataUrl(made.bytes, mime) + ")\n\n" + redactSecrets(caption, cfg.secrets), ctx);
+  } catch (e) {
+    return stop(String(e && e.message || e) + ". Do not try other image tools; tell the user.");
+  }
+}
+
+async function make_image(params, userSettings, resources) { return imageTool(false, params, userSettings, resources); }
+async function edit_image(params, userSettings, resources) { return imageTool(true, params, userSettings, resources); }
+
+// ---------------------------------------------------------------------------
 // Browser bridge (browser_run, browser_tabs, browser_state, browser_act)
 // ---------------------------------------------------------------------------
 // These functions reach OUT of the sandboxed plugin iframe to the companion
