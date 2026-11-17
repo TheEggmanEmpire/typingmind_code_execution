@@ -148,6 +148,20 @@ routes.push(async (url, init) => {
     if (IMG.codex === "sentinel") return text(JSON.stringify({ output: [{ type: "message", content: [{ text: "NO REFERENCE IMAGE" }] }] }));
     return text(JSON.stringify({ output: [{ type: "image_generation_call", result: imgB64 }] }));
   }
+  if (url.endsWith("/api/v1/models")) {
+    count("img:models");
+    return text(JSON.stringify({ data: [{ id: "heretic-venice-api/seedream-v5-5", type: "image" }, { id: "heretic-venice-api/seedream-v5-5-edit", type: "image" },
+      { id: "heretic-venice-api/z-image-turbo", type: "image" }, { id: "heretic-venice-web/z-image-turbo", type: "image" }, { id: "cx/gpt-6.1-sol" }, { id: "kagi/seedream-v5-5" }] }));
+  }
+  if (url.endsWith("/api/v1/images/generations")) {
+    count("img:gen"); IMG.last.gen = JSON.parse(init.body);
+    return text(JSON.stringify({ data: [IMG.gen === "url" ? { url: "https://wrapper.test/s/signed" } : { b64_json: imgB64 }] }));
+  }
+  if (url.endsWith("/api/v1/images/edits")) {
+    count("img:edits"); IMG.last.edits = JSON.parse(init.body);
+    if (IMG.last.edits.model.endsWith("-edit") && IMG.edits !== "ok") return text(JSON.stringify({ error: { message: "Not found" } }), 404);
+    return text(JSON.stringify({ data: [{ b64_json: imgB64 }] }));
+  }
   if (url.endsWith("/api/v1/chat/completions")) {
     count("img:chatgpt"); IMG.last.chatgpt = JSON.parse(init.body);
     if (IMG.chatgpt === "down") return text("nope", 503);
@@ -559,6 +573,31 @@ const big = { stateLimitKB: "500" };   // keep test workspaces inline unless a t
     IMG.codex = "ok"; IMG.chatgpt = "down";
     check("route order setting", await img(make_image, { prompt: "y" }, { ...ok, imageRoutes: "broken,codex" }), (s) => shown(s) && /broken: unknown route/.test(s));
     IMG.chatgpt = "ok"; prev = undefined;
+
+    // A named model: that model only, on the image endpoints.
+    const before = () => ({ codex: hits["img:codex"] || 0, chatgpt: hits["img:chatgpt"] || 0, gen: hits["img:gen"] || 0 });
+    let b = before();
+    check("a full model ID goes to the image endpoint", await img(make_image, { prompt: "a fox", model: "heretic-venice-api/seedream-v5-5" }),
+      (s) => shown(s) && /heretic-venice-api\/seedream-v5-5`/.test(s) && IMG.last.gen.model === "heretic-venice-api/seedream-v5-5" && IMG.last.gen.prompt === "a fox" && !("image" in IMG.last.gen) && (hits["img:codex"] || 0) === b.codex && noLeak(s));
+    prev = undefined;
+    check("a bare name is looked up in the catalogue", await img(make_image, { prompt: "a fox", model: "Seedream-v5-5" }), (s) => shown(s) && IMG.last.gen.model === "heretic-venice-api/seedream-v5-5");
+    prev = undefined; b = before();
+    check("an ambiguous bare name asks for the full ID", await img(make_image, { prompt: "x", model: "z-image-turbo" }),
+      (s) => !shown(s) && /matches several/.test(s) && /heretic-venice-web\/z-image-turbo/.test(s) && /no other was tried/.test(s) && (hits["img:gen"] || 0) === b.gen);
+    check("an unknown bare name lists similar models", await img(make_image, { prompt: "x", model: "seedream" }), (s) => !shown(s) && /not an image model/.test(s) && /Similar: heretic-venice-api\/seedream-v5-5/.test(s) && !/kagi/.test(s));
+    b = before();
+    check("a failing named model has no fallback", await img(edit_image, { prompt: "x", src: "https://files.test/photo.png", model: "seedream-v5-5-edit" }),
+      (s) => !shown(s) && /images\/edits answered HTTP 404/.test(s) && (hits["img:codex"] || 0) === b.codex && (hits["img:chatgpt"] || 0) === b.chatgpt);
+    check("a source never goes to the generations endpoint", 1, () => (hits["img:gen"] || 0) === b.gen && IMG.last.edits.image.startsWith("data:image/png;base64,"));
+    IMG.edits = "ok";
+    check("an edit model that answers edits the source", await img(edit_image, { prompt: "x", src: "https://files.test/photo.png", model: "heretic-venice-api/seedream-v5-5-edit" }), (s) => shown(s) && /Edited/.test(s) && /seedream-v5-5-edit`/.test(s));
+    IMG.edits = ""; prev = undefined; IMG.gen = "url";
+    check("an image returned as a link is fetched", await img(make_image, { prompt: "x", model: "heretic-venice-api/seedream-v5-5" }), (s) => shown(s));
+    IMG.gen = ""; prev = undefined; b = before();
+    check("cx/ models use the Responses route", await img(make_image, { prompt: "x", model: "cx/gpt-6.1-terra" }), (s) => shown(s) && /cx\/gpt-6\.1-terra`/.test(s) && IMG.last.codex.model === "cx/gpt-6.1-terra" && (hits["img:gen"] || 0) === b.gen);
+    prev = undefined;
+    check("chatgpt_web/ models use the chat route", await img(make_image, { prompt: "x", model: "chatgpt_web/chatgpt_image" }), (s) => shown(s) && IMG.last.chatgpt.model === "chatgpt_web/chatgpt_image");
+    prev = undefined;
   }
 
   // 14. Never throws, always explains --------------------------------------------------------------

@@ -177,7 +177,8 @@ function specs() {
         properties: {
           prompt: { type: "string", description: "What the image should show: subject, style, composition, text to render." },
           src: { type: "string", description: "Optional reference image: a workspace path (uploads/photo.jpg) or an https URL. \"none\" forces generation from the prompt alone." },
-          out: { type: "string", description: "Optional file name in the workspace (default image_N.png)." }
+          out: { type: "string", description: "Optional file name in the workspace (default image_N.png)." },
+          model: { type: "string", description: "Optional. Only when the user names an image model: its OmniRoute ID, e.g. heretic-venice-api/seedream-v5-5 (a bare name such as seedream-v5-5 is looked up). That model alone is used, with no fallback. Omit for the default routes." }
         },
         required: ["prompt"]
       }
@@ -190,7 +191,8 @@ function specs() {
         properties: {
           prompt: { type: "string", description: "The change to make, and what must stay as it is." },
           src: { type: "string", description: "The image to edit: a workspace path or an https URL." },
-          out: { type: "string", description: "Optional file name in the workspace." }
+          out: { type: "string", description: "Optional file name in the workspace." },
+          model: { type: "string", description: "Optional. Only when the user names an image model: its OmniRoute ID, e.g. heretic-venice-api/seedream-v5-5 (a bare name such as seedream-v5-5 is looked up). That model alone is used, with no fallback. Omit for the default routes." }
         },
         required: ["prompt"]
       }
@@ -532,18 +534,9 @@ async function imageTool(editing, args, ctx) {
     const source = resolved.source;
 
     const base = config.omnirouteBase || legacy.IMAGE_API_BASE;
-    const ways = { codex: legacy.imageViaCodex, chatgpt: legacy.imageViaChatgpt };
-    const failed = [];
-    let made = null;
-    for (const route of legacy.IMAGE_ROUTES_DEFAULT) {
-      try {
-        ctx.progress("image route: " + route + "\n");
-        made = await ways[route](base, key, prompt, source);
-        if (!made || made.bytes.length < 100) { made = null; throw new Error("the image came back empty"); }
-        break;
-      } catch (e) { failed.push(route + ": " + (e && (e.name === "AbortError" || e.name === "TimeoutError") ? "timed out" : String(e && e.message || e)).slice(0, 180)); }
-    }
-    if (!made) return stop("Every route failed:\n" + failed.map((f) => "- " + f).join("\n") + "\n\nStop here. Do not try other image tools, models or MCP routes. Tell the user these errors.");
+    const model = String(args.model == null ? "" : args.model).trim();
+    const { made, failed } = await legacy.imageMake(base, key, prompt, source, { model, onRoute: (r) => ctx.progress("image route: " + r + "\n") });
+    if (!made) return stop(legacy.imageFailText(failed, model));
 
     const bytes = Buffer.from(made.bytes);
     const mime = legacy.sniffImage(bytes) || "image/png";

@@ -188,6 +188,7 @@ const imageParams = (srcDoc) => ({
     prompt: { type: "string", description: "What the image should show. For an edit write: Change: <what to change>. Preserve: <what must stay the same>." },
     src: { type: "string", description: srcDoc },
     out: { type: "string", description: "Optional /workspace file name for the result. Default image_N.png." },
+    model: { type: "string", description: "Optional. Only when the user names an image model: its OmniRoute ID, e.g. heretic-venice-api/seedream-v5-5 (a bare name such as seedream-v5-5 is looked up). That model alone is used, with no fallback. Omit for the default routes." },
     share: { type: "string", enum: ["auto", "catbox", "gofile", "litterbox"], description: "Optional: also upload the result to a public host and show a link. Only when the user asks for a link." }
   },
   required: ["prompt"]

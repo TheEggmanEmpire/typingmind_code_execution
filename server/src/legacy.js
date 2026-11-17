@@ -12,8 +12,8 @@ const ctx = vm.createContext({
 });
 const names = ['previewHtml','previewKind','guessMime','extOf','fmtSize','mdEscape','FENCE_BY_EXT',
   'ALL_LANGS','CE_LANGS','WB_LANGS','LANG_ALIASES','normalizeLanguage','runRemote','buildNotebook',
-  'CHART_HTML','PY_HELPERS','R_HELPERS','sniffImage','imageViaCodex','imageViaChatgpt',
-  'IMAGE_API_BASE','IMAGE_ROUTES_DEFAULT','globToRegex','parseCsvHeader','csvCell','PY_PIP_ALIASES','TS_GLOBALS'];
+  'CHART_HTML','PY_HELPERS','R_HELPERS','sniffImage','imageMake','imageFailText',
+  'IMAGE_API_BASE','globToRegex','parseCsvHeader','csvCell','PY_PIP_ALIASES','TS_GLOBALS'];
 vm.runInContext(fs.readFileSync(new URL('../../implementation.js', import.meta.url),'utf8') +
   '\n; netFetch = (input, init) => timedFetch(rawFetch(), input, init, 30000);' +
   '\n; globalThis.__exports = {' + names.join(',') + '};', ctx, {filename:'implementation.js'});

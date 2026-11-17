@@ -3540,25 +3540,27 @@ async function imagePost(base, key, endpoint, body, ms) {
   return text;
 }
 
-async function imageViaCodex(base, key, prompt, source) {
+async function imageViaCodex(base, key, prompt, source, model) {
+  model = model || IMAGE_CODEX_MODEL;
   const text = source
     ? "Use the image_generation tool to edit the attached image as follows.\n" + prompt + "\nIf you received no image, reply exactly " + IMAGE_SENTINEL + " and do not call the tool."
     : "Use the image_generation tool to generate this image.\n" + prompt;
   const content = [{ type: "input_text", text }];
   if (source) content.push({ type: "input_image", image_url: source.url && !source.bytes ? source.url : bytesToDataUrl(source.bytes, source.mime) });
-  const reply = await imagePost(base, key, "/responses", { model: IMAGE_CODEX_MODEL, tools: [{ type: "image_generation" }], input: [{ role: "user", content }] }, 150000);
+  const reply = await imagePost(base, key, "/responses", { model, tools: [{ type: "image_generation" }], input: [{ role: "user", content }] }, 150000);
   if (source && reply.includes(IMAGE_SENTINEL)) throw new Error("the image did not reach the model");
   const item = (JSON.parse(reply).output || []).find((it) => it.type === "image_generation_call" && it.result);
   if (!item) throw new Error("no image in the reply");
-  return { bytes: base64ToBytes(item.result), model: IMAGE_CODEX_MODEL };
+  return { bytes: base64ToBytes(item.result), model };
 }
 
-async function imageViaChatgpt(base, key, prompt, source) {
+async function imageViaChatgpt(base, key, prompt, source, model) {
+  model = model || IMAGE_CHATGPT_MODEL;
   const content = source
     ? [{ type: "text", text: "Generate an image using the attached reference image: " + prompt + "\nIf you received no image attachment, reply with exactly " + IMAGE_SENTINEL + " and generate nothing." },
        { type: "image_url", image_url: { url: await imageAsSmallJpeg(source, 768) } }]
     : "Generate an image: " + prompt;
-  const body = { model: IMAGE_CHATGPT_MODEL, stream: false, messages: [{ role: "user", content }] };
+  const body = { model, stream: false, messages: [{ role: "user", content }] };
   const pollMs = globalThis.__crImagePollMs || 30000;
   const deadline = Date.now() + 240000;
   let text;
@@ -3571,16 +3573,88 @@ async function imageViaChatgpt(base, key, prompt, source) {
   }
   if (source && text.includes(IMAGE_SENTINEL)) throw new Error("the image did not reach the model");
   const m = /data:image\/[\w+.-]+;base64,([A-Za-z0-9+/=]+)/.exec(text);
-  if (m) return { bytes: base64ToBytes(m[1]), model: IMAGE_CHATGPT_MODEL };
+  if (m) return { bytes: base64ToBytes(m[1]), model };
   for (const url of text.match(/https?:\/\/[^\s"')\]\\]+/g) || []) {
     if (/\/api\/jobs\/|\/artifacts\//.test(url)) continue;   // bearer-only wrapper links: never follow
     try {
       const r = await netFetch(url);   // signed /s/ link: no auth header
       const bytes = new Uint8Array(await r.arrayBuffer());
-      if (r.ok && (sniffImage(bytes) || /^image\//.test(r.headers.get("content-type") || ""))) return { bytes, model: IMAGE_CHATGPT_MODEL };
+      if (r.ok && (sniffImage(bytes) || /^image\//.test(r.headers.get("content-type") || ""))) return { bytes, model };
     } catch (e) {}
   }
   throw new Error("no usable image in the reply");
+}
+
+// Any other OmniRoute image model, on the image endpoints. A source goes to
+// /images/edits only: /images/generations answers 200 and ignores an image, and a
+// picture made without the source must never pass for an edit of it.
+async function imageViaEndpoint(base, key, prompt, source, model) {
+  let reply;
+  if (source) {
+    await sourceBytes(source);
+    try {
+      reply = await imagePost(base, key, "/images/edits", { model, prompt, image: bytesToDataUrl(source.bytes, source.mime), response_format: "b64_json" }, 200000);
+    } catch (e) {
+      if (/^HTTP 404/.test(String(e && e.message))) throw new Error("OmniRoute's /images/edits answered HTTP 404 for `" + model + "`, so a source image cannot reach this model through OmniRoute. Leave `model` out to edit with the default routes");
+      throw e;
+    }
+  } else {
+    reply = await imagePost(base, key, "/images/generations", { model, prompt, response_format: "b64_json" }, 200000);
+  }
+  const first = (JSON.parse(reply).data || [])[0] || {};
+  if (first.b64_json) return { bytes: base64ToBytes(first.b64_json), model };
+  if (first.url) {
+    const r = await netFetch(first.url);
+    if (!r.ok) throw new Error("the image link answered HTTP " + r.status);
+    return { bytes: new Uint8Array(await r.arrayBuffer()), model };
+  }
+  throw new Error("no image in the reply");
+}
+
+// "seedream-v5-5" -> "heretic-venice-api/seedream-v5-5". An ID with a provider is used as given.
+async function resolveImageModel(base, key, raw) {
+  if (raw.includes("/")) return raw;
+  const r = await timedFetch(rawFetch(), base + "/models", { headers: { Authorization: "Bearer " + key } }, 30000);
+  if (!r.ok) throw new Error("the model list answered HTTP " + r.status + "; pass the full ID (provider/model)");
+  const ids = ((await r.json()).data || []).filter((m) => m && m.id && (m.type === "image" || /^(cx|chatgpt_web)\//.test(m.id))).map((m) => String(m.id));
+  const want = raw.toLowerCase();
+  const hits = ids.filter((id) => id.slice(id.indexOf("/") + 1).toLowerCase() === want);
+  if (hits.length === 1) return hits[0];
+  if (hits.length) throw new Error("`" + raw + "` matches several models: " + hits.join(", ") + ". Pass one full ID");
+  const near = ids.filter((id) => id.toLowerCase().includes(want)).slice(0, 8);
+  throw new Error("`" + raw + "` is not an image model in OmniRoute's catalogue" + (near.length ? ". Similar: " + near.join(", ") : ""));
+}
+
+// One image through OmniRoute. With opts.model that exact model makes it and nothing
+// else is tried; otherwise the routes run in order until one answers.
+// Returns {made, failed}: made is {bytes, model} or null.
+async function imageMake(base, key, prompt, source, opts) {
+  opts = opts || {};
+  const failed = [];
+  const note = (label, e) => failed.push(label + ": " + (isAbort(e) ? "timed out" : String(e && e.message || e)).slice(0, 260));
+  const usable = (made) => { if (!made || made.bytes.length < 100) throw new Error("the image came back empty"); return made; };
+  const say = (what) => { if (opts.onRoute) opts.onRoute(what); };
+  if (opts.model) {
+    try {
+      const model = await resolveImageModel(base, key, opts.model);
+      say(model);
+      const way = /^cx\//.test(model) ? imageViaCodex : /^chatgpt_web\//.test(model) ? imageViaChatgpt : imageViaEndpoint;
+      return { made: usable(await way(base, key, prompt, source, model)), failed };
+    } catch (e) { note(opts.model, e); return { made: null, failed }; }
+  }
+  const ways = { codex: imageViaCodex, chatgpt: imageViaChatgpt };
+  for (const route of opts.routes && opts.routes.length ? opts.routes : IMAGE_ROUTES_DEFAULT) {
+    try {
+      if (!ways[route]) throw new Error("unknown route");
+      say(route);
+      return { made: usable(await ways[route](base, key, prompt, source)), failed };
+    } catch (e) { note(route, e); }
+  }
+  return { made: null, failed };
+}
+function imageFailText(failed, model) {
+  return (model ? "The requested model failed and no other was tried:\n" : "Every route failed:\n") + failed.map((f) => "- " + f).join("\n") +
+    "\n\nStop here. Do not try other image tools, models or MCP routes. Tell the user these errors.";
 }
 
 function nextImageName(files) {
@@ -3625,18 +3699,9 @@ async function imageTool(editing, params, userSettings, resources) {
 
     const base = (String(userSettings && userSettings.imageApiBase || "").trim() || IMAGE_API_BASE).replace(/\/+$/, "");
     const wanted = String(userSettings && userSettings.imageRoutes || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-    const ways = { codex: imageViaCodex, chatgpt: imageViaChatgpt };
-    const failed = [];
-    let made = null;
-    for (const route of wanted.length ? wanted : IMAGE_ROUTES_DEFAULT) {
-      try {
-        if (!ways[route]) throw new Error("unknown route");
-        made = await ways[route](base, key, prompt, source);
-        if (made.bytes.length < 100) { made = null; throw new Error("the image came back empty"); }
-        break;
-      } catch (e) { failed.push(route + ": " + (isAbort(e) ? "timed out" : String(e && e.message || e)).slice(0, 180)); }
-    }
-    if (!made) return stop("Every route failed:\n" + failed.map((f) => "- " + f).join("\n") + "\n\nStop here. Do not try other image tools, models or MCP routes. Tell the user these errors.");
+    const model = String(params.model == null ? "" : params.model).trim();
+    const { made, failed } = await imageMake(base, key, prompt, source, { model, routes: wanted });
+    if (!made) return stop(imageFailText(failed, model));
 
     const mime = sniffImage(made.bytes) || "image/png";
     const ext = mime.split("/")[1].replace("jpeg", "jpg");
