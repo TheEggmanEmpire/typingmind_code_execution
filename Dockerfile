@@ -59,12 +59,12 @@ COPY server ./server
 RUN sh server/sandbox/build.sh && chmod -R go-w /app
 
 # Root is needed once per run to switch to the workspace's own unix user.
-# Nothing else in the server depends on it.
+# Nothing else in the server depends on it. Attach a Railway volume at /data
+# (Railway rejects a Dockerfile VOLUME instruction).
 ENV NODE_ENV=production \
     DATA_DIR=/data \
     PORT=8080 \
     RAILWAY_RUN_UID=0
-VOLUME ["/data"]
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1
