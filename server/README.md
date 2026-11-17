@@ -120,9 +120,15 @@ workspace `main` of the user `default`.
 ## REA (reverse engineering)
 
 [REA](https://github.com/morluto/rea) (npm `rea-agents`, about 140 tools) inspects native binaries, JavaScript
-and Electron apps, web bundles, .NET assemblies, APKs and websites. Its tools are part of the same MCP endpoint:
-`/mcp` lists them after the Code Runner tools, and there is nothing extra to connect.
+and Electron apps, web bundles, .NET assemblies, APKs and websites. It is part of the same MCP endpoint; there
+is nothing extra to connect.
 
+- **Two tools by default**: `rea_find` (the catalogue: all tools, a search, or one tool's parameters) and
+  `rea_call` (run one). REA's own definitions are over half a megabyte of JSON, which no chat should carry on
+  every turn. `REA_TOOLS=full` lists all REA tools directly instead (output schemas are left out either way).
+- **Results stay small**: a result above `REA_MAX_CHARS` is saved as `rea/<tool>-<time>.json` in the workspace
+  and returned shortened with that file name, so the AI reads the rest with `run_code`. (One REA call can
+  return several hundred kilobytes; a chat client cannot send that back to the model.)
 - Each workspace gets its own REA process, started on the first REA call and stopped after `REA_IDLE_MIN` idle
   minutes (and on shutdown). It runs in the same sandbox as the model's code, with the workspace as its
   working directory: REA analyses files the user uploaded or the code produced (relative paths such as
@@ -137,25 +143,11 @@ and Electron apps, web bundles, .NET assemblies, APKs and websites. Its tools ar
 | Variable | Default | Purpose |
 |---|---|---|
 | `REA` | `1` | `0` leaves the REA tools out |
+| `REA_TOOLS` | `compact` | `full` lists every REA tool instead of `rea_find` / `rea_call` |
+| `REA_MAX_CHARS` | 20000 | Longer REA results are saved to a workspace file and shortened |
 | `REA_COMMAND` | `rea mcp` | REA's stdio MCP command line, e.g. `node /opt/rea/node_modules/rea-agents/scripts/rea.mjs mcp`. A tool folder outside `/usr` is made readable to the sandbox automatically |
 | `REA_IDLE_MIN` | 15 | An idle REA process is stopped after this |
 | `REA_CALL_TIMEOUT_S` | 300 | Limit of one REA tool call |
-
-**Tool count.** With REA the endpoint lists about 150 tool definitions, a lot of context for every turn. Expose
-what the agent needs: in LibreChat pick the tools in the agent's tool list; in Hermes filter them:
-
-```yaml
-mcp_servers:
-  code_runner:
-    url: "https://<domain>/mcp"
-    headers:
-      Authorization: "Bearer ${CODE_RUNNER_API_KEY}"
-    timeout: 300
-    tools:
-      include: [run_code, job, serve_file, preview_file, manage_files, browser_state, browser_act,
-                analyze_javascript_application, analyze_web_bundle, inspect_artifact, extract_artifact,
-                recover_javascript_sources, trace_javascript_semantics, open_binary, binary_overview]
-```
 
 ## Your files
 

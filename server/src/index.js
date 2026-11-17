@@ -28,7 +28,9 @@ import { handleAuthHttp, checkAuth, logAuthStatus } from "./mcp-auth.js";
 import { reaListTools, reaCallTool, shutdownRea, reaAvailable } from "./rea.js";
 
 const VERSION = "1.0.0";
-const REA_NOTE = "\n- Reverse engineering: the other tools (open_binary, analyze_javascript_application, inspect_*, trace_*, ...) are REA. They read files from the same workspace (relative paths), so download or upload the target there first.";
+const REA_NOTE = () => (config.reaTools === "compact"
+  ? "\n- Reverse engineering (REA, about 140 tools): rea_find lists them and shows one tool's parameters, rea_call runs one. They read files from the same workspace (relative paths), so download or upload the target there first."
+  : "\n- Reverse engineering: the other tools (open_binary, analyze_javascript_application, inspect_*, trace_*, ...) are REA. They read files from the same workspace (relative paths), so download or upload the target there first.");
 const MCP_BODY_MAX = 64 * 1024 * 1024;   // `files` may carry base64 content
 
 function json(res, status, body, headers = {}) {
@@ -58,7 +60,7 @@ function mcpServerFor(req) {
   const ws = getWorkspace(user, header(req, "x-workspace") || "main");
   const secrets = { ...config.codeSecrets, ...parseSecrets(header(req, "x-code-secrets")) };
 
-  const server = new Server({ name: "code-runner", version: VERSION }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS + (reaAvailable() ? REA_NOTE : "") });
+  const server = new Server({ name: "code-runner", version: VERSION }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS + (reaAvailable() ? REA_NOTE() : "") });
   // One list: the Code Runner tools, then REA's (reverse engineering), which work on the same workspace.
   const own = new Set(listTools().map((t) => t.name));
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [...listTools(), ...(await reaListTools(ws, [...own]))] }));

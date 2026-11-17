@@ -101,6 +101,10 @@ export const config = {
   rea: flag(env.REA, true),
   reaCommand: splitCommand(env.REA_COMMAND || "rea mcp"),       // full command line of REA's stdio MCP server
   reaIdleMin: num(env.REA_IDLE_MIN, 15, 1, 1440),              // an idle REA process is stopped after this
+  // "compact" (default): two tools, rea_find and rea_call, instead of REA's ~140 tool
+  // definitions (over half a megabyte of schemas in every model request). "full" lists them all.
+  reaTools: /^full$/i.test(env.REA_TOOLS || "") ? "full" : "compact",
+  reaMaxChars: num(env.REA_MAX_CHARS, 20000, 2000, 1000000),   // longer REA results are saved to a file and shortened
   reaCallTimeoutS: num(env.REA_CALL_TIMEOUT_S, 300, 5, 86400), // limit of one forwarded REA call
 
   serveMaxBytes: 20 * 1024 * 1024,

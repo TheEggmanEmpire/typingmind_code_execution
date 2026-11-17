@@ -14,7 +14,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ReadBuffer, serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
 import { ListToolsResultSchema, CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { config } from "./config.js";
-import { spawnInWorkspace, killTree } from "./sandbox.js";
+import { spawnInWorkspace, killTree, wsfs } from "./sandbox.js";
 
 const BODY_MAX = 4 * 1024 * 1024;
 const START_TIMEOUT_MS = 90000;
@@ -175,12 +175,6 @@ function errorText(e, entry) {
 // ---- part of the main MCP endpoint ------------------------------------------------
 // REA's tools are listed next to the Code Runner tools on /mcp and calls to them
 // are forwarded to the workspace's REA process.
-function withoutProgress(params) {
-  const out = { ...params };
-  if (out._meta) { const { progressToken, ...rest } = out._meta; out._meta = Object.keys(rest).length ? rest : undefined; if (!out._meta) delete out._meta; }
-  return out;
-}
-
 // The tool list depends on the installed REA version only, so one answer serves
 // every workspace: listing tools does not start a process per user.
 let catalog = null, catalogPending = null, catalogFailedAt = 0;
@@ -197,32 +191,134 @@ async function fetchTools(entry) {
   return tools;
 }
 
-// `reserved`: names of the server's own tools; a REA tool of the same name is left out.
-export async function reaListTools(ws, reserved = []) {
+// What a chat can carry is small. REA's own definitions and results are not:
+// output schemas alone are 1.4 MB, and one call can return 400 KB. So tools are
+// listed without output schemas, and a long result is saved to the workspace and
+// returned shortened, with the file name.
+function slim(tool) {
+  const out = { name: tool.name, description: tool.description || "", inputSchema: tool.inputSchema || { type: "object" } };
+  if (tool.annotations) out.annotations = tool.annotations;
+  return out;
+}
+
+async function loadCatalog(ws) {
   if (!config.rea || !reaAvailable()) return [];
   if (catalog) return catalog;
   // A REA that cannot start must not make every tools/list slow or fail.
   if (Date.now() - catalogFailedAt < CATALOG_RETRY_MS) return [];
-  catalogPending ||= using(ws, fetchTools).then((tools) => {
-    const taken = new Set(reserved);
-    catalog = tools.filter((t) => !taken.has(t.name));
-    return catalog;
-  }).catch((e) => {
+  catalogPending ||= using(ws, fetchTools).then((tools) => (catalog = tools.map(slim))).catch((e) => {
     catalogFailedAt = Date.now();
     console.error("rea: tools are not offered: " + (e && e.message || e));
     return [];
   }).finally(() => { catalogPending = null; });
   return catalogPending;
 }
+
+const COMPACT = [
+  {
+    name: "rea_find",
+    description:
+      "REA (Reverse Engineer Anything): about 140 reverse-engineering tools for native binaries, JavaScript/Electron apps, web bundles, .NET, APKs, firmware and websites, working on files in the same workspace as run_code. " +
+      "This tool is the catalogue. No arguments: every REA tool with a one-line summary. `query`: tools matching the words. `tool`: one tool's full description and parameter schema; read it before calling that tool with rea_call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Words to search in tool names and descriptions, e.g. \"javascript bundle\" or \"decompile\"." },
+        tool: { type: "string", description: "Exact tool name: returns its full description and JSON schema of its arguments." }
+      }
+    },
+    annotations: { title: "REA: find a tool", readOnlyHint: true }
+  },
+  {
+    name: "rea_call",
+    description:
+      "Run one REA tool (names and parameters from rea_find). Paths are relative to the workspace, so put the target there first (run_code download, or the user's upload page). " +
+      "A long result is saved as a JSON file under rea/ in the workspace and returned shortened: read the rest with run_code.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tool: { type: "string", description: "REA tool name, e.g. analyze_javascript_application." },
+        arguments: { type: "object", description: "The tool's arguments, as its schema from rea_find says.", additionalProperties: true }
+      },
+      required: ["tool"]
+    },
+    annotations: { title: "REA: run a tool", openWorldHint: true }
+  }
+];
+
+// `reserved`: names of the server's own tools; a REA tool of the same name is left out.
+export async function reaListTools(ws, reserved = []) {
+  if (!config.rea || !reaAvailable()) return [];
+  if (config.reaTools === "compact") return COMPACT;   // needs no REA process
+  const taken = new Set(reserved);
+  return (await loadCatalog(ws)).filter((t) => !taken.has(t.name));
+}
+export const reaToolNames = () => (config.rea && reaAvailable() && config.reaTools === "compact" ? COMPACT.map((t) => t.name) : []);
 export const reaInstructions = () => (known && known.instructions) || "";
+
+const text = (t, isError) => ({ content: [{ type: "text", text: t }], ...(isError ? { isError: true } : {}) });
+const firstLine = (d) => { const s = String(d || "").replace(/\s+/g, " ").trim(); const m = /^(.{20,160}?[.!?])(\s|$)/.exec(s); return (m ? m[1] : s.slice(0, 160)); };
+
+async function find(ws, args) {
+  const tools = await loadCatalog(ws);
+  if (!tools.length) return text("REA could not be started on this server, so its tools are not available right now. " + HOW_TO_ENABLE, true);
+  const name = String(args.tool || "").trim();
+  if (name) {
+    const t = tools.find((x) => x.name === name);
+    if (!t) {
+      const near = tools.filter((x) => x.name.includes(name) || name.includes(x.name)).slice(0, 10).map((x) => x.name);
+      return text("No REA tool `" + name + "`." + (near.length ? " Similar: " + near.join(", ") + "." : " Call rea_find without arguments for the list."), true);
+    }
+    return text(t.name + "\n\n" + t.description + "\n\nArguments (JSON Schema):\n" + JSON.stringify(t.inputSchema) + "\n\nCall it with rea_call { \"tool\": \"" + t.name + "\", \"arguments\": { ... } }.");
+  }
+  const words = String(args.query || "").toLowerCase().split(/[^a-z0-9_]+/).filter(Boolean);
+  const hits = words.length ? tools.filter((t) => { const h = (t.name + " " + t.description).toLowerCase(); return words.every((w) => h.includes(w)); }) : tools;
+  if (!hits.length) return text("No REA tool matches \"" + args.query + "\". Try fewer or other words, or call rea_find without arguments for all " + tools.length + " tools.");
+  const lines = hits.map((t) => "- " + t.name + ": " + (words.length && hits.length <= 12 ? t.description.replace(/\s+/g, " ").trim() : firstLine(t.description)));
+  return text((words.length ? hits.length + " REA tools match" : "REA offers " + hits.length + " tools") + ". For one tool's parameters: rea_find { \"tool\": \"<name>\" }; to run it: rea_call.\n\n" + lines.join("\n"));
+}
+
+// Keep a result small enough for a chat: one text, no duplicate structured copy,
+// and beyond the limit the full text goes to a workspace file.
+async function fit(ws, tool, result) {
+  if (!result || !Array.isArray(result.content)) return result;
+  const rest = result.content.filter((c) => c.type !== "text");
+  let body = result.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+  if (!body && result.structuredContent !== undefined) body = JSON.stringify(result.structuredContent);
+  const out = { content: rest, ...(result.isError ? { isError: true } : {}) };
+  const max = config.reaMaxChars;
+  if (body.length > max) {
+    const rel = "rea/" + tool.replace(/[^A-Za-z0-9_-]/g, "_") + "-" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19) + ".json";
+    let saved = "";
+    try { await wsfs.write(ws, rel, Buffer.from(body, "utf8")); saved = " The full result is saved as " + rel + " in the workspace: read the parts you need with run_code (python: json.load(open('" + rel + "'))), or narrow the request."; }
+    catch (e) { saved = " The full result could not be saved (" + (e && e.message || e) + "); narrow the request."; }
+    const head = Math.floor(max * 0.75), tail = max - head;
+    body = body.slice(0, head) + "\n\n... [" + (body.length - max) + " characters left out] ...\n\n" + body.slice(-tail) +
+      "\n\n(This REA result has " + body.length + " characters; the middle was left out." + saved + ")";
+  }
+  out.content = [{ type: "text", text: body }, ...rest];
+  return out;
+}
 
 // params: the tools/call params as received; extra: the MCP handler's extra (signal, sendNotification).
 export async function reaCallTool(ws, params, extra) {
+  let name = params.name, args = params.arguments || {};
+  if (config.reaTools === "compact") {
+    if (name === "rea_find") { try { return await find(ws, args); } catch (e) { return text("rea_find failed: " + (e && e.message || e), true); } }
+    // Any other name is a REA tool called directly (a client that still holds the long list): forward it.
+    if (name === "rea_call") {
+      name = String(args.tool || "").trim();
+      if (!name) return text("rea_call needs `tool` (a REA tool name from rea_find) and `arguments`.", true);
+      let a = args.arguments;
+      if (typeof a === "string") { try { a = JSON.parse(a); } catch { return text("`arguments` must be an object, e.g. { \"input_path\": \"app\" }.", true); } }
+      args = a && typeof a === "object" ? a : {};
+    }
+  }
   const token = params._meta && params._meta.progressToken;
   const timeout = config.reaCallTimeoutS * 1000;
   let entry;
   try {
-    return await using(ws, async (e) => {
+    const result = await using(ws, async (e) => {
       entry = e;
       const options = { timeout, maxTotalTimeout: timeout, signal: extra.signal };
       if (token !== undefined) {
@@ -230,12 +326,18 @@ export async function reaCallTool(ws, params, extra) {
           extra.sendNotification({ method: "notifications/progress", params: { ...p, progressToken: token } }).catch(() => {});
         };
       }
-      return await e.client.request({ method: "tools/call", params: withoutProgress(params) }, CallToolResultSchema, options);
+      return await e.client.request({ method: "tools/call", params: { name, arguments: args } }, CallToolResultSchema, options);
     });
+    const fitted = await fit(ws, name, result);
+    // A rejected argument list is the usual first mistake: say where the schema is.
+    if (config.reaTools === "compact" && fitted.isError && /Input validation error|Invalid arguments|not found|Unknown tool/i.test(fitted.content[0]?.text || "")) {
+      fitted.content[0].text += "\n\n(See the tool's parameters with rea_find { \"tool\": \"" + name + "\" }.)";
+    }
+    return fitted;
   } catch (e) {
     if (extra.signal && extra.signal.aborted) throw e;
-    if (e && e.unavailable) return { content: [{ type: "text", text: "REA is not available on this server. " + e.message + " " + HOW_TO_ENABLE }], isError: true };
-    return { content: [{ type: "text", text: "REA call failed: " + errorText(e, entry) }], isError: true };
+    if (e && e.unavailable) return text("REA is not available on this server. " + e.message + " " + HOW_TO_ENABLE, true);
+    return text("REA call failed: " + errorText(e, entry), true);
   }
 }
 
