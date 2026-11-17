@@ -284,6 +284,14 @@ are out of reach. Lua and PHP stay remote: the in-browser Lua has no file access
 
 For a fully private setup: deploy the Worker, set both of its URLs, and turn **Allow public CORS proxies** off.
 
+### Server version (LibreChat, Hermes and other MCP clients)
+
+The same tools also run as a remote MCP server, built from this repository's `Dockerfile` (made for Railway):
+real Python, Node.js, bash and compilers in a sandboxed workspace per user, variables that stay alive between
+calls, background jobs, scheduled runs, links for downloads, previews and uploads, the browser tools through the
+same extension (paired with the server), and [REA](https://github.com/morluto/rea) on a second endpoint.
+Setup and security notes: [`server/README.md`](server/README.md).
+
 ### Development
 
 `implementation.js` is the plugin code; `node build.js` regenerates `plugin.json` (tool descriptions, schema,

@@ -1,0 +1,5 @@
+node_modules/
+server/sandbox/crbox
+server/py/__pycache__/
+*.pyc
+.env

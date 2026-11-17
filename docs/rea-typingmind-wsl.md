@@ -1,8 +1,6 @@
 # REA in TypingMind through WSL and Tailscale
 
-REA runs on the home PC as a stdio MCP server. TypingMind connects through the
-Private MCP Connector running in WSL. Mobile TypingMind uses the same connector;
-the home PC must stay on and awake, and Tailscale must be connected on both devices.
+The hosted Code Runner server now also carries REA at `/rea/mcp` (see `server/README.md`, section "REA"); this guide covers the home-PC setup.
 
 This guide describes the configured Ubuntu WSL installation. The paths below
 use its existing managed REA runtime; change them if your installation differs.

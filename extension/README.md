@@ -25,6 +25,49 @@ this extension provides the eyes and hands. `page-agent.js` is an independent, c
 
 After editing the extension, press its reload icon in `chrome://extensions`, then reload the TypingMind tab.
 
+## Remote link (LibreChat, Hermes and other MCP clients)
+
+The remote MCP server can reach this extension without a TypingMind page. Pair each browser profile separately:
+
+1. Install the extension as above, then open **Details -> Extension options**.
+2. Ask the AI in your MCP client to use a browser tool. When no browser is connected, it gives you the server URL
+   and a one-time pairing code. The code expires after 10 minutes and works once. It is not a reusable credential.
+3. Under **Remote link**, enter that URL and code, choose a device name, and click **Pair**. You can also paste
+   `https://your-server#CODE` in the URL field. Use HTTPS; only `http://localhost` and `http://127.0.0.1` are allowed
+   for local development. The URL must be the server origin, without a path or login.
+4. Check that the options page says **Connected to … as …**. The icon shows a green **on** badge while connected.
+   Retry the browser tool. With several connected devices, the server chooses the most recently paired or answering one.
+
+The extension opens an outbound WebSocket at `/bridge`. It sends the device credential in the first message,
+never in the URL, and exchanges traffic every 20 seconds to keep the service worker alive (Chrome 116+).
+Disconnects retry automatically; a rejected pairing stops retries until you pair again. The extension keeps its
+credential in local extension storage, restricted to trusted extension contexts. The server stores only its hash.
+Neither the token nor a derivable reusable credential is returned to the AI.
+
+**Local safety controls** apply to remote requests in addition to the server's settings. Save changes with
+**Save settings**; the **Remote link enabled** switch takes effect immediately.
+
+- **Allowed sites / Blocked sites:** a block in either source wins. Every non-empty allow list must permit the host.
+  Empty local allow lists add no restriction. The same host patterns as the TypingMind settings are supported.
+- **Always confirm risky actions:** on by default. The server cannot disable the recognizable risky-click and
+  Enter/Space guard. A client can still send `confirm: true`; this relies on the AI asking you, not a browser dialog.
+- **Allow running scripts (browser_run):** on by default. Turn it off to refuse the `run` operation. Scripts are
+  arbitrary JavaScript inside an allowed tab and are not subject to the risky-action guard.
+- **Chat page hosts:** optional. These tabs are marked as chat tabs and skipped when choosing a default target.
+  This list grants no access. Pass an explicit tab id when you mean to work on a chat tab.
+- **Remote link enabled:** off disconnects the remote path. The TypingMind relay keeps its existing trusted-host rules.
+
+The paired server can read and operate allowed tabs, including pages where you are signed in. It cannot edit
+these local controls through the bridge protocol or use them to grant itself access. Site lists constrain the
+selected tab and navigation checks; they are not a network firewall. A page, redirect, or arbitrary script can
+make requests to other sites. Redirects are detected after navigation. Turning scripts off does not stop ordinary
+page scripts or make clicks harmless. Browser automation and signed-in data remain powerful access.
+
+Click **Unlink** to revoke this device on the server and forget its local credential. If the server is unreachable,
+local access stops immediately but server revocation is unconfirmed; revoke browser devices through the MCP client
+when it is reachable. Server revocation closes sockets and invalidates old credentials. Existing actions cannot
+be undone by disconnecting. After rejection, unlink before pairing a new code.
+
 ## Troubleshooting
 
 - **"The browser tools only work from the plugin itself, not from content nested inside it."** Chrome is running
@@ -98,11 +141,11 @@ plugin (sandboxed iframe) --window.postMessage--> content.js (same frame) --chro
 
 | File | Role |
 |---|---|
-| `manifest.json` | MV3 manifest: `tabs`, `scripting`, `debugger`, `storage`; all-frames content script; options page |
+| `manifest.json` | MV3 manifest: `tabs`, `scripting`, `debugger`, `storage`, `alarms`; all-frames content script; options page |
 | `content.js` | postMessage <-> chrome.runtime relay, injected into every frame |
 | `background.js` | service worker: authorization, site policy, tabs, actions, screenshots, `browser_run` |
 | `page-agent.js` | isolated-world agent: numbered snapshot, element geometry, dropdowns, scrolling, Markdown, risk checks |
-| `options.html` / `options.js` | trusted hosts |
+| `options.html` / `options.js` | trusted hosts, remote pairing, local safety controls and status |
 | `config.json` (optional) | `{ "trustedHosts": [...] }` default, used by the tests |
 
 ## Test
@@ -110,3 +153,7 @@ plugin (sandboxed iframe) --window.postMessage--> content.js (same frame) --chro
 `node test/run-browser-e2e.js` loads a copy of this folder (trusting 127.0.0.1) into Chrome for Testing / Chromium and
 runs the tools against `test/fixture.html` (branded Chrome ignores `--load-extension`; the runner finds Playwright's
 Chromium automatically, or set `CHROME=`).
+
+`node test/run-remote-bridge-e2e.js` starts a local server and a disposable Chrome for Testing profile, then tests
+the real WebSocket path, page snapshots, clicks and local-policy enforcement. It uses the existing `ws` package
+and Chromium's DevTools interface; Playwright is not required. It never attaches to your everyday browser.

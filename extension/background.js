@@ -7,29 +7,41 @@
 //   - real mouse clicks, keystrokes, typed text, screenshots and the model's own
 //     scripts: the DevTools protocol (chrome.debugger), attached per call
 //
-// Every request must come from a trusted page (TypingMind by default; more hosts
-// on the options page), so other websites cannot drive your tabs through this
-// extension. Each request also carries the plugin's site policy (allow / block
-// lists), checked before a tab is touched.
+// Trusted TypingMind frames use the existing relay. Paired remote clients enter
+// through a private service-worker socket and also obey the local site lists,
+// script switch and risky-action guard from the options page.
 //
 // Every reply is { ok: true, ... } or { ok: false, error, code? }.
 
-const VERSION = "0.4.2";
+const VERSION = "0.5.0";
+// Only socket callbacks hold this identity; no page message can serialize it.
+const REMOTE_SOURCE = Object.freeze({});
 const DEFAULT_TRUSTED = ["typingmind.com", "*.typingmind.com"];
 
-// ---- settings: trusted hosts -----------------------------------------------------
+// ---- settings -----------------------------------------------------------------------
 let settingsCache = null;
 async function settings() {
   if (settingsCache) return settingsCache;
   let file = {};
   try { const r = await fetch(chrome.runtime.getURL("config.json")); if (r.ok) file = await r.json(); } catch (e) {}
-  const s = await chrome.storage.local.get(["trustedHosts"]);
+  const s = await chrome.storage.local.get(["trustedHosts", "remoteLink", "remoteEnabled", "remoteAllow", "remoteBlock", "remoteConfirmRisky", "remoteScripts", "remoteChatHosts", "remoteAuthRejected"]);
   const hosts = Array.isArray(s.trustedHosts) && s.trustedHosts.length ? s.trustedHosts : Array.isArray(file.trustedHosts) && file.trustedHosts.length ? file.trustedHosts : DEFAULT_TRUSTED;
-  settingsCache = { hosts };
+  settingsCache = { ...s, hosts };
   return settingsCache;
 }
-chrome.storage.onChanged.addListener(() => { settingsCache = null; });
-chrome.runtime.onInstalled.addListener(() => { settings(); });
+
+// Pure helpers also used by the VM tests (no Chrome API needed).
+function normalizeServerUrl(value) {
+  const u = new URL(String(value).trim());
+  if (u.username || u.password || u.search || u.hash || (u.pathname && u.pathname !== "/")) throw new Error("Use the server URL only, without a path, login or query.");
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && ["localhost", "127.0.0.1"].includes(u.hostname))) throw new Error("Use HTTPS; HTTP is allowed only on localhost or 127.0.0.1.");
+  return u.origin;
+}
+function remotePolicy(policy, s) {
+  const list = value => Array.isArray(value) ? value.filter(x => typeof x === "string" && x.trim()) : [];
+  return { allow: list(policy && policy.allow), block: [...list(policy && policy.block), ...list(s.remoteBlock)], localAllow: list(s.remoteAllow), remote: true };
+}
+function chatTab(tab, s) { return (s.remoteChatHosts || []).some(p => hostMatches(hostOf(tab.url || tab.pendingUrl || ""), p)); }
 
 function hostMatches(host, pattern) {
   pattern = String(pattern || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "").replace(/:\d+$/, "");
@@ -39,9 +51,10 @@ function hostMatches(host, pattern) {
   if (pattern.startsWith("*.")) return host.endsWith(pattern.slice(1)) || host === pattern.slice(2);
   return host === pattern || host.endsWith("." + pattern);
 }
-function hostOf(url) { try { return new URL(url).hostname; } catch (e) { return ""; } }
+function hostOf(url) { try { return new URL(url).hostname.replace(/\.+$/, ""); } catch (e) { return ""; } }
 
 async function authorize(req, sender) {
+  if (sender === REMOTE_SOURCE) return { trusted: true, remote: true };
   const s = await settings();
   const pageUrl = sender && sender.tab && sender.tab.url || "";
   const host = hostOf(pageUrl);
@@ -52,11 +65,17 @@ async function authorize(req, sender) {
 // ---- site policy (plugin settings) ---------------------------------------------------
 function policyBlocks(url, policy) {
   if (!policy) return null;
+  if (policy.remote) {
+    try { if (!["http:", "https:"].includes(new URL(url).protocol)) return "remote access is limited to HTTP and HTTPS pages"; }
+    catch { return "remote access needs an HTTP or HTTPS URL"; }
+  }
   const host = hostOf(url);
-  if (!host) return null;   // about:blank, chrome://newtab etc. are handled by Chrome itself
-  const block = (policy.block || []).filter(Boolean), allow = (policy.allow || []).filter(Boolean);
-  if (block.some((p) => hostMatches(host, p))) return host + " is on the plugin's blocked sites list";
-  if (allow.length && !allow.some((p) => hostMatches(host, p))) return host + " is not on the plugin's allowed sites list";
+  if (!host) return null;
+  const block = (policy.block || []).filter(Boolean);
+  if (block.some((p) => hostMatches(host, p))) return host + " is on the " + (policy.remote ? "server or extension's" : "plugin's") + " blocked sites list";
+  for (const allow of [policy.allow || [], policy.localAllow || []]) {
+    if (allow.length && !allow.some((p) => hostMatches(host, p))) return host + " is not on the " + (policy.remote ? "server and extension's" : "plugin's") + " allowed sites list";
+  }
   return null;
 }
 async function checkTab(tabId, policy) {
@@ -71,13 +90,6 @@ function checkUrl(url, policy) {
 }
 
 // ---- messaging ---------------------------------------------------------------------------
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!msg || msg.type !== "crb") return;
-  handle(msg.request || {}, sender, msg.depth, msg.ancestors)
-    .then((r) => sendResponse(r))
-    .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e), code: e && e.code }));
-  return true; // async sendResponse
-});
 
 function withTimeout(promise, ms, what) {
   let t;
@@ -90,12 +102,14 @@ function withTimeout(promise, ms, what) {
 async function resolveTabId(req, sender) {
   if (req.tabId != null) return Number(req.tabId);
   const own = sender && sender.tab ? sender.tab.id : null;
+  const cfg = sender === REMOTE_SOURCE ? await settings() : null;
+  const skip = t => t.id === own || (cfg && chatTab(t, cfg));
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (tab && tab.id !== own) return tab.id;
-  const others = (await chrome.tabs.query({})).filter((t) => t.id !== own && /^https?:/.test(t.url || ""));
+  if (tab && !skip(tab)) return tab.id;
+  const others = (await chrome.tabs.query({})).filter((t) => !skip(t) && /^https?:/.test(t.url || ""));
   others.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
   if (others.length) return others[0].id;
-  if (tab) return tab.id;
+  if (tab && !cfg) return tab.id;
   throw new Error("no tab to act on (open one with browser_tabs, or pass a tabId)");
 }
 
@@ -109,19 +123,28 @@ async function handle(req, sender, depth, ancestors) {
   // TypingMind's plugin frame sits behind sandboxed wrapper frames, so a stricter
   // frame-position check cannot tell it apart from previews nested inside it.
   const frame = { depth, ancestors: Array.isArray(ancestors) ? ancestors.map(String).slice(0, 20) : [] };
-  if (auth.trusted && !(depth >= 1)) auth.trusted = false, auth.nested = true;
+  if (!auth.remote && auth.trusted && !(depth >= 1)) auth.trusted = false, auth.nested = true;
+  if (auth.remote && req.op === "ping") return { ok: true, version: VERSION, trusted: true, remote: true };
   if (req.op === "ping") return { ok: true, version: VERSION, trusted: auth.trusted, nested: !!auth.nested, host: auth.host, frame };
   if (auth.nested) return { ok: false, code: "untrusted", error: "only frames inside the page may use the Code Runner bridge, not the page itself (frame depth " + depth + ", ancestors " + JSON.stringify(frame.ancestors) + ")." };
   if (!auth.trusted) return { ok: false, code: "untrusted", error: "this page (" + (auth.host || "unknown") + ") is not a trusted host of the Code Runner bridge. Add it on the extension's options page." };
-  const policy = req.policy || null;
+  let policy = req.policy || null;
+  if (auth.remote) {
+    const s = await settings();
+    if (s.remoteEnabled === false || !s.remoteLink || s.remoteAuthRejected) return { ok: false, code: "offline", error: "Remote link is disabled or unpaired in the extension." };
+    if (req.op === "run" && s.remoteScripts === false) return { ok: false, code: "scripts-disabled", error: "Running scripts (browser_run) is disabled on the extension's options page." };
+    policy = remotePolicy(policy, s);
+    req = { ...req, policy, confirmRisky: s.remoteConfirmRisky !== false || req.confirmRisky !== false };
+  }
 
   switch (req.op) {
     // ---- tabs ----
     case "tabs.list": {
       const tabs = await chrome.tabs.query(req.allWindows ? {} : { currentWindow: true });
       const own = sender && sender.tab ? sender.tab.id : null;
-      const shown = tabs.filter((t) => t.id === own || !policyBlocks(t.url || t.pendingUrl || "", policy));
-      return { ok: true, tabs: shown.map((t) => ({ ...tabView(t), chat: t.id === own })), hidden: tabs.length - shown.length };
+      const cfg = auth.remote ? await settings() : null;
+      const shown = tabs.filter((t) => (!auth.remote && t.id === own) || !policyBlocks(t.url || t.pendingUrl || "", policy));
+      return { ok: true, tabs: shown.map((t) => ({ ...tabView(t), chat: cfg ? chatTab(t, cfg) : t.id === own })), hidden: tabs.length - shown.length };
     }
     case "tabs.activate": {
       const id = await resolveTabId(req, sender);
@@ -131,7 +154,7 @@ async function handle(req, sender, depth, ancestors) {
       return { ok: true, tab: tabView(t) };
     }
     case "tabs.open": {
-      if (req.url) checkUrl(req.url, policy);
+      if (req.url || auth.remote) checkUrl(req.url || "about:blank", policy);
       const t = await chrome.tabs.create({ url: req.url || undefined, active: req.active !== false });
       if (req.url) { await waitForLoad(t.id, 15000); await landed(t.id, policy, true); }
       return { ok: true, tab: tabView(await chrome.tabs.get(t.id)) };
@@ -147,6 +170,7 @@ async function handle(req, sender, depth, ancestors) {
       await checkTab(id, policy);
       await chrome.tabs.reload(id);
       await waitForLoad(id, 15000);
+      if (auth.remote) await landed(id, policy, false);
       return { ok: true, tab: id };
     }
     case "tabs.navigate": {
@@ -486,6 +510,7 @@ async function pageAct(tabId, req, policy, sender) {
       } else if (name === "reload") {
         await chrome.tabs.reload(current);
         await waitForLoad(current, 20000);
+        if (policy && policy.remote) await landed(current, policy, false);
         steps.push(label + " -> ok");
       } else if (name === "wait") {
         const s = Math.min(Math.max(Number(a.seconds) || 2, 0.2), 30);
@@ -506,7 +531,7 @@ async function pageAct(tabId, req, policy, sender) {
         await chrome.tabs.update(current, { active: true });
         steps.push(label + " #" + current + " -> ok");
       } else if (name === "open_tab") {
-        if (a.url) checkUrl(a.url, policy);
+        if (a.url || policy && policy.remote) checkUrl(a.url || "about:blank", policy);
         const t = await chrome.tabs.create({ url: a.url || undefined, active: true });
         if (a.url) { await waitForLoad(t.id, 20000); await landed(t.id, policy, true); }
         current = t.id;
@@ -523,7 +548,7 @@ async function pageAct(tabId, req, policy, sender) {
       }
     } catch (e) {
       steps.push(label + " -> FAILED: " + String(e && e.message || e));
-      stopped = stopped || { failed: true };
+      stopped = stopped || { failed: true, ...(e.code ? { code: e.code } : {}) };
       break;
     }
   }
@@ -601,4 +626,115 @@ async function runViaDebugger(tabId, code, timeoutMs) {
   } finally {
     chrome.debugger.onEvent.removeListener(onEvent);
   }
+}
+
+
+// ---- outbound remote link ------------------------------------------------------------
+let remoteSocket = null, remoteGeneration = 0, remoteKey = "", remoteFailures = 0;
+let remoteRetry = null, remotePing = null, remoteHello = null;
+let remoteStatus = { connected: false, host: "", user: "", since: null, lastError: "" };
+const MAX_REMOTE_MESSAGE = 32 * 1024 * 1024;
+async function showRemoteStatus(change) {
+  remoteStatus = { ...remoteStatus, ...change };
+  try { await chrome.storage.session.set({ remoteStatus }); } catch (e) {}
+  try {
+    await chrome.action.setBadgeText({ text: remoteStatus.connected ? "on" : "" });
+    await chrome.action.setBadgeBackgroundColor({ color: "#1a7f37" });
+    await chrome.action.setTitle({ title: remoteStatus.connected ? "Code Runner: connected to " + remoteStatus.host : "Code Runner Browser Bridge" });
+  } catch (e) {}
+}
+function stopRemoteTimers() {
+  clearTimeout(remoteRetry); remoteRetry = null;
+  clearTimeout(remoteHello); remoteHello = null;
+  clearInterval(remotePing); remotePing = null;
+}
+async function syncRemote() {
+  const generation = ++remoteGeneration;
+  const s = await settings();
+  if (generation !== remoteGeneration) return;
+  let url = "", reason = "";
+  try { if (s.remoteLink) url = normalizeServerUrl(s.remoteLink.url); } catch (e) { reason = e.message; }
+  const usable = url && s.remoteEnabled !== false && !s.remoteAuthRejected && s.remoteLink.deviceId && s.remoteLink.token;
+  const key = usable ? url + "\n" + s.remoteLink.deviceId + "\n" + s.remoteLink.token : "";
+  if (key && key === remoteKey && remoteSocket && remoteSocket.readyState <= WebSocket.OPEN) return;
+  stopRemoteTimers();
+  const old = remoteSocket; remoteSocket = null; old?.close();
+  remoteKey = key;
+  if (!usable) {
+    await showRemoteStatus({ connected: false, host: url ? new URL(url).host : "", user: "", since: null,
+      lastError: s.remoteAuthRejected ? "Pairing rejected, pair again." : reason || (s.remoteEnabled === false ? "Remote link is disabled." : "") });
+    return;
+  }
+  const ws = new WebSocket(url.replace(/^http/, "ws") + "/bridge");
+  remoteSocket = ws;
+  void showRemoteStatus({ connected: false, host: new URL(url).host, user: "", since: null });
+  let ready = false;
+  const current = () => remoteSocket === ws;
+  ws.onopen = () => {
+    if (!current()) return ws.close();
+    ws.send(JSON.stringify({ type: "hello", deviceId: s.remoteLink.deviceId, token: s.remoteLink.token, version: VERSION }));
+    remoteHello = setTimeout(() => { if (current() && !ready) ws.close(4400, "Handshake timed out"); }, 10_000);
+  };
+  ws.onmessage = async event => {
+    if (!current() || typeof event.data !== "string") return;
+    if (new TextEncoder().encode(event.data).length > MAX_REMOTE_MESSAGE) return ws.close(4400, "Bridge message exceeds 32 MB");
+    let msg;
+    try { msg = JSON.parse(event.data); } catch (e) { return ws.close(4400, "Invalid bridge message"); }
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "ready" && !ready && typeof msg.user === "string") {
+      clearTimeout(remoteHello); remoteHello = null; ready = true; remoteFailures = 0;
+      await showRemoteStatus({ connected: true, user: msg.user, since: Date.now(), lastError: "" });
+      if (!current()) return;
+      remotePing = setInterval(() => { if (current() && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" })); }, 20_000);
+    } else if (ready && msg.type === "req" && typeof msg.id === "string" && msg.id.length <= 100 && msg.request && typeof msg.request === "object") {
+      let response;
+      try { response = await handle(msg.request, REMOTE_SOURCE); }
+      catch (e) { response = { ok: false, error: String(e && e.message || e), ...(e.code ? { code: e.code } : {}) }; }
+      if (!current() || ws.readyState !== WebSocket.OPEN) return;
+      let reply = JSON.stringify({ type: "res", id: msg.id, response });
+      if (new TextEncoder().encode(reply).length > MAX_REMOTE_MESSAGE) reply = JSON.stringify({ type: "res", id: msg.id, response: { ok: false, error: "Browser response exceeds 32 MB; narrow the request." } });
+      ws.send(reply);
+    }
+  };
+  ws.onerror = () => { if (current()) void showRemoteStatus({ lastError: "Connection failed; retrying." }); };
+  ws.onclose = async event => {
+    if (!current()) return;
+    remoteSocket = null; stopRemoteTimers();
+    if (event.code === 4401) {
+      await chrome.storage.local.set({ remoteAuthRejected: true });
+      await showRemoteStatus({ connected: false, since: null, lastError: "Pairing rejected, pair again." });
+      return;
+    }
+    await showRemoteStatus({ connected: false, since: null, lastError: "Connection closed; retrying." });
+    const delay = Math.max(1000, Math.min(60_000, 1000 * 2 ** Math.min(remoteFailures++, 6) * (0.8 + Math.random() * 0.4)));
+    if (!remoteSocket && remoteKey === key) remoteRetry = setTimeout(() => void syncRemote().catch(() => {}), delay);
+  };
+}
+
+if (typeof chrome !== "undefined" && chrome.runtime) {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || msg.type !== "crb") return;
+  handle(msg.request || {}, sender, msg.depth, msg.ancestors)
+    .then((r) => sendResponse(r))
+    .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e), code: e && e.code }));
+  return true; // async sendResponse
+});
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local") return;
+    settingsCache = null;
+    if (["remoteLink", "remoteEnabled", "remoteAuthRejected"].some(k => k in changes)) void syncRemote().catch(() => {});
+  });
+  chrome.alarms.onAlarm.addListener(alarm => {
+    if (alarm.name === "crb-remote" && !remoteSocket) void syncRemote().catch(() => {});
+  });
+  async function bootRemote() {
+    // storage.local otherwise exposes pairing credentials to content scripts.
+    await chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+    await chrome.alarms.create("crb-remote", { periodInMinutes: 1 });
+    await syncRemote();
+  }
+  chrome.runtime.onInstalled.addListener(() => { settingsCache = null; void bootRemote().catch(() => {}); });
+  chrome.runtime.onStartup.addListener(() => void bootRemote().catch(() => {}));
+  void bootRemote().catch(e => showRemoteStatus({ connected: false, lastError: String(e.message || e) }));
 }

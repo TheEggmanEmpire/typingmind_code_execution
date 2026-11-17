@@ -1,0 +1,12 @@
+.git
+.claude
+**/node_modules
+test
+worker
+docs
+extension
+plugin.json
+build.js
+server/test
+server/sandbox/crbox
+*.md

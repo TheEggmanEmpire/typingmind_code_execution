@@ -2,18 +2,40 @@
 <meta charset="utf-8">
 <title>Code Runner Browser Bridge</title>
 <style>
-  body { font: 14px/1.5 system-ui, sans-serif; max-width: 640px; margin: 24px auto; padding: 0 16px; color: #1f2328; }
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 700px; margin: 24px auto; padding: 0 16px; color: #1f2328; }
   code, textarea { font: 13px ui-monospace, Menlo, monospace; }
-  textarea { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #d0d7de; border-radius: 6px; }
+  textarea, input[type=text] { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #d0d7de; border-radius: 6px; }
   button { padding: 6px 12px; border: 1px solid #d0d7de; border-radius: 6px; background: #f6f8fa; cursor: pointer; }
-  .mut { color: #656d76; font-size: 13px; } #saved { color: #1a7f37; margin-left: 8px; }
+  label { display: block; margin: 12px 0; } .mut { color: #656d76; font-size: 13px; }
+  #saved { color: #1a7f37; margin-left: 8px; } #pairResult { white-space: pre-wrap; } fieldset { margin: 20px 0; border: 1px solid #d0d7de; }
 </style>
 <h2>Code Runner Browser Bridge</h2>
-<p>This extension lets the Code Runner plugin in TypingMind read and operate your tabs. It only answers the pages
-on the trusted hosts below, so other websites cannot use it.</p>
-<h3>Trusted hosts</h3>
-<p class="mut">One per line. <code>*.example.com</code> matches subdomains. Add your own host if you run TypingMind
-self-hosted or on a custom domain.</p>
+<p>Connect a remote MCP client, or use the Code Runner plugin in TypingMind. The two paths work independently.</p>
+<fieldset>
+  <legend>Remote link</legend>
+  <p id="connection" role="status">Checking connection…</p>
+  <p class="mut" id="lastError"></p>
+  <label><input id="remoteEnabled" type="checkbox"> Remote link enabled</label>
+  <p class="mut">Ask the AI to use a browser tool, then paste the server URL and the one-time pairing code it gives you. HTTPS is required except on localhost or 127.0.0.1.</p>
+  <label>Server URL <input id="serverUrl" type="text" placeholder="https://your-server.up.railway.app" autocomplete="off" spellcheck="false"></label>
+  <label>Pairing code <input id="pairCode" type="text" placeholder="XXXX-XXXX-XX" autocomplete="off" spellcheck="false"></label>
+  <label>Device name <input id="deviceName" type="text" value="Chrome on this computer" maxlength="100"></label>
+  <p><button id="pair">Pair</button> <button id="unlink">Unlink</button></p>
+  <p id="pairResult" role="status"></p>
+  <h3>Local safety controls</h3>
+  <p class="mut">These controls apply to remote requests. The server cannot relax them. Host lists accept one host per line, including <code>*.example.com</code>. A plain host also matches its subdomains.</p>
+  <label>Allowed sites <textarea id="remoteAllow" rows="3" placeholder="Empty means no local allow restriction"></textarea></label>
+  <label>Blocked sites <textarea id="remoteBlock" rows="3"></textarea></label>
+  <label><input id="remoteConfirmRisky" type="checkbox"> Always confirm risky actions</label>
+  <p class="mut">Holds recognizable risky clicks and Enter/Space presses until the client repeats with confirmation. This relies on the client asking you; it is not a browser approval dialog.</p>
+  <label><input id="remoteScripts" type="checkbox"> Allow running scripts (browser_run)</label>
+  <p class="mut">Scripts can act freely inside an allowed page and make network requests. The risky-action check does not cover scripts.</p>
+  <label>Chat page hosts <textarea id="remoteChatHosts" rows="3" placeholder="Optional: chat.example.com"></textarea></label>
+  <p class="mut">Remote tab lists mark these as chat tabs. Default tab selection skips them. This list grants no access.</p>
+</fieldset>
+<h3>Trusted hosts (TypingMind)</h3>
+<p>The plugin relay answers only frames inside pages on these trusted hosts. Add your own host for self-hosted TypingMind or a custom domain.</p>
+<p class="mut">These hosts authorize the TypingMind path. Remote pairing does not change them.</p>
 <textarea id="hosts" rows="5"></textarea>
-<p><button id="save">Save</button><span id="saved"></span></p>
+<p><button id="save">Save settings</button><span id="saved" role="status"></span></p>
 <script src="options.js"></script>

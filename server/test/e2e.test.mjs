@@ -1,0 +1,143 @@
+// End to end: the real server process, a real MCP client over Streamable HTTP.
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-e2e-"));
+const port = 20000 + Math.floor(Math.random() * 20000);
+const base = "http://127.0.0.1:" + port;
+const KEY = "e2e-key-0123456789abcdef";
+let proc, log = "";
+
+async function client(headers = {}) {
+  const c = new Client({ name: "e2e", version: "1" });
+  await c.connect(new StreamableHTTPClientTransport(new URL(base + "/mcp"), { requestInit: { headers: { Authorization: "Bearer " + KEY, ...headers } } }));
+  return c;
+}
+const textOf = (r) => r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+const call = async (c, name, args) => c.callTool({ name, arguments: args }, undefined, { timeout: 120000 });
+
+before(async () => {
+  proc = spawn(process.execPath, ["src/index.js"], { cwd: root, env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, MCP_API_KEY: KEY, PUBLIC_URL: base, WAIT_BUDGET_S: "5", CODE_SECRETS: "E2E_TOKEN=supersecretvalue123", REA: "0" }, stdio: ["ignore", "pipe", "pipe"] });
+  proc.stdout.on("data", (d) => (log += d)); proc.stderr.on("data", (d) => (log += d));
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(base + "/health")).ok) return; } catch (e) {}
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error("server did not start:\n" + log);
+});
+after(() => { proc && proc.kill("SIGTERM"); fs.rmSync(dataDir, { recursive: true, force: true }); });
+
+test("health reports an active sandbox", async () => {
+  const h = await (await fetch(base + "/health")).json();
+  assert.equal(h.ok, true);
+  assert.notEqual(h.sandbox, "unavailable", log);
+  assert.ok(h.languages.includes("python"));
+});
+
+test("requests without the key are refused", async () => {
+  const r = await fetch(base + "/mcp", { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+  assert.equal(r.status, 401);
+});
+
+test("tools are listed with instructions", async () => {
+  const c = await client();
+  const { tools } = await c.listTools();
+  for (const n of ["run_code", "job", "schedule", "serve_file", "preview_file", "manage_files", "make_image", "edit_image", "browser_state", "browser_act", "browser_run", "browser_tabs"]) assert.ok(tools.some((t) => t.name === n), n);
+  assert.match(c.getInstructions() || "", /Code Runner/);
+});
+
+test("python keeps variables and files across separate requests; secrets are redacted", async () => {
+  const c1 = await client();
+  let r = await call(c1, "run_code", { language: "python", code: "x = 41\nopen('note.txt','w').write('hello')\nimport os\nprint(os.environ['E2E_TOKEN'])" });
+  assert.match(textOf(r), /\[secret E2E_TOKEN\]/);
+  assert.doesNotMatch(textOf(r), /supersecretvalue123/);
+  assert.match(textOf(r), /note\.txt/);
+  const c2 = await client();
+  r = await call(c2, "run_code", { language: "python", code: "x + 1" });
+  assert.match(textOf(r), /42/);
+  r = await call(c2, "run_code", { language: "javascript", code: "const fs2 = await import('node:fs'); return fs2.readFileSync('note.txt','utf8')" });
+  assert.match(textOf(r), /hello/);
+});
+
+test("the code cannot read the server's environment or key", async () => {
+  const c = await client();
+  const r = await call(c, "run_code", { language: "bash", code: "env | sort; cat /proc/$PPID/environ 2>&1 | tr '\\0' '\\n' | head -50" });
+  assert.doesNotMatch(textOf(r), new RegExp(KEY));
+  assert.doesNotMatch(textOf(r), /MCP_API_KEY/);
+});
+
+test("workspaces are separate per user", async () => {
+  const a = await client({ "X-User-ID": "alice" });
+  const b = await client({ "X-User-ID": "bob" });
+  await call(a, "run_code", { language: "bash", code: "echo private > a.txt" });
+  const r = await call(b, "manage_files", { action: "list" });
+  assert.doesNotMatch(textOf(r), /a\.txt/);
+});
+
+test("a long run becomes a job that can be followed", async () => {
+  const c = await client();
+  let r = await call(c, "run_code", { language: "bash", code: "for i in 1 2 3 4 5 6 7 8; do echo tick $i; sleep 1; done; echo finished" });
+  const m = /job\s+`?([a-z0-9]+)`?/i.exec(textOf(r));
+  assert.ok(m, textOf(r));
+  r = await call(c, "job", { action: "output", id: m[1], wait: 20 });
+  assert.match(textOf(r), /finished/);
+});
+
+test("serve_file, preview_file and the upload page give working links", async () => {
+  const c = await client();
+  await call(c, "run_code", { language: "python", code: "open('t.csv','w').write('a,b\\n1,2\\n')" });
+  let r = await call(c, "serve_file", { path: "t.csv", share: true });
+  const urls = [...textOf(r).matchAll(/http:\/\/127\.0\.0\.1:\d+\/f\/[^\s)]+/g)].map((x) => x[0]);
+  assert.ok(urls.length >= 2, textOf(r));
+  let f = await fetch(urls[0]);
+  assert.equal(f.status, 200);
+  assert.equal(await f.text(), "a,b\n1,2\n");
+  assert.match(f.headers.get("content-security-policy") || "", /sandbox/);
+  r = await call(c, "preview_file", { path: "t.csv" });
+  const p = /http:\/\/127\.0\.0\.1:\d+\/p\/[^\s)]+/.exec(textOf(r))[0];
+  f = await fetch(p);
+  assert.equal(f.status, 200);
+  assert.match(await f.text(), /<html/i);
+  // revoke the share
+  await call(c, "manage_files", { action: "unshare", path: "t.csv" });
+  assert.equal((await fetch(urls[urls.length - 1])).status, 403);
+  // upload page
+  r = await call(c, "manage_files", { action: "upload_link" });
+  const w = /http:\/\/127\.0\.0\.1:\d+\/w\/[^\s)]+/.exec(textOf(r))[0];
+  assert.equal((await fetch(w)).status, 200);
+  const up = await fetch(w + "upload?name=in.txt", { method: "POST", body: "uploaded" });
+  assert.equal(up.status, 200, await up.text());
+  r = await call(c, "run_code", { language: "bash", code: "cat uploads/in.txt" });
+  assert.match(textOf(r), /uploaded/);
+  assert.equal((await fetch(base + "/f/forged.token/x")).status, 403);
+});
+
+test("a symlink planted by the code is not served", async () => {
+  const c = await client();
+  await call(c, "run_code", { language: "bash", code: "ln -s /etc/passwd leak.txt" });
+  const r = await call(c, "serve_file", { path: "leak.txt", as: "text" });
+  assert.doesNotMatch(textOf(r), /root:x:0/);
+});
+
+test("status, schedule and browser pairing answer sensibly", async () => {
+  const c = await client();
+  let r = await call(c, "manage_files", { action: "status" });
+  assert.match(textOf(r), /Sandbox:/);
+  r = await call(c, "schedule", { action: "create", name: "beat", language: "bash", code: "date >> beat.txt; echo ran", every_minutes: 5 });
+  assert.match(textOf(r), /Created schedule beat/);
+  r = await call(c, "schedule", { action: "run", name: "beat" });
+  assert.match(textOf(r), /done/);
+  r = await call(c, "run_code", { language: "bash", code: "cat schedules/beat.log" });
+  assert.match(textOf(r), /ran/);
+  r = await call(c, "schedule", { action: "delete", name: "beat" });
+  r = await call(c, "browser_tabs", { action: "list" });
+  assert.match(textOf(r), /Pairing code: [A-Z0-9-]+/);
+});
