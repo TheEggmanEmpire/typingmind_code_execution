@@ -1,30 +1,20 @@
-// REA (Reverse Engineer Anything, npm package rea-agents) behind POST /rea/mcp.
+// REA (Reverse Engineer Anything, npm package rea-agents) as part of the main MCP
+// endpoint: its tools are listed on /mcp next to the Code Runner tools.
 //
 // REA is a stdio MCP server. Each workspace gets its own REA process, started on
-// first use through the same sandbox as model-written code (cwd = the workspace,
-// so REA sees uploaded and generated files), kept alive between calls and stopped
-// after REA_IDLE_MIN idle minutes or on shutdown. The HTTP side is stateless like
-// /mcp: every POST builds a small MCP server that forwards to that child through
-// the SDK Client over the child's stdin/stdout (newline-delimited JSON-RPC).
-//
-// Forwarded: initialize (REA's capabilities and instructions, without listChanged,
-// which a stateless endpoint cannot deliver), tools/list (cached per child),
-// tools/call (progress passed through when the caller sent a progressToken),
-// prompts/list, prompts/get and completion/complete. REA 6.2 offers no resources.
+// the first call through the same sandbox as model-written code (cwd = the
+// workspace, so REA sees uploaded and generated files), kept alive between calls
+// and stopped after REA_IDLE_MIN idle minutes or on shutdown. Calls are forwarded
+// through the SDK Client over the child's stdin/stdout (newline-delimited JSON-RPC);
+// progress is passed through when the caller sent a progressToken.
 
 import fs from "node:fs";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ReadBuffer, serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
-import {
-  ListToolsRequestSchema, CallToolRequestSchema, ListPromptsRequestSchema, GetPromptRequestSchema, CompleteRequestSchema,
-  ListToolsResultSchema, CallToolResultSchema, ListPromptsResultSchema, GetPromptResultSchema, CompleteResultSchema
-} from "@modelcontextprotocol/sdk/types.js";
+import { ListToolsResultSchema, CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { config } from "./config.js";
-import { getWorkspace } from "./sessions.js";
-import { initSandbox, spawnInWorkspace, killTree } from "./sandbox.js";
+import { spawnInWorkspace, killTree } from "./sandbox.js";
 
 const BODY_MAX = 4 * 1024 * 1024;
 const START_TIMEOUT_MS = 90000;
@@ -182,110 +172,73 @@ function errorText(e, entry) {
   return msg;
 }
 
-// ---- outer MCP server, one per request -------------------------------------------
+// ---- part of the main MCP endpoint ------------------------------------------------
+// REA's tools are listed next to the Code Runner tools on /mcp and calls to them
+// are forwarded to the workspace's REA process.
 function withoutProgress(params) {
   const out = { ...params };
   if (out._meta) { const { progressToken, ...rest } = out._meta; out._meta = Object.keys(rest).length ? rest : undefined; if (!out._meta) delete out._meta; }
   return out;
 }
 
-function outerServer(ws, info) {
-  const caps = { tools: {} };
-  if (info.capabilities.prompts) caps.prompts = {};
-  if (info.capabilities.completions) caps.completions = {};
-  const server = new Server({ name: "code-runner-rea", version: info.version }, { capabilities: caps, instructions: info.instructions });
+// The tool list depends on the installed REA version only, so one answer serves
+// every workspace: listing tools does not start a process per user.
+let catalog = null, catalogPending = null, catalogFailedAt = 0;
+const CATALOG_RETRY_MS = 60000;
+
+async function fetchTools(entry) {
+  const tools = [];
+  let cursor;
+  do {
+    const r = await entry.client.request({ method: "tools/list", params: cursor ? { cursor } : {} }, ListToolsResultSchema, { timeout: 60000 });
+    tools.push(...r.tools);
+    cursor = r.nextCursor;
+  } while (cursor);
+  return tools;
+}
+
+// `reserved`: names of the server's own tools; a REA tool of the same name is left out.
+export async function reaListTools(ws, reserved = []) {
+  if (!config.rea || !reaAvailable()) return [];
+  if (catalog) return catalog;
+  // A REA that cannot start must not make every tools/list slow or fail.
+  if (Date.now() - catalogFailedAt < CATALOG_RETRY_MS) return [];
+  catalogPending ||= using(ws, fetchTools).then((tools) => {
+    const taken = new Set(reserved);
+    catalog = tools.filter((t) => !taken.has(t.name));
+    return catalog;
+  }).catch((e) => {
+    catalogFailedAt = Date.now();
+    console.error("rea: tools are not offered: " + (e && e.message || e));
+    return [];
+  }).finally(() => { catalogPending = null; });
+  return catalogPending;
+}
+export const reaInstructions = () => (known && known.instructions) || "";
+
+// params: the tools/call params as received; extra: the MCP handler's extra (signal, sendNotification).
+export async function reaCallTool(ws, params, extra) {
+  const token = params._meta && params._meta.progressToken;
   const timeout = config.reaCallTimeoutS * 1000;
-
-  server.setRequestHandler(ListToolsRequestSchema, async () => using(ws, async (entry) => {
-    if (!entry.tools) {
-      const tools = [];
-      let cursor;
-      do {
-        const r = await entry.client.request({ method: "tools/list", params: cursor ? { cursor } : {} }, ListToolsResultSchema, { timeout: 60000 });
-        tools.push(...r.tools);
-        cursor = r.nextCursor;
-      } while (cursor);
-      entry.tools = tools;
-    }
-    return { tools: entry.tools };
-  }));
-
-  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    const token = request.params._meta && request.params._meta.progressToken;
-    let entry;
-    try {
-      return await using(ws, async (e) => {
-        entry = e;
-        const options = { timeout, maxTotalTimeout: timeout, signal: extra.signal };
-        if (token !== undefined) {
-          options.onprogress = (p) => {
-            extra.sendNotification({ method: "notifications/progress", params: { ...p, progressToken: token } }).catch(() => {});
-          };
-        }
-        return await e.client.request({ method: "tools/call", params: withoutProgress(request.params) }, CallToolResultSchema, options);
-      });
-    } catch (e) {
-      if (extra.signal.aborted) throw e;
-      return { content: [{ type: "text", text: "REA call failed: " + errorText(e, entry) }], isError: true };
-    }
-  });
-
-  if (caps.prompts) {
-    server.setRequestHandler(ListPromptsRequestSchema, async (request) => using(ws, (e) => e.client.request({ method: "prompts/list", params: request.params || {} }, ListPromptsResultSchema, { timeout: 60000 })));
-    server.setRequestHandler(GetPromptRequestSchema, async (request) => using(ws, (e) => e.client.request({ method: "prompts/get", params: request.params }, GetPromptResultSchema, { timeout: 60000 })));
-  }
-  if (caps.completions) {
-    server.setRequestHandler(CompleteRequestSchema, async (request) => using(ws, (e) => e.client.request({ method: "completion/complete", params: request.params }, CompleteResultSchema, { timeout: 60000 })));
-  }
-  return server;
-}
-
-// ---- HTTP ---------------------------------------------------------------------------
-function json(res, status, body, headers = {}) {
-  const buf = Buffer.from(JSON.stringify(body));
-  res.writeHead(status, { "Content-Type": "application/json", "Content-Length": buf.length, "Cache-Control": "no-store", ...headers });
-  res.end(buf);
-}
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = []; let size = 0;
-    req.on("data", (c) => {
-      size += c.length;
-      if (size > BODY_MAX) { reject(Object.assign(new Error("request body too large"), { status: 413 })); req.destroy(); return; }
-      chunks.push(c);
+  let entry;
+  try {
+    return await using(ws, async (e) => {
+      entry = e;
+      const options = { timeout, maxTotalTimeout: timeout, signal: extra.signal };
+      if (token !== undefined) {
+        options.onprogress = (p) => {
+          extra.sendNotification({ method: "notifications/progress", params: { ...p, progressToken: token } }).catch(() => {});
+        };
+      }
+      return await e.client.request({ method: "tools/call", params: withoutProgress(params) }, CallToolResultSchema, options);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
-const header = (req, name) => { const v = req.headers[name]; return Array.isArray(v) ? v[0] : v; };
-const firstId = (body) => { const m = Array.isArray(body) ? body.find((x) => x && x.id !== undefined) : body; return m && m.id !== undefined ? m.id : null; };
-const onlyLightMessages = (body) => (Array.isArray(body) ? body : [body]).every((m) => m && (m.id === undefined || m.method === "initialize" || m.method === "ping"));
-
-// Authentication is the caller's job (index.js runs the same gate as for /mcp).
-export async function handleReaMcp(req, res) {
-  if (req.method !== "POST") return json(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed: this server is stateless, use POST." }, id: null }, { Allow: "POST" });
-  let body;
-  try { body = JSON.parse((await readBody(req)).toString("utf8")); }
-  catch (e) { return json(res, e.status || 400, { jsonrpc: "2.0", error: { code: -32700, message: e.status ? e.message : "Parse error" }, id: null }); }
-  const cmd = status();
-  if (!cmd.ok) return json(res, 200, { jsonrpc: "2.0", error: { code: -32000, message: "REA is not available on this server. " + cmd.reason + " " + HOW_TO_ENABLE }, id: firstId(body) });
-
-  const ws = getWorkspace(header(req, "x-user-id") || "default", header(req, "x-workspace") || "main");
-  let info = known;
-  // initialize/ping/notifications reuse what an earlier REA reported; anything else starts this workspace's REA now.
-  if (!info || !onlyLightMessages(body)) {
-    try { await initSandbox(); info = (await ready(ws)).info; }
-    catch (e) { return json(res, 200, { jsonrpc: "2.0", error: { code: -32603, message: errorText(e) }, id: firstId(body) }); }
+  } catch (e) {
+    if (extra.signal && extra.signal.aborted) throw e;
+    if (e && e.unavailable) return { content: [{ type: "text", text: "REA is not available on this server. " + e.message + " " + HOW_TO_ENABLE }], isError: true };
+    return { content: [{ type: "text", text: "REA call failed: " + errorText(e, entry) }], isError: true };
   }
-  const server = outerServer(ws, info);
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  res.on("close", () => { transport.close().catch(() => {}); server.close().catch(() => {}); });
-  await server.connect(transport);
-  await transport.handleRequest(req, res, body);
 }
 
-// Stops every REA process (shutdown). Resolves once they have exited or after a few seconds.
 export async function shutdownRea() {
   const all = [...children.values()];
   const exits = all.map((e) => e.closed ? null : new Promise((r) => e.child.once("close", r)));
@@ -300,5 +253,5 @@ export function reaReport() { return { available: reaAvailable(), running: child
 export const __test = {
   setIdleMs(ms) { idleMs = ms; },
   children,
-  reset() { resolved = undefined; known = null; }
+  reset() { resolved = undefined; known = null; catalog = null; catalogFailedAt = 0; }
 };

@@ -1,13 +1,15 @@
-// REA proxy (/rea/mcp) against a real local REA install, under the real sandbox.
-// Needs the managed runtime at ~/.local/share/rea/runtime (or REA_TEST_RUNTIME);
-// skipped with a reason when it is missing.
+// REA as part of the main MCP endpoint, against a real local REA install and the
+// real sandbox. Needs the managed runtime at ~/.local/share/rea/runtime (or
+// REA_TEST_RUNTIME); skipped with a reason when it is missing.
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import http from 'node:http';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 const runtime = process.env.REA_TEST_RUNTIME || path.join(os.homedir(), '.local/share/rea/runtime');
 const reaNode = path.join(runtime, 'node_modules/node/bin/node');
@@ -16,140 +18,73 @@ const node = fs.existsSync(reaNode) ? reaNode : process.execPath;
 const missing = !fs.existsSync(reaScript) ? `local REA install not found at ${reaScript}` : null;
 const opts = missing ? { skip: missing } : {};
 
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const data = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-test-'));
-fs.chmodSync(data, 0o711);
-process.env.DATA_DIR = data;
-process.env.ALLOW_NO_AUTH = '1';
-process.env.REA_COMMAND = `${node} ${reaScript} mcp`;
-// Non-root mode: RLIMIT_NPROC counts every task of this unix user, so the default
-// 256 fails on a busy desktop. Stay below the hard limit (above it crbox refuses).
-if (!process.env.MAX_PROCS) {
-  const hard = spawnSync('sh', ['-c', 'ulimit -Hu'], { encoding: 'utf8' }).stdout.trim();
-  process.env.MAX_PROCS = String(/^\d+$/.test(hard) ? Math.min(Number(hard) - 1, 20000) : 20000);
+const KEY = 'rea-test-key-0123456789abcdef';
+let proc, log = '';
+
+function start(port, extra = {}) {
+  const p = spawn(process.execPath, ['src/index.js'], { cwd: root, env: { ...process.env, PORT: String(port), DATA_DIR: data, MCP_API_KEY: KEY, PUBLIC_URL: 'http://127.0.0.1:' + port, REA_COMMAND: `${node} ${reaScript} mcp`, REA_IDLE_MIN: '1', ...extra }, stdio: ['ignore', 'pipe', 'pipe'] });
+  p.stdout.on('data', d => (log += d)); p.stderr.on('data', d => (log += d));
+  return p;
 }
-
-let rea, sandbox, sessions, config, server, base;
-
-async function rpc(msg, workspace = 'main', user = 'rea-test') {
-  const r = await fetch(base, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'x-user-id': user, 'x-workspace': workspace },
-    body: JSON.stringify(msg)
-  });
-  const text = await r.text();
-  const messages = text.split('\n').filter(l => l.startsWith('data: ')).map(l => JSON.parse(l.slice(6)));
-  return { status: r.status, messages, last: messages.length ? messages[messages.length - 1] : JSON.parse(text) };
+async function up(port) {
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {}
+    await new Promise(r => setTimeout(r, 200));
+  }
+  throw new Error('server did not start:\n' + log);
 }
-const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
-async function until(fn, ms) { const end = Date.now() + ms; while (Date.now() < end) { if (await fn()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }
+async function client(port, user = 'rea-test') {
+  const c = new Client({ name: 'rea-test', version: '1' });
+  await c.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), { requestInit: { headers: { Authorization: 'Bearer ' + KEY, 'X-User-ID': user } } }));
+  return c;
+}
+const textOf = r => r.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+const port = 21000 + Math.floor(Math.random() * 20000);
 
-before(async () => {
-  if (missing) return;
-  ({ config } = await import('../src/config.js'));
-  sandbox = await import('../src/sandbox.js');
-  sessions = await import('../src/sessions.js');
-  rea = await import('../src/rea.js');
-  await sandbox.initSandbox();
-  server = http.createServer((req, res) => rea.handleReaMcp(req, res));
-  await new Promise(r => server.listen(0, '127.0.0.1', r));
-  base = `http://127.0.0.1:${server.address().port}/rea/mcp`;
-  const ws = sessions.getWorkspace('rea-test', 'main');
-  fs.mkdirSync(path.join(ws.dir, 'app'));
-  fs.writeFileSync(path.join(ws.dir, 'app/package.json'), '{"name":"demo","version":"1.0.0","main":"main.js"}');
-  fs.writeFileSync(path.join(ws.dir, 'app/main.js'), 'import fs from "node:fs";\nexport function hello() { return fs.readFileSync("x"); }\n');
-});
-after(async () => {
-  if (rea) await rea.shutdownRea();
-  if (server) server.close();
-  fs.rmSync(data, { recursive: true, force: true });
-});
+before(async () => { if (!missing) { proc = start(port); await up(port); } });
+after(() => { proc && proc.kill('SIGTERM'); fs.rmSync(data, { recursive: true, force: true }); });
 
-test('runs under the real sandbox', opts, () => {
-  const rep = sandbox.sandboxReport();
-  assert.notEqual(rep.mode, 'off', JSON.stringify(rep.notes));
-  console.log('# sandbox', rep.mode, JSON.stringify(rep.layers));
+test('one tool list holds the Code Runner tools and REA\'s', opts, async () => {
+  const c = await client(port);
+  const { tools } = await c.listTools();
+  const names = tools.map(t => t.name);
+  assert.ok(names.includes('run_code') && names.includes('browser_state'));
+  assert.ok(names.includes('analyze_javascript_application'), 'REA tools missing:\n' + log.slice(-1500));
+  assert.ok(tools.length > 100, 'only ' + tools.length + ' tools');
+  assert.equal(new Set(names).size, names.length, 'duplicate tool names');
+  assert.match(c.getInstructions() || '', /REA/);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/rea/mcp`)).status, 404);   // no second endpoint
 });
 
-test('initialize forwards REA capabilities and instructions', opts, async () => {
-  const r = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } } });
-  const result = r.last.result;
-  assert.ok(result, JSON.stringify(r.last));
-  assert.ok(result.capabilities.tools);
-  assert.equal(result.capabilities.tools.listChanged, undefined);
-  assert.match(result.serverInfo.name, /rea/);
-  assert.ok(typeof result.instructions === 'string' && result.instructions.length > 10);
+test('a REA tool analyses a file the code wrote into the same workspace', opts, async () => {
+  const c = await client(port);
+  await c.callTool({ name: 'run_code', arguments: { language: 'bash', code: "mkdir -p app && printf 'export function hi(){return 1}\\n' > app/index.js && printf '{\"name\":\"demo\",\"main\":\"index.js\"}' > app/package.json" } });
+  const r = await c.callTool({ name: 'analyze_javascript_application', arguments: { input_path: 'app' } }, undefined, { timeout: 120000 });
+  assert.ok(!r.isError, textOf(r).slice(0, 1500));
+  const body = JSON.parse(r.content[0].text);
+  // A relative path resolved inside the workspace proves where REA runs.
+  assert.match(body.normalized_result.input_path, /rea-test-main-[0-9a-f]+\/app$/);
 });
 
-test('tools/list through HTTP returns REA tools and is cached per child', opts, async () => {
-  const r = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
-  const tools = r.last.result.tools;
-  assert.ok(tools.length > 50, `only ${tools.length} tools`);
-  assert.ok(tools.some(t => t.name === 'analyze_javascript_application'));
-  const entry = rea.__test.children.get(sessions.getWorkspace('rea-test', 'main').id);
-  assert.equal(entry.tools.length, tools.length);
+test('each user gets a REA process of their own; an unknown tool is an error, not a crash', opts, async () => {
+  const other = await client(port, 'rea-other');
+  const r = await other.callTool({ name: 'analyze_javascript_application', arguments: { input_path: 'app' } }, undefined, { timeout: 120000 });
+  // The other user's workspace has no app/ folder.
+  assert.ok(r.isError || /not|no such|missing|exist/i.test(textOf(r)), textOf(r).slice(0, 500));
+  const bad = await other.callTool({ name: 'no_such_tool_anywhere', arguments: {} });
+  assert.ok(bad.isError);
 });
 
-test('tools/call runs a static analysis on a workspace file (cwd = workspace)', opts, async () => {
-  const ws = sessions.getWorkspace('rea-test', 'main');
-  const r = await rpc({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'analyze_javascript_application', arguments: { input_path: 'app' }, _meta: { progressToken: 'p1' } } });
-  const result = r.last.result;
-  assert.ok(result && !result.isError, JSON.stringify(r.last).slice(0, 2000));
-  const body = JSON.parse(result.content[0].text);
-  // A relative path resolved inside the workspace proves the child's cwd.
-  assert.equal(fs.realpathSync(body.normalized_result.input_path), fs.realpathSync(path.join(ws.dir, 'app')));
-  assert.ok(fs.statSync(path.join(ws.dir, '.cr/rea/cache')).isDirectory(), 'XDG dirs live in .cr/rea');
-});
-
-test('unknown tool comes back as a tool error, not a crash', opts, async () => {
-  const r = await rpc({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'no_such_tool', arguments: {} } });
-  assert.ok(r.last.result?.isError || r.last.error, JSON.stringify(r.last));
-});
-
-test('a second workspace gets its own REA process', opts, async () => {
-  const r = await rpc({ jsonrpc: '2.0', id: 5, method: 'tools/list' }, 'other');
-  assert.ok(r.last.result.tools.length > 50);
-  const a = rea.__test.children.get(sessions.getWorkspace('rea-test', 'main').id);
-  const b = rea.__test.children.get(sessions.getWorkspace('rea-test', 'other').id);
-  assert.ok(a && b && a !== b);
-  assert.notEqual(a.child.pid, b.child.pid);
-  assert.equal(rea.reaReport().running, 2);
-});
-
-test('an idle REA process is stopped', opts, async () => {
-  const id = sessions.getWorkspace('rea-test', 'idle').id;
-  rea.__test.setIdleMs(500);
+test('with REA switched off only the Code Runner tools are listed', opts, async () => {
+  const p2 = port + 1;
+  const off = start(p2, { REA: '0', DATA_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'rea-off-')) });
   try {
-    await rpc({ jsonrpc: '2.0', id: 6, method: 'tools/list' }, 'idle');
-    const entry = rea.__test.children.get(id);
-    assert.ok(entry);
-    const pid = entry.child.pid;
-    assert.ok(await until(() => !rea.__test.children.has(id) && entry.closed && !alive(pid), 10000), 'idle child still running');
-    // The next call starts a fresh one.
-    const r = await rpc({ jsonrpc: '2.0', id: 7, method: 'tools/list' }, 'idle');
-    assert.ok(r.last.result.tools.length > 50);
-    assert.notEqual(rea.__test.children.get(id).child.pid, pid);
-  } finally { rea.__test.setIdleMs(config.reaIdleMin * 60000); }
-});
-
-test('disabled or missing REA answers a clear JSON-RPC error', opts, async () => {
-  const saved = { rea: config.rea, cmd: config.reaCommand };
-  try {
-    config.rea = false; rea.__test.reset();
-    let r = await rpc({ jsonrpc: '2.0', id: 8, method: 'tools/list' });
-    assert.equal(r.last.id, 8);
-    assert.match(r.last.error.message, /REA is not available.*REA=0.*WITH_REA=1/s);
-    assert.equal(rea.reaAvailable(), false);
-    config.rea = true; config.reaCommand = ['/nonexistent/rea', 'mcp']; rea.__test.reset();
-    r = await rpc({ jsonrpc: '2.0', id: 9, method: 'tools/list' });
-    assert.match(r.last.error.message, /not found.*REA_COMMAND/s);
-  } finally { config.rea = saved.rea; config.reaCommand = saved.cmd; rea.__test.reset(); }
-  assert.equal(rea.reaAvailable(), true);
-});
-
-test('shutdown stops every REA process', opts, async () => {
-  const pids = [...rea.__test.children.values()].map(e => e.child.pid);
-  assert.ok(pids.length >= 1);
-  await rea.shutdownRea();
-  assert.equal(rea.__test.children.size, 0);
-  assert.ok(await until(() => pids.every(p => !alive(p)), 5000));
+    await up(p2);
+    const c = await client(p2);
+    assert.equal((await c.listTools()).tools.length, 12);
+    const r = await c.callTool({ name: 'analyze_javascript_application', arguments: {} });
+    assert.ok(r.isError);
+  } finally { off.kill('SIGTERM'); }
 });

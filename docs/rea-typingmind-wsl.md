@@ -1,6 +1,6 @@
 # REA in TypingMind through WSL and Tailscale
 
-The hosted Code Runner server now also carries REA at `/rea/mcp` (see `server/README.md`, section "REA"); this guide covers the home-PC setup.
+The hosted Code Runner server now also offers the REA tools on its normal MCP endpoint (see `server/README.md`, section "REA"); this guide covers the home-PC setup.
 
 This guide describes the configured Ubuntu WSL installation. The paths below
 use its existing managed REA runtime; change them if your installation differs.

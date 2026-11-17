@@ -2,7 +2,6 @@
 //
 //   POST /mcp            MCP over Streamable HTTP (stateless: every request stands alone,
 //                        so redeploys and several clients need no session bookkeeping)
-//   POST /rea/mcp        REA (reverse engineering) as a second MCP endpoint, same auth and headers
 //   GET  /health         liveness and a short capability summary (no secrets)
 //   /bridge, /bridge/*   the Chrome extension's remote link (WebSocket + pairing)
 //   /f /p /w             signed links for the user: downloads, previews, workspace page
@@ -26,9 +25,10 @@ import { shutdownRunner, localLanguages } from "./runner.js";
 // Auth for every MCP endpoint: Bearer key, HTTP Basic, or OAuth 2.1 (claude.ai-style
 // connectors). Other endpoints reuse checkAuth/requireAuth with { resource: "/their/path" }.
 import { handleAuthHttp, checkAuth, logAuthStatus } from "./mcp-auth.js";
-import { handleReaMcp, shutdownRea, reaAvailable } from "./rea.js";
+import { reaListTools, reaCallTool, shutdownRea, reaAvailable } from "./rea.js";
 
 const VERSION = "1.0.0";
+const REA_NOTE = "\n- Reverse engineering: the other tools (open_binary, analyze_javascript_application, inspect_*, trace_*, ...) are REA. They read files from the same workspace (relative paths), so download or upload the target there first.";
 const MCP_BODY_MAX = 64 * 1024 * 1024;   // `files` may carry base64 content
 
 function json(res, status, body, headers = {}) {
@@ -58,9 +58,12 @@ function mcpServerFor(req) {
   const ws = getWorkspace(user, header(req, "x-workspace") || "main");
   const secrets = { ...config.codeSecrets, ...parseSecrets(header(req, "x-code-secrets")) };
 
-  const server = new Server({ name: "code-runner", version: VERSION }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: listTools() }));
+  const server = new Server({ name: "code-runner", version: VERSION }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS + (reaAvailable() ? REA_NOTE : "") });
+  // One list: the Code Runner tools, then REA's (reverse engineering), which work on the same workspace.
+  const own = new Set(listTools().map((t) => t.name));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [...listTools(), ...(await reaListTools(ws, [...own]))] }));
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    if (!own.has(request.params.name) && reaAvailable()) return reaCallTool(ws, request.params, extra);
     const token = request.params._meta && request.params._meta.progressToken;
     let n = 0;
     // Output while a run is going, for clients that asked for progress.
@@ -95,11 +98,6 @@ const httpServer = http.createServer(async (req, res) => {
     // everything else, without credentials.
     if (await handleAuthHttp(req, res, url)) return;
     if (url.pathname === "/mcp" || url.pathname === "/mcp/") return await handleMcp(req, res);
-    if (url.pathname === "/rea/mcp" || url.pathname === "/rea/mcp/") {
-      const gate = checkAuth(req, { resource: "/rea/mcp" });
-      if (!gate.ok) return json(res, gate.status, gate.body, gate.headers);
-      return await handleReaMcp(req, res);
-    }
     if (url.pathname === "/health") {
       const rep = sandboxReport();
       return json(res, rep.refuse ? 503 : 200, { ok: !rep.refuse, version: VERSION, sandbox: rep.refuse ? "unavailable" : rep.mode, layers: rep.layers, network: config.network, languages: Object.keys(localLanguages()), rea: reaAvailable() });
@@ -117,6 +115,12 @@ const httpServer = http.createServer(async (req, res) => {
     if (!res.headersSent) json(res, 500, { error: "internal error" }); else res.destroy();
   }
 });
+
+// Node closes an idle keep-alive connection after 5 s by default. A proxy or
+// client that reuses it at that moment loses the request, so stay open longer
+// than they do.
+httpServer.keepAliveTimeout = 75000;
+httpServer.headersTimeout = 80000;
 
 async function main() {
   if (!config.apiKey && !config.allowNoAuth) {

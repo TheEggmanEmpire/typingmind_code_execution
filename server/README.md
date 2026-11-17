@@ -120,62 +120,42 @@ workspace `main` of the user `default`.
 ## REA (reverse engineering)
 
 [REA](https://github.com/morluto/rea) (npm `rea-agents`, about 140 tools) inspects native binaries, JavaScript
-and Electron apps, web bundles, .NET assemblies, APKs and websites. The server offers it as a **second MCP
-endpoint**, `POST /rea/mcp`: same authentication, same `X-User-ID` / `X-Workspace` headers, stateless like
-`/mcp`.
+and Electron apps, web bundles, .NET assemblies, APKs and websites. Its tools are part of the same MCP endpoint:
+`/mcp` lists them after the Code Runner tools, and there is nothing extra to connect.
 
-- Each workspace gets its own REA process, started on the first call and stopped after `REA_IDLE_MIN` idle
+- Each workspace gets its own REA process, started on the first REA call and stopped after `REA_IDLE_MIN` idle
   minutes (and on shutdown). It runs in the same sandbox as the model's code, with the workspace as its
   working directory: REA analyses files the user uploaded or the code produced (relative paths such as
   `app/` or `dist/main.js` resolve there). Its cache and settings live in the workspace's hidden `.cr/rea/`.
-- Forwarded: `initialize` (REA's instructions), `tools/list`, `tools/call` (progress is passed through),
-  `prompts/*` and completions. REA offers no resources.
 - Works out of the box: static JavaScript / Electron (`.asar`) / web-bundle / source-map analysis, .NET metadata,
   plists, artifact inventories, saved HAR captures. Native decompilation (Ghidra + JDK, IDA, Hopper), Android
   (JADX + JDK), firmware (binwalk) and browser capture (a Chrome-family browser) need their engines in the image:
   add them with `EXTRA_APT` where Debian packages them.
 - The image installs REA pinned (`WITH_REA=1`, `REA_VERSION=6.2.0` build arguments; `WITH_REA=0` leaves it out).
-  `/health` reports `"rea": true` when the endpoint is usable.
+  `/health` reports `"rea": true` when the tools are offered.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `REA` | `1` | `0` switches the endpoint off |
+| `REA` | `1` | `0` leaves the REA tools out |
 | `REA_COMMAND` | `rea mcp` | REA's stdio MCP command line, e.g. `node /opt/rea/node_modules/rea-agents/scripts/rea.mjs mcp`. A tool folder outside `/usr` is made readable to the sandbox automatically |
 | `REA_IDLE_MIN` | 15 | An idle REA process is stopped after this |
 | `REA_CALL_TIMEOUT_S` | 300 | Limit of one REA tool call |
 
-**Tool count.** 140 tool definitions are a lot of context for every turn. Expose only what the agent needs.
-
-LibreChat: add the server as a second entry and enable only the needed REA tools in the agent's tool picker.
-
-```yaml
-mcpServers:
-  code-runner-rea:
-    type: streamable-http
-    url: https://<domain>/rea/mcp
-    headers:
-      Authorization: "Bearer ${CODE_RUNNER_API_KEY}"
-      X-User-ID: "{{LIBRECHAT_USER_ID}}"
-    requiresOAuth: false
-    serverInstructions: true
-    timeout: 300000
-```
-
-Hermes Agent: filter with `tools.include`.
+**Tool count.** With REA the endpoint lists about 150 tool definitions, a lot of context for every turn. Expose
+what the agent needs: in LibreChat pick the tools in the agent's tool list; in Hermes filter them:
 
 ```yaml
 mcp_servers:
-  code-runner-rea:
-    url: "https://<domain>/rea/mcp"
+  code_runner:
+    url: "https://<domain>/mcp"
     headers:
       Authorization: "Bearer ${CODE_RUNNER_API_KEY}"
     timeout: 300
     tools:
-      include: [analyze_javascript_application, analyze_web_bundle, inspect_artifact, extract_artifact,
+      include: [run_code, job, serve_file, preview_file, manage_files, browser_state, browser_act,
+                analyze_javascript_application, analyze_web_bundle, inspect_artifact, extract_artifact,
                 recover_javascript_sources, trace_javascript_semantics, open_binary, binary_overview]
 ```
-
-Use the same `X-User-ID` / `X-Workspace` values as for `code-runner`, so both endpoints see the same files.
 
 ## Your files
 

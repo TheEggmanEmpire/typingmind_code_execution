@@ -97,7 +97,7 @@ export const config = {
   browserConfirm: flag(env.BROWSER_CONFIRM, true),
   browserHighlight: flag(env.BROWSER_HIGHLIGHT, true),
 
-  // REA (reverse engineering MCP server) behind /rea/mcp: one child per workspace
+  // REA (reverse engineering): its tools are part of /mcp; one REA process per workspace
   rea: flag(env.REA, true),
   reaCommand: splitCommand(env.REA_COMMAND || "rea mcp"),       // full command line of REA's stdio MCP server
   reaIdleMin: num(env.REA_IDLE_MIN, 15, 1, 1440),              // an idle REA process is stopped after this
