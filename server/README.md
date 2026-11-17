@@ -30,7 +30,9 @@ else that speaks MCP over Streamable HTTP.
    that project's private network.
 2. **Variables**: set `MCP_API_KEY` to a long random string (`openssl rand -hex 32`). The server refuses to
    start without it.
-3. **Volume**: add one, mount path `/data`. Workspaces, schedules and browser pairings live there.
+3. **Volume**: attach one to this service (any mount path; `/data` is the usual choice). Workspaces, schedules,
+   installed packages and revocation lists live there. A volume belongs to one service: another service's
+   volume cannot be shared. Without one the server runs, but those are lost on every redeploy.
 4. **Networking -> Generate domain**. The server reads `RAILWAY_PUBLIC_DOMAIN` for the links it hands out; with
    a custom domain set `PUBLIC_URL=https://your.domain`.
 5. Open `https://<domain>/health`: it reports the sandbox layers that are active on the host.
@@ -43,7 +45,7 @@ else that speaks MCP over Streamable HTTP.
 | `MCP_TOKEN_STORE` | `DATA_DIR/mcp-tokens.json` | Where tokens issued through OAuth are kept (hashed, mode 0600) |
 | `MCP_TRUST_PROXY` | off | `1` lets the OAuth addresses follow `X-Forwarded-Host`/`-Proto`; only needed without `PUBLIC_URL` or a Railway domain |
 | `PUBLIC_URL` | Railway domain | Base of the links given to the user, and of the OAuth addresses |
-| `DATA_DIR` | `/data` | Where the volume is mounted |
+| `DATA_DIR` | the volume's mount path, else `/data` | Where data is kept. Only set it to override the attached volume's path |
 | `CODE_NETWORK` | `open` | `off` removes network access from the code |
 | `CODE_SECRETS` | - | `NAME=value; NAME2=value`: environment variables for the code, replaced by `[secret NAME]` in everything the AI reads |
 | `OMNIROUTE_API_KEY` | - | Enables `make_image` / `edit_image` (`OMNIROUTE_BASE_URL` overrides the endpoint) |

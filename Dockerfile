@@ -59,10 +59,11 @@ COPY server ./server
 RUN sh server/sandbox/build.sh && chmod -R go-w /app
 
 # Root is needed once per run to switch to the workspace's own unix user.
-# Nothing else in the server depends on it. Attach a Railway volume at /data
-# (Railway rejects a Dockerfile VOLUME instruction).
+# Nothing else in the server depends on it.
+# Data lives on a Railway volume: the server uses the volume's mount path, whatever
+# it is (RAILWAY_VOLUME_MOUNT_PATH), or DATA_DIR if set, or /data without a volume.
+# (Railway rejects a Dockerfile VOLUME instruction.)
 ENV NODE_ENV=production \
-    DATA_DIR=/data \
     PORT=8080 \
     RAILWAY_RUN_UID=0
 EXPOSE 8080
