@@ -661,7 +661,8 @@ export async function runCode(ws,params,hooks={}) {
   if(typeof params.code!=='string') return {text:'code must be a string.',running:false,exitCode:1};
   if(stopping) return {text:'The server is shutting down. Retry after it restarts.',running:false,exitCode:1};
   const map=workspaceJobs(ws);
-  const busy=[...map.values()].find(j=>!j.finished && j.language==='python');
+  // Only the live session is exclusive; a fresh (scheduled) Python run is its own process.
+  const busy=[...map.values()].find(j=>!j.finished && j.language==='python' && !j.params?.fresh);
   if(language==='python' && busy && !params.fresh) return {text:'python is busy with job '+busy.id+'. Use the job tool to follow or kill it.',running:false,exitCode:1};
   if([...map.values()].filter(j=>!j.finished).length>=config.maxJobs) return {text:'Too many running jobs (limit '+config.maxJobs+'). Use the job tool to wait or kill a job.',running:false,exitCode:1};
   const seconds=Number(params.timeout ?? config.runTimeoutS);

@@ -60,8 +60,8 @@ RUN sh server/sandbox/build.sh && chmod -R go-w /app
 
 # Root is needed once per run to switch to the workspace's own unix user.
 # Nothing else in the server depends on it.
-# Data lives on a Railway volume: the server uses the volume's mount path, whatever
-# it is (RAILWAY_VOLUME_MOUNT_PATH), or DATA_DIR if set, or /data without a volume.
+# Data lives on a Railway volume: the server uses DATA_DIR if set, otherwise the
+# volume's mount path, whatever it is (RAILWAY_VOLUME_MOUNT_PATH), otherwise /data.
 # (Railway rejects a Dockerfile VOLUME instruction.)
 ENV NODE_ENV=production \
     PORT=8080 \
