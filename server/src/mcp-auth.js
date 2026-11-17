@@ -127,7 +127,7 @@ function persistTokens() {
     const tmp = `${file}.${crypto.randomBytes(6).toString("hex")}.tmp`;
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     // JSON.stringify preserves null, so expiresAt: null round-trips.
-    fs.writeFileSync(tmp, JSON.stringify({ version: 2, seedSalt: saltHex(), passwordSeed: computePasswordSeed(), tokens, clients }), { encoding: "utf8", mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify({ version: 2, seedSalt: saltHex(), passwordSeed: computePasswordSeed(), tokens, clients, revoked: [...REVOKED], revokedBefore }), { encoding: "utf8", mode: 0o600 });
     fs.renameSync(tmp, file);
     fs.chmodSync(file, 0o600);
   } catch (err) {
@@ -180,6 +180,9 @@ function loadTokens() {
     return;
   }
 
+  if (Array.isArray(parsed.revoked)) for (const h of parsed.revoked) if (/^[0-9a-f]{64}$/.test(h)) REVOKED.add(h);
+  if (typeof parsed.revokedBefore === "number") revokedBefore = Math.max(revokedBefore, parsed.revokedBefore);
+
   const tokens = parsed.tokens;
   if (!tokens || typeof tokens !== "object") return;
   const now = Date.now();
@@ -210,6 +213,8 @@ export function reloadTokenStore() {
   AUTH_CODES.clear();
   FAILURE_COUNTERS.clear();
   seedSalt = null;
+  REVOKED.clear();
+  revokedBefore = 0;
   loadTokens();
 }
 
@@ -337,11 +342,55 @@ function verifyPassword(candidate) {
   return constantTimeEquals(candidate, password);
 }
 
+// ---------------------------------------------------------------------------
+// Self-validating tokens
+//
+// An issued token carries its own proof: a body signed with a key derived from
+// MCP_API_KEY. The store on disk is then a convenience, not a requirement: a
+// redeploy that wipes it (no volume, a new volume) must not sign every
+// connected client out, because a client whose token is refused mid-chat just
+// stops. Changing MCP_API_KEY changes the signing key and so ends every token.
+// Revocations are remembered in the store; they are only as durable as it is.
+// ---------------------------------------------------------------------------
+const SIGNED_PREFIX = "crt1.";
+const REVOKED = new Set();          // hashes of individually revoked signed tokens
+let revokedBefore = 0;              // signed tokens issued before this are refused ("revoke all")
+
+function signingKey() {
+  const password = getPassword();
+  return password ? crypto.createHmac("sha256", password).update("code-runner access token v1").digest() : null;
+}
+function signTokenBody(body) {
+  return crypto.createHmac("sha256", signingKey()).update(body).digest("base64url");
+}
+// -> { issuedAt, expiresAt, scope } for a token this server signed with the current key, else null.
+function readSignedToken(candidate) {
+  if (typeof candidate !== "string" || !candidate.startsWith(SIGNED_PREFIX) || candidate.length > 600 || !signingKey()) return null;
+  const [body, sig, extra] = candidate.slice(SIGNED_PREFIX.length).split(".");
+  if (!body || !sig || extra !== undefined) return null;
+  if (!constantTimeEquals(sig, signTokenBody(body))) return null;
+  let p;
+  try { p = JSON.parse(Buffer.from(body, "base64url").toString("utf8")); } catch { return null; }
+  if (!p || typeof p.i !== "number") return null;
+  if (p.i < revokedBefore || REVOKED.has(tokenKey(candidate))) return null;
+  const expiresAt = typeof p.e === "number" ? p.e : null;
+  if (expiresAt != null && expiresAt < Date.now()) return null;
+  return { issuedAt: p.i, expiresAt, scope: typeof p.s === "string" ? p.s : DEFAULT_SCOPE };
+}
+
 function verifyAccessToken(candidate) {
   if (!candidate) return false;
   const key = tokenKey(candidate);
-  const entry = TOKENS.get(key);
-  if (!entry) return false;
+  let entry = TOKENS.get(key);
+  if (!entry) {
+    // Not in the store (it was wiped, or this is another instance): the signature decides.
+    const signed = readSignedToken(candidate);
+    if (!signed) return false;
+    TOKENS.set(key, signed);
+    while (TOKENS.size > MAX_TOKENS) TOKENS.delete(TOKENS.keys().next().value);
+    persistTokens();
+    return true;
+  }
   // expiresAt === null means non-expiring; only finite, elapsed TTLs are pruned.
   if (entry.expiresAt != null && entry.expiresAt < Date.now()) {
     TOKENS.delete(key);
@@ -359,13 +408,16 @@ function verifyStringSecret(secret) {
 /** Revoke all issued tokens. */
 export function revokeAllTokens() {
   TOKENS.clear();
+  REVOKED.clear();
+  revokedBefore = Date.now();
   persistTokens();
   console.error("[mcp-auth] all tokens revoked");
 }
 
 function mintAccessToken({ ttlMs = DEFAULT_TTL_MS, scope = DEFAULT_SCOPE } = {}) {
   const now = Date.now();
-  const token = crypto.randomBytes(32).toString("base64url");
+  const body = Buffer.from(JSON.stringify({ i: now, n: crypto.randomBytes(12).toString("base64url"), s: scope, ...(ttlMs == null ? {} : { e: now + ttlMs }) })).toString("base64url");
+  const token = SIGNED_PREFIX + body + "." + signTokenBody(body);
   TOKENS.set(tokenKey(token), { expiresAt: ttlMs == null ? null : now + ttlMs, issuedAt: now, scope });
   // Drop the oldest entries until the store is within MAX_TOKENS (FIFO).
   while (TOKENS.size > MAX_TOKENS) TOKENS.delete(TOKENS.keys().next().value);
@@ -877,7 +929,12 @@ export async function handleAuthHttp(req, res, url) {
 
     // Persist the revocation: these tokens never expire, so one dropped only
     // from memory would come back from the store on the next boot.
-    if (token && TOKENS.delete(tokenKey(token))) persistTokens();
+    if (token) {
+      const had = TOKENS.delete(tokenKey(token));
+      // A signed token would pass again by its signature alone: remember it as revoked.
+      if (token.startsWith(SIGNED_PREFIX)) { REVOKED.add(tokenKey(token)); while (REVOKED.size > MAX_TOKENS) REVOKED.delete(REVOKED.values().next().value); }
+      if (had || token.startsWith(SIGNED_PREFIX)) persistTokens();
+    }
     if (revokeAll) revokeAllTokens();
     sendJson(res, 200, { status: "ok" });
     return true;

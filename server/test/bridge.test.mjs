@@ -37,7 +37,7 @@ async function pair(user, name = "Test Chrome") {
   assert.equal(res.status, 200);
   const result = await res.json();
   assert.equal(result.user, user);
-  assert.match(result.token, /^[A-Za-z0-9_-]{43}$/);
+  assert.match(result.token, /^crd1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/);
   return { code, ...result };
 }
 async function connect(device, overrides = {}) {
@@ -78,8 +78,12 @@ test("expired code is refused", async t => {
   assert.equal((await post("/bridge/pair", { code })).status, 401);
 });
 test("at most five open pairing codes per user", () => {
-  for (let i = 0; i < 5; i++) bridge.createPairingCode("five");
-  assert.throws(() => bridge.createPairingCode("five"), /five|5|limit/i);
+  const first = bridge.createPairingCode("five").code;
+  for (let i = 0; i < 4; i++) bridge.createPairingCode("five");
+  // A sixth code is still issued; the oldest one stops working instead.
+  const sixth = bridge.createPairingCode("five").code;
+  assert.match(sixth, /^[A-HJ-NP-Z2-9-]{12}$/);
+  return post("/bridge/pair", { code: first, name: "x", version: "0.5.1" }).then(r => assert.equal(r.status, 401));
 });
 test("concurrent redemption can create only one device", async () => {
   const { code } = bridge.createPairingCode("race");
@@ -181,6 +185,33 @@ test("persisted device credentials authenticate after module reload", async () =
     ws.send(JSON.stringify({ type: "hello", ...d }));
     assert.equal(JSON.parse((await ready)[0]).type, "ready");
   } finally { ws.terminate(); await new Promise(r => second.close(r)); }
+});
+
+test("a pairing survives a wiped bridge.json; an unlinked device does not come back", async () => {
+  const kept = await pair("wiped"), gone = await pair("wiped-gone");
+  assert.equal((await post("/bridge/unpair", gone)).status, 200);
+  const file = path.join(dir, "bridge.json");
+  const saved = fs.readFileSync(file);
+  const hello = async (mod, d) => {
+    const srv = http.createServer(); mod.attachBridge(srv);
+    srv.listen(0, "127.0.0.1"); await once(srv, "listening");
+    const ws = new WebSocket(`ws://127.0.0.1:${srv.address().port}/bridge`);
+    try {
+      await once(ws, "open");
+      const first = new Promise(res => { ws.once("message", m => res(JSON.parse(m).type)); ws.once("close", c => res(c)); });
+      ws.send(JSON.stringify({ type: "hello", ...d }));
+      return await first;
+    } finally { ws.terminate(); await new Promise(r => srv.close(r)); }
+  };
+  // With the file as it is, the unlinked device stays refused after a restart.
+  assert.equal(await hello(await import("../src/bridge.js?afterunlink"), gone), 4401);
+  try {
+    // The store vanishes entirely, as on a redeploy with no volume: the signed token restores the pairing.
+    fs.rmSync(file);
+    const fresh = await import("../src/bridge.js?wiped");
+    assert.equal(await hello(fresh, kept), "ready");
+    assert.equal(await hello(fresh, { ...kept, token: kept.token.slice(0, -2) + "xx" }), 4401);
+  } finally { fs.writeFileSync(file, saved); }
 });
 
 test("missing hello expires in five seconds", async t => {

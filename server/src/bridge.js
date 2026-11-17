@@ -15,6 +15,27 @@ const hash = value => crypto.createHash("sha256").update(String(value)).digest()
 const extensionOrigin = origin => /^chrome-extension:\/\/[a-p]{32}$/.test(origin || "");
 const filename = path.join(config.dataDir, "bridge.json");
 
+// A device token carries its own proof (signed with a key derived from the
+// server secret), so a pairing survives a redeploy that wiped bridge.json: the
+// extension would otherwise be told "pair again" after every deploy without a
+// volume. Unlinked devices are remembered in `revoked`, as durably as the file is.
+const DEVICE_PREFIX = "crd1.";
+const revoked = new Set();
+const deviceKey = () => crypto.createHmac("sha256", config.secret).update("code-runner bridge device v1").digest();
+const signDevice = body => crypto.createHmac("sha256", deviceKey()).update(body).digest("base64url");
+function mintDeviceToken(d) {
+  const body = Buffer.from(JSON.stringify({ d: d.deviceId, u: d.user, n: d.name, c: d.created, r: crypto.randomBytes(9).toString("base64url") })).toString("base64url");
+  return DEVICE_PREFIX + body + "." + signDevice(body);
+}
+function readDeviceToken(token) {
+  if (typeof token !== "string" || !token.startsWith(DEVICE_PREFIX) || token.length > 900) return null;
+  const [body, sig, extra] = token.slice(DEVICE_PREFIX.length).split(".");
+  if (!body || !sig || extra !== undefined) return null;
+  const want = Buffer.from(signDevice(body)), got = Buffer.from(sig);
+  if (want.length !== got.length || !crypto.timingSafeEqual(want, got)) return null;
+  try { const p = JSON.parse(Buffer.from(body, "base64url").toString("utf8")); return p && typeof p.d === "string" && typeof p.u === "string" ? p : null; } catch { return null; }
+}
+
 function load() {
   if (loaded) return;
   let data;
@@ -23,6 +44,7 @@ function load() {
   if (data !== undefined && (!data || !Array.isArray(data.devices) || data.devices.some(d => !d || typeof d.deviceId !== "string" || typeof d.user !== "string" || !/^[a-f0-9]{64}$/.test(d.tokenHash))))
     throw new Error("Invalid bridge.json; refusing to discard paired devices");
   for (const d of (data?.devices || []).sort((a, b) => a.lastSeen - b.lastSeen)) devices.set(d.deviceId, { ...d, order: ++order });
+  for (const id of Array.isArray(data?.revoked) ? data.revoked : []) if (typeof id === "string") revoked.add(id);
   loaded = true;
 }
 
@@ -32,7 +54,7 @@ function save() {
   let fd;
   try {
     fd = fs.openSync(tmp, "wx", 0o600);
-    fs.writeFileSync(fd, JSON.stringify({ devices: [...devices.values()].map(({ order, ...d }) => d) }) + "\n");
+    fs.writeFileSync(fd, JSON.stringify({ devices: [...devices.values()].map(({ order, ...d }) => d), revoked: [...revoked].slice(-5000) }) + "\n");
     fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined;
     fs.renameSync(tmp, filename);
   } finally {
@@ -43,11 +65,20 @@ function save() {
 
 function credential(deviceId, token) {
   load();
-  const d = typeof deviceId === "string" ? devices.get(deviceId) : null;
+  let d = typeof deviceId === "string" ? devices.get(deviceId) : null;
+  if (!d && typeof deviceId === "string" && !revoked.has(deviceId)) {
+    // Unknown here (the store was wiped): a validly signed token restores the pairing.
+    const p = readDeviceToken(token);
+    if (p && p.d === deviceId) {
+      d = { deviceId, tokenHash: hash(token).toString("hex"), user: p.u, name: String(p.n || "Chrome").slice(0, 100), version: "", created: Number(p.c) || Date.now(), lastSeen: Date.now(), order: ++order };
+      devices.set(deviceId, d);
+      try { save(); } catch (e) {}
+    }
+  }
   const supplied = hash(typeof token === "string" ? token : "");
   const expected = d ? Buffer.from(d.tokenHash, "hex") : Buffer.alloc(32);
   const match = crypto.timingSafeEqual(supplied, expected);
-  return match && d && typeof token === "string" && /^[A-Za-z0-9_-]{43}$/.test(token) ? d : null;
+  return match && d && typeof token === "string" && /^[A-Za-z0-9_.-]{43,900}$/.test(token) ? d : null;
 }
 
 function cleanCodes() {
@@ -58,7 +89,11 @@ function cleanCodes() {
 export function createPairingCode(user) {
   load(); cleanCodes();
   if (typeof user !== "string" || !user) throw new Error("Pairing needs a user");
-  if ([...codes.values()].filter(c => c.user === user).length >= 5) throw new Error("Five pairing codes are already open; use one or wait 10 minutes");
+  // At most five open codes per user. A sixth replaces the oldest instead of
+  // failing: every browser tool call without a linked browser asks for a code,
+  // and the sixth such call must still get a usable answer.
+  const mine = [...codes].filter(([, c]) => c.user === user).sort((x, y) => x[1].expiresAt - y[1].expiresAt);
+  while (mine.length >= 5) codes.delete(mine.shift()[0]);
   if (codes.size >= 10_000) throw new Error("Pairing code limit reached; try later");
   let raw, digest;
   do {
@@ -111,8 +146,8 @@ async function bodyJson(req) {
 }
 
 function removeDevice(d) {
-  devices.delete(d.deviceId);
-  try { save(); } catch (e) { devices.set(d.deviceId, d); throw e; }
+  devices.delete(d.deviceId); revoked.add(d.deviceId);
+  try { save(); } catch (e) { devices.set(d.deviceId, d); revoked.delete(d.deviceId); throw e; }
   const socket = sockets.get(d.deviceId);
   if (socket) { socket.finish(); socket.ws.close(4401, "Pairing rejected, pair again"); }
 }
@@ -146,10 +181,11 @@ export async function handleBridgeHttp(req, res, url) {
     for (const [key, c] of codes) if (crypto.timingSafeEqual(supplied, Buffer.from(key, "hex"))) matched = [key, c];
     if (!matched) { json(res, 401, { ok: false, code: "pairing-invalid", error: "Pairing code invalid or expired" }); return true; }
     const [key, code] = matched;
-    const token = crypto.randomBytes(32).toString("base64url");
-    const d = { deviceId: crypto.randomUUID(), tokenHash: hash(token).toString("hex"), user: code.user,
+    const d = { deviceId: crypto.randomUUID(), tokenHash: "", user: code.user,
       name: String(body.name || "Chrome").replace(/[\x00-\x1f\x7f]/g, "").slice(0, 100),
       version: String(body.version || "").slice(0, 40), created: Date.now(), lastSeen: Date.now(), order: ++order };
+    const token = mintDeviceToken(d);
+    d.tokenHash = hash(token).toString("hex");
     codes.delete(key); devices.set(d.deviceId, d);
     try { save(); } catch (e) { devices.delete(d.deviceId); codes.set(key, code); throw e; }
     json(res, 200, { deviceId: d.deviceId, token, user: d.user });
@@ -262,8 +298,8 @@ export async function bridgeCall(user, request, timeoutMs = 30_000) {
 export function revokeDevices(user) {
   load();
   const removed = [...devices.values()].filter(d => d.user === user);
-  for (const d of removed) devices.delete(d.deviceId);
-  try { save(); } catch (e) { for (const d of removed) devices.set(d.deviceId, d); throw e; }
+  for (const d of removed) { devices.delete(d.deviceId); revoked.add(d.deviceId); }
+  try { save(); } catch (e) { for (const d of removed) { devices.set(d.deviceId, d); revoked.delete(d.deviceId); } throw e; }
   for (const d of removed) { const e = sockets.get(d.deviceId); if (e) { e.finish(); e.ws.close(4401, "Pairing rejected, pair again"); } }
   for (const [key, c] of codes) if (c.user === user) codes.delete(key);
   return removed.length;

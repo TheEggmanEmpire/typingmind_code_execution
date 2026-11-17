@@ -84,7 +84,7 @@ async function cdp(url) {
     let paired;
     await step('pair over HTTP, preseed trusted extension storage, then connect', async () => {
       const {code} = bridge.createPairingCode('remote-e2e');
-      const r = await fetch(base+'/bridge/pair',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code,name:'E2E Chrome',version:'0.5.0'})});
+      const r = await fetch(base+'/bridge/pair',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code,name:'E2E Chrome',version:'0.5.1'})});
       assert.equal(r.status,200); paired = await r.json();
       // Never print this expression: it contains the new device credential.
       await sw.evaluate(`chrome.storage.local.set(${JSON.stringify({remoteLink:{url:base,...paired},remoteEnabled:true,remoteAuthRejected:false,remoteScripts:true,remoteConfirmRisky:true})})`);
@@ -92,7 +92,7 @@ async function cdp(url) {
     });
     const request = req => bridge.bridgeCall('remote-e2e',req,20_000);
     await step('remote ping uses paired authority', async () => {
-      assert.deepEqual(await request({op:'ping'}),{ok:true,version:'0.5.0',trusted:true,remote:true});
+      assert.deepEqual(await request({op:'ping'}),{ok:true,version:'0.5.1',trusted:true,remote:true});
     });
     let tab;
     await step('tabs.list and page.state elements on the real fixture', async () => {
@@ -135,7 +135,7 @@ async function cdp(url) {
       const {targetId}=await browser.call('Target.createTarget',{url:`chrome-extension://${extensionId}/options.html`});
       const target=await until(async ()=>(await targets()).find(t=>t.id===targetId),'options page');
       const page=await cdp(target.webSocketDebuggerUrl);
-      try { await until(async ()=>/Connected to .* as remote-e2e since/.test(await page.evaluate(`document.getElementById('connection').textContent`)), 'options connection status'); }
+      try { await until(async ()=>/Connected to .* as remote-e2e since/.test(await page.evaluate(`(document.getElementById('connection') || {}).textContent || ''`)), 'options connection status'); }
       finally { page.close(); }
     });
     await step('master switch disconnects; enabling reconnects once', async () => {

@@ -13,7 +13,7 @@
 //
 // Every reply is { ok: true, ... } or { ok: false, error, code? }.
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 // Only socket callbacks hold this identity; no page message can serialize it.
 const REMOTE_SOURCE = Object.freeze({});
 const DEFAULT_TRUSTED = ["typingmind.com", "*.typingmind.com"];

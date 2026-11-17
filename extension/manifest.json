@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Code Runner Browser Bridge",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Companion browser bridge for Code Runner: trusted TypingMind frames and paired remote MCP clients.",
   "permissions": [
     "tabs",

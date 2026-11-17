@@ -48,6 +48,10 @@ function publicUrl() {
 // redeploy; SERVER_SECRET overrides it.
 function serverSecret() {
   if (env.SERVER_SECRET && env.SERVER_SECRET.length >= 16) return env.SERVER_SECRET;
+  // Derived from the access key when there is one: links and browser pairings
+  // then survive a redeploy even without a volume. (Changing the key ends them.)
+  const key = env.MCP_API_KEY || env.MCP_PASSWORD || "";
+  if (key.length >= 16) return crypto.createHmac("sha256", key).update("code-runner server secret v1").digest("hex");
   const file = path.join(dataDir, ".secret");
   // A short or empty file (a failed first write, a stray `touch`) must never
   // become the signing key: anyone could forge links with it.

@@ -223,6 +223,24 @@ test("token and client registration survive a reload from disk; file holds no se
   assert.equal(r.status, 400);
 });
 
+test("a token survives a wiped store (redeploy without a volume); a revoked one does not come back", async () => {
+  const ip = newIp();
+  const issue = async () => (await (await form("/oauth/token", { grant_type: "client_credentials", client_secret: KEY }, { "X-Forwarded-For": ip })).json()).access_token;
+  const kept = await issue(), gone = await issue();
+  assert.equal((await form("/oauth/revoke", { token: gone }, { Authorization: "Bearer " + KEY, "X-Forwarded-For": ip })).status, 200);
+  // Revocations are in the store; a reload keeps them.
+  auth.reloadTokenStore();
+  assert.equal((await mcp({ Authorization: "Bearer " + gone, "X-Forwarded-For": newIp() })).status, 401);
+  // The store vanishes entirely, as on a redeploy with no volume.
+  fs.rmSync(STORE, { force: true });
+  auth.reloadTokenStore();
+  assert.equal((await mcp({ Authorization: "Bearer " + kept, "X-Forwarded-For": newIp() })).status, 200, "a valid token must outlive the store");
+  // A forged or altered token still fails.
+  const forged = kept.slice(0, -3) + (kept.endsWith("AAA") ? "BBB" : "AAA");
+  assert.equal((await mcp({ Authorization: "Bearer " + forged, "X-Forwarded-For": newIp() })).status, 401);
+  assert.equal((await mcp({ Authorization: "Bearer crt1.e30.x", "X-Forwarded-For": newIp() })).status, 401);
+});
+
 test("a rotated key invalidates persisted tokens", async () => {
   const { access_token } = await (await form("/oauth/token", { grant_type: "client_credentials", client_secret: KEY }, { "X-Forwarded-For": newIp() })).json();
   const old = config.apiKey;

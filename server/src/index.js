@@ -82,7 +82,12 @@ function mcpServerFor(req) {
 
 async function handleMcp(req, res) {
   const gate = checkAuth(req, { resource: "/mcp" });
-  if (!gate.ok) return json(res, gate.status, gate.body, gate.headers);
+  if (!gate.ok) {
+    // A refused client usually shows nothing but a chat that stops: leave a trace (never the credential).
+    // A request without any credential is the normal first step of an OAuth sign-in and is not logged.
+    if (req.headers.authorization || req.headers["x-api-key"]) console.log("auth refused " + gate.status + " " + req.method + " /mcp (a credential was sent and not accepted; the client has to sign in again)");
+    return json(res, gate.status, gate.body, gate.headers);
+  }
   if (req.method !== "POST") return json(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed: this server is stateless, use POST." }, id: null }, { Allow: "POST" });
   let body;
   try { body = JSON.parse((await readBody(req, MCP_BODY_MAX)).toString("utf8")); }

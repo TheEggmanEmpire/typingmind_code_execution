@@ -43,7 +43,7 @@ async function pair() {
     body: JSON.stringify({ code, name: $("deviceName").value.trim() || "Chrome", version: chrome.runtime.getManifest().version }), signal: AbortSignal.timeout(15_000) });
   const data = await r.json();
   if (!r.ok) throw new Error(data.error || "Pairing failed (HTTP " + r.status + ").");
-  if (typeof data.deviceId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(data.token || "") || typeof data.user !== "string") throw new Error("The server returned an invalid pairing response.");
+  if (typeof data.deviceId !== "string" || !/^[A-Za-z0-9_.-]{43,900}$/.test(data.token || "") || typeof data.user !== "string") throw new Error("The server returned an invalid pairing response.");
   await chrome.storage.local.set({ remoteLink: { url, deviceId: data.deviceId, token: data.token, user: data.user }, remoteEnabled: true, remoteAuthRejected: false });
   $("pairCode").value = ""; $("serverUrl").value = url; $("remoteEnabled").checked = true; $("unlink").disabled = false;
   $("pairResult").textContent = "Paired. Connecting…";
