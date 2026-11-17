@@ -24,15 +24,19 @@ async function client(headers = {}) {
 const textOf = (r) => r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
 const call = async (c, name, args) => c.callTool({ name, arguments: args }, undefined, { timeout: 120000 });
 
-before(async () => {
-  proc = spawn(process.execPath, ["src/index.js"], { cwd: root, env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, MCP_API_KEY: KEY, PUBLIC_URL: base, WAIT_BUDGET_S: "5", CODE_SECRETS: "E2E_TOKEN=supersecretvalue123", REA: "0" }, stdio: ["ignore", "pipe", "pipe"] });
+function boot() {
+  return spawn(process.execPath, ["src/index.js"], { cwd: root, env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, MCP_API_KEY: KEY, PUBLIC_URL: base, WAIT_BUDGET_S: "5", CODE_SECRETS: "E2E_TOKEN=supersecretvalue123", REA: "0" }, stdio: ["ignore", "pipe", "pipe"] });
+}
+async function start() {
+  proc = boot();
   proc.stdout.on("data", (d) => (log += d)); proc.stderr.on("data", (d) => (log += d));
   for (let i = 0; i < 100; i++) {
     try { if ((await fetch(base + "/health")).ok) return; } catch (e) {}
     await new Promise((r) => setTimeout(r, 200));
   }
   throw new Error("server did not start:\n" + log);
-});
+}
+before(start);
 after(() => { proc && proc.kill("SIGTERM"); fs.rmSync(dataDir, { recursive: true, force: true }); });
 
 test("health reports an active sandbox", async () => {
@@ -148,4 +152,24 @@ test("status, schedule and browser pairing answer sensibly", async () => {
   r = await call(c, "schedule", { action: "delete", name: "beat" });
   r = await call(c, "browser_tabs", { action: "list" });
   assert.match(textOf(r), /Pairing code: [A-Z0-9-]+/);
+});
+
+// Runs last: everything above has left real state in the data directory.
+test("a restart on the same data directory comes up and keeps files, sign-ins and schedules", async () => {
+  const c = await client();
+  await call(c, "run_code", { language: "bash", code: "echo survives > keep.txt" });
+  await call(c, "schedule", { action: "create", name: "keeper", language: "bash", code: "echo hi", every_minutes: 60 });
+  const tok = (await (await fetch(base + "/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "grant_type=client_credentials&client_secret=" + KEY })).json()).access_token;
+  await fetch(base + "/oauth/revoke", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", Authorization: "Bearer " + KEY }, body: "token=" + encodeURIComponent(tok) });
+  const kept = (await (await fetch(base + "/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "grant_type=client_credentials&client_secret=" + KEY })).json()).access_token;
+  const exited = new Promise((r) => proc.once("exit", r));
+  proc.kill("SIGTERM"); await exited;
+  log = "";
+  await start();
+  const ping = (t) => fetch(base + "/mcp", { method: "POST", headers: { Authorization: "Bearer " + t, "Content-Type": "application/json", Accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }) }).then((r) => r.status);
+  assert.equal(await ping(kept), 200, log);
+  assert.equal(await ping(tok), 401);
+  const c2 = await client();
+  assert.match(textOf(await call(c2, "run_code", { language: "bash", code: "cat keep.txt" })), /survives/);
+  assert.match(textOf(await call(c2, "schedule", { action: "list" })), /keeper/);
 });

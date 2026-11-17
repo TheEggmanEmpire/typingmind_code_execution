@@ -254,3 +254,15 @@ test("a rotated key invalidates persisted tokens", async () => {
     auth.reloadTokenStore();
   }
 });
+
+test("the module starts with a token store already on disk (a volume that kept it)", async () => {
+  // Every field a previous run may have written, including the revocation lists.
+  const ip = newIp();
+  const { access_token } = await (await form("/oauth/token", { grant_type: "client_credentials", client_secret: KEY }, { "X-Forwarded-For": ip })).json();
+  await form("/oauth/revoke", { token: access_token }, { Authorization: "Bearer " + KEY, "X-Forwarded-For": ip });
+  const stored = JSON.parse(fs.readFileSync(STORE, "utf8"));
+  assert.ok(Array.isArray(stored.revoked) && stored.revoked.length >= 1 && typeof stored.revokedBefore === "number");
+  // A fresh copy of the module loads that file while it is being evaluated.
+  const fresh = await import("../src/mcp-auth.js?boot-with-store");
+  assert.equal(typeof fresh.checkAuth, "function");
+});

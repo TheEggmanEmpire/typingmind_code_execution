@@ -113,6 +113,11 @@ function computePasswordSeed() {
 // Disk persistence for the token store
 // ---------------------------------------------------------------------------
 
+// Revocations of signed tokens (see "Self-validating tokens" below). Declared
+// here, before the store is loaded at import: loadTokens() fills them.
+const REVOKED = new Set();          // hashes of individually revoked signed tokens
+let revokedBefore = 0;              // signed tokens issued before this are refused ("revoke all")
+
 /** Atomically write the current token map to disk. */
 function persistTokens() {
   const file = getTokenStorePath();
@@ -351,8 +356,6 @@ function verifyPassword(candidate) {
 // Revocations are remembered in the store; they are only as durable as it is.
 // ---------------------------------------------------------------------------
 const SIGNED_PREFIX = "crt1.";
-const REVOKED = new Set();          // hashes of individually revoked signed tokens
-let revokedBefore = 0;              // signed tokens issued before this are refused ("revoke all")
 
 function signingKey() {
   const password = getPassword();
