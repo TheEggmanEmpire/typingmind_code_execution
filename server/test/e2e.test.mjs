@@ -154,6 +154,36 @@ test("status, schedule and browser pairing answer sensibly", async () => {
   assert.match(textOf(r), /Pairing code: [A-Z0-9-]+/);
 });
 
+test("the tab list says it is complete, marks browser pages and names ignored parameters", async () => {
+  const { default: WebSocket } = await import("ws");
+  const c = await client({ "X-User-ID": "tabs-user" });
+  const code = /Pairing code: ([A-Z0-9-]+)/.exec(textOf(await call(c, "browser_tabs", {})))[1];
+  const dev = await (await fetch(base + "/bridge/pair", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code, name: "stand-in", version: "0.5.2" }) })).json();
+  const ws = new WebSocket(base.replace("http", "ws") + "/bridge");
+  let seen;
+  await new Promise((res, rej) => {
+    ws.on("open", () => ws.send(JSON.stringify({ type: "hello", deviceId: dev.deviceId, token: dev.token, version: "0.5.2" })));
+    ws.on("message", (m) => {
+      const d = JSON.parse(m.toString());
+      if (d.type === "ready") res();
+      if (d.type === "req") { seen = d.request; ws.send(JSON.stringify({ type: "res", id: d.id, response: { ok: true, hidden: 1, tabs: [
+        { id: 1, active: true, title: "Example", url: "https://example.com/" },
+        { id: 2, active: false, title: "Extensions", url: "chrome://extensions/", restricted: true }] } })); }
+    });
+    ws.on("error", rej);
+  });
+  try {
+    const t = textOf(await call(c, "browser_tabs", { action: "list", includeHidden: true, showAll: true }));
+    assert.equal(seen.allWindows, true, "all windows by default");
+    assert.match(t, /All 2 open tabs in every window/);
+    assert.match(t, /#2 .*chrome:\/\/extensions\/ {2}\(browser page: cannot be read or operated\)/);
+    assert.match(t, /1 more tab is open on sites the user excluded/);
+    assert.match(t, /complete list/);
+    assert.match(t, /Ignored: includeHidden, showAll\. browser_tabs has no such parameters; it takes only: action, tabId, url, active, allWindows/);
+    assert.doesNotMatch(t, /hidden by the site lists/);
+  } finally { ws.terminate(); }
+});
+
 // Runs last: everything above has left real state in the data directory.
 test("a restart on the same data directory comes up and keeps files, sign-ins and schedules", async () => {
   const c = await client();

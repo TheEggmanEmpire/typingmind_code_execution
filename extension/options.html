@@ -10,7 +10,7 @@
   #saved { color: #1a7f37; margin-left: 8px; } #pairResult { white-space: pre-wrap; } fieldset { margin: 20px 0; border: 1px solid #d0d7de; }
 </style>
 <h2>Code Runner Browser Bridge</h2>
-<p>Connect a remote MCP client, or use the Code Runner plugin in TypingMind. The two paths work independently.</p>
+<p>Lets the AI in LibreChat, Hermes or another MCP client read and operate the tabs you have open, through your Code Runner server. Nothing can use it until you pair it below.</p>
 <fieldset>
   <legend>Remote link</legend>
   <p id="connection" role="status">Checking connection…</p>
@@ -33,9 +33,10 @@
   <label>Chat page hosts <textarea id="remoteChatHosts" rows="3" placeholder="Optional: chat.example.com"></textarea></label>
   <p class="mut">Remote tab lists mark these as chat tabs. Default tab selection skips them. This list grants no access.</p>
 </fieldset>
-<h3>Trusted hosts (TypingMind)</h3>
-<p>The plugin relay answers only frames inside pages on these trusted hosts. Add your own host for self-hosted TypingMind or a custom domain.</p>
-<p class="mut">These hosts authorize the TypingMind path. Remote pairing does not change them.</p>
-<textarea id="hosts" rows="5"></textarea>
 <p><button id="save">Save settings</button><span id="saved" role="status"></span></p>
+<details>
+  <summary>Only if you also use the Code Runner plugin inside TypingMind</summary>
+  <p class="mut">Not needed for LibreChat or Hermes. The TypingMind plugin talks to this extension from the chat page itself instead of through the server; it is answered only on the hosts listed here. Pairing above does not change this list.</p>
+  <textarea id="hosts" rows="5"></textarea>
+</details>
 <script src="options.js"></script>

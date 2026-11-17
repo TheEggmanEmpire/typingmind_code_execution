@@ -1,14 +1,16 @@
 # Code Runner Browser Bridge
 
-A small unpacked Chrome extension that lets the Code Runner TypingMind plugin read and operate **your own open
-browser tabs** through four plugin tools:
+A small unpacked Chrome extension that lets the AI read and operate **your own open browser tabs**. It serves
+two clients, independently: the Code Runner MCP server (LibreChat, Hermes Agent and other MCP clients; see
+"Remote link" below) and the Code Runner plugin inside TypingMind. Four tools:
 
 - **`browser_state`**: the page with every visible interactive element numbered, the page's text as Markdown, or a
-  screenshot (saved into the plugin's `/workspace`, element numbers drawn on it).
+  screenshot (saved into the workspace, element numbers drawn on it).
 - **`browser_act`**: click, type, press keys, list and pick dropdown options, scroll, go to a URL, search, back,
   forward, reload, wait, switch / open / close tabs, by element number, several actions per call.
 - **`browser_run`**: run custom JavaScript in a tab and get the value plus console output.
-- **`browser_tabs`**: list / activate / open / close / reload / navigate tabs.
+- **`browser_tabs`**: list / activate / open / close / reload / navigate tabs. Through the remote link the list
+  covers every window; browser pages (`chrome://`, the Web Store) are listed but marked as out of reach.
 
 The numbered-snapshot approach (the model sees `[12]<button>Search</button>` and acts on 12) is the core of
 [nanobrowser](https://github.com/nanobrowser/nanobrowser) and browser-use. Here TypingMind's model is the agent;

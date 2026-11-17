@@ -250,7 +250,7 @@ function specs() {
     },
     {
       name: "browser_tabs",
-      description: "List the user's open tabs, or activate, open, close, reload or navigate one.",
+      description: "List the user's open tabs (all windows; one call with no arguments returns the complete list), or activate, open, close, reload or navigate one.",
       inputSchema: {
         type: "object",
         properties: {
@@ -258,7 +258,7 @@ function specs() {
           tabId: { type: "number" },
           url: { type: "string" },
           active: { type: "boolean", description: "open: bring the new tab to the front (default true)." },
-          allWindows: { type: "boolean", description: "list: every window instead of the current one." }
+          allWindows: { type: "boolean", description: "list: false limits the list to the current window. Default: every window." }
         }
       }
     }
@@ -679,12 +679,18 @@ async function browser_tabs(args, ctx) {
   if (args.tabId != null) req.tabId = Number(args.tabId);
   if (args.url != null) req.url = String(args.url);
   if (args.active != null) req.active = !!args.active;
-  if (args.allWindows != null) req.allWindows = !!args.allWindows;
+  // "My tabs" means all of them: every window unless the caller narrows it.
+  if (op === "tabs.list") req.allWindows = args.allWindows !== false;
   const r = await browserCall(ctx, req, 30000);
   if (!r.ok) return browserFail(ctx, "browser_tabs", r);
   if (op === "tabs.list") {
-    const rows = (r.tabs || []).map((t) => "#" + t.id + (t.active ? " *" : "  ") + " " + (t.title || "(untitled)") + "  -  " + t.url + (t.chat ? "  (the chat)" : ""));
-    return browserText(ctx, (rows.length ? "Open tabs (id, * = active):\n" + rows.join("\n") : "No tabs found.") + (r.hidden ? "\n(" + r.hidden + " tab" + (r.hidden === 1 ? " is" : "s are") + " hidden by the site lists)" : ""));
+    const rows = (r.tabs || []).map((t) => "#" + t.id + (t.active ? " *" : "  ") + " " + (t.title || "(untitled)") + "  -  " + t.url + (t.chat ? "  (the chat)" : "") + (t.restricted ? "  (browser page: cannot be read or operated)" : ""));
+    const n = (r.tabs || []).length;
+    // Say exactly what the list is, so nobody goes looking for more with other parameters.
+    let out = rows.length ? "All " + n + " open tab" + (n === 1 ? "" : "s") + (req.allWindows ? " in every window" : " in the current window") + " (id, * = active in its window):\n" + rows.join("\n") : "No tabs found.";
+    if (r.hidden) out += "\n\n" + r.hidden + " more tab" + (r.hidden === 1 ? " is" : "s are") + " open on sites the user excluded (the allowed/blocked sites lists in the extension's options or on the server). They cannot be listed by any parameter; only the user can change those lists.";
+    out += "\n\nThis is the complete list this tool can give: there are no further parameters that show more. Tabs of other Chrome profiles, incognito windows and other browsers are never visible.";
+    return browserText(ctx, out);
   }
   if (op === "tabs.close") return text("Closed tab " + r.closed + ".");
   if (op === "tabs.reload") return text("Reloaded tab " + r.tab + ".");
@@ -767,7 +773,16 @@ export async function callTool(name, args, ctx) {
   const fn = HANDLERS[name];
   if (!fn) return fail("Unknown tool \"" + name + "\".");
   try {
-    return await fn(args && typeof args === "object" ? args : {}, ctx);
+    args = args && typeof args === "object" ? args : {};
+    const result = await fn(args, ctx);
+    // A model that guesses parameters gets no signal when they are silently
+    // ignored, and keeps guessing. Name what was ignored and what exists.
+    const known = Object.keys(((listTools().find((t) => t.name === name) || {}).inputSchema || {}).properties || {});
+    const unknown = Object.keys(args).filter((k) => !known.includes(k));
+    if (unknown.length && result && Array.isArray(result.content) && result.content[0] && result.content[0].type === "text") {
+      result.content[0].text += "\n\n(Ignored: " + unknown.slice(0, 8).join(", ") + ". " + name + " has no such parameter" + (unknown.length === 1 ? "" : "s") + "; it takes only: " + known.join(", ") + ". Do not try other parameter names.)";
+    }
+    return result;
   } catch (e) {
     return fail("**" + name + " failed:** " + runner.redact(String(e && e.message || e), ctx.secrets) + ".");
   }

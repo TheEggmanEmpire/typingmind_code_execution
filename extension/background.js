@@ -13,7 +13,7 @@
 //
 // Every reply is { ok: true, ... } or { ok: false, error, code? }.
 
-const VERSION = "0.5.1";
+const VERSION = "0.5.2";
 // Only socket callbacks hold this identity; no page message can serialize it.
 const REMOTE_SOURCE = Object.freeze({});
 const DEFAULT_TRUSTED = ["typingmind.com", "*.typingmind.com"];
@@ -143,8 +143,15 @@ async function handle(req, sender, depth, ancestors) {
       const tabs = await chrome.tabs.query(req.allWindows ? {} : { currentWindow: true });
       const own = sender && sender.tab ? sender.tab.id : null;
       const cfg = auth.remote ? await settings() : null;
-      const shown = tabs.filter((t) => (!auth.remote && t.id === own) || !policyBlocks(t.url || t.pendingUrl || "", policy));
-      return { ok: true, tabs: shown.map((t) => ({ ...tabView(t), chat: cfg ? chatTab(t, cfg) : t.id === own })), hidden: tabs.length - shown.length };
+      // Three kinds of tab: usable; a browser page (chrome://, the Web Store, a new
+      // tab), which is listed so the list is complete but marked as out of reach;
+      // and a page the site lists exclude, which is only counted. Calling a browser
+      // page "hidden by the site lists" sent a model hunting for a tab it could
+      // never be shown.
+      const webPage = (t) => /^https?:/i.test(t.url || t.pendingUrl || "");
+      const blocked = (t) => !(!auth.remote && t.id === own) && webPage(t) && !!policyBlocks(t.url || t.pendingUrl || "", policy);
+      const shown = tabs.filter((t) => !blocked(t));
+      return { ok: true, tabs: shown.map((t) => ({ ...tabView(t), chat: cfg ? chatTab(t, cfg) : t.id === own, ...(webPage(t) || (!auth.remote && t.id === own) ? {} : { restricted: true }) })), hidden: tabs.length - shown.length };
     }
     case "tabs.activate": {
       const id = await resolveTabId(req, sender);
