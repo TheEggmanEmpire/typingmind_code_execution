@@ -57,6 +57,7 @@ How it works inside: [ARCHITECTURE.md](ARCHITECTURE.md)
 | `WORKSPACE_QUOTA_MB` / `MAX_FILE_MB` | 2048 / 512 | Size of a workspace and of one file |
 | `MAX_JOBS` / `MAX_PROCS` | 4 / 256 | Concurrent runs and processes per workspace |
 | `BROWSER_ALLOW_SITES` / `BROWSER_BLOCK_SITES` | - | Sites the browser tools may touch (the extension has its own lists as well) |
+| `BRIDGE_LINK_KEY` | on | `off` refuses browsers linked by config file; only per-user pairing codes work then |
 | `BROWSER_CONFIRM` | on | Hold buy/pay/delete/send clicks for the user's approval |
 | `RESULT_MAX_CHARS` / `RESULT_IMAGE_MAX_KB` | 60000 / 1024 | Budget of one tool result. Longer text is saved under `results/` in the workspace and shortened; larger images are left out with a note |
 | `CALL_CEILING_S` | 600 | A tool call that has not answered by then returns an error instead of hanging |
@@ -165,9 +166,19 @@ can be revoked.
 ## Link your browser
 
 1. Load the `extension/` folder of this repository in Chrome (`chrome://extensions`, Developer mode, Load unpacked).
-2. Ask the AI to look at a tab. With no browser linked, it answers with the server address and a one-time
-   pairing code.
-3. Enter both under **Remote link** on the extension's options page.
+2. Put a `config.json` next to its `manifest.json` with the server address and the link key, then reload the
+   extension:
+
+   ```json
+   { "server": "https://<domain>", "key": "<link key>" }
+   ```
+
+   The link key is derived from the access key; `extension/README.md` has the one-line command that prints it.
+
+That is all: the extension connects by itself whenever Chrome runs, and the browser tools work at once. No
+pairing code, nothing to repeat after a redeploy. A browser linked this way serves every user of the server who
+has no browser of their own paired; set `BRIDGE_LINK_KEY=off` to allow only per-user pairing, which works through
+a one-time code the AI shows (see `extension/README.md`).
 
 The extension connects out to the server; nothing listens on your machine. Its own allowed/blocked site lists,
 the confirmation of risky actions and the switch for running scripts are enforced in the extension and cannot be

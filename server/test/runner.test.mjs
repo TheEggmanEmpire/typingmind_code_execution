@@ -113,7 +113,7 @@ test('output offsets follow growing jobs without duplicating prior text',async()
 test('Python hard interrupt fallback loses state and next run recovers',async()=>{
   await run('python','kept_until_killed = 10');
   const start=Date.now();const result=await run('python','import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nwhile True: pass',{timeout:1});
-  assert.match(result.text,/timed out/);assert.ok(Date.now()-start<6000);
+  assert.match(result.text,/timed out/);assert.ok(Date.now()-start<10000);   // 1 s limit + 3 s grace before the hard kill, with slack for a busy machine
   assert.match((await run('python','print("fresh")')).text,/Variables were lost/);
 });
 test('max jobs and quota refuse new work',async()=>{

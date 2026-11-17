@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Code Runner Browser Bridge",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Lets the Code Runner MCP server (LibreChat, Hermes and other MCP clients) read and operate your open tabs, after you pair it. Also serves the Code Runner plugin in TypingMind.",
   "permissions": [
     "tabs",

@@ -12,6 +12,7 @@ import { WebSocket } from "ws";
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-bridge-unit-"));
 process.env.BRIDGE_TRUST_LOCAL_XFF = "1";
 process.env.DATA_DIR = dir;
+process.env.MCP_API_KEY = "bridge-test-access-key-0123456789";
 const bridge = await import("../src/bridge.js");
 const server = http.createServer(async (req, res) => {
   try { if (!await bridge.handleBridgeHttp(req, res, new URL(req.url, "http://localhost"))) res.writeHead(404).end(); }
@@ -212,6 +213,31 @@ test("a pairing survives a wiped bridge.json; an unlinked device does not come b
     assert.equal(await hello(fresh, kept), "ready");
     assert.equal(await hello(fresh, { ...kept, token: kept.token.slice(0, -2) + "xx" }), 4401);
   } finally { fs.writeFileSync(file, saved); }
+});
+
+test("the link key connects a browser without pairing and serves every user; an own pairing wins", async () => {
+  const key = bridge.linkKey();
+  assert.match(key, /^[A-Za-z0-9_-]{43}$/);
+  // A wrong key is refused like a wrong token.
+  const bad = new WebSocket(base.replace("http:", "ws:") + "/bridge"); clients.add(bad);
+  await once(bad, "open"); const closed = once(bad, "close");
+  bad.send(JSON.stringify({ type: "hello", key: key.slice(0, -1) + (key.endsWith("A") ? "B" : "A"), deviceId: "x" }));
+  assert.equal((await closed)[0], 4401);
+  assert.deepEqual(await bridge.bridgeCall("nobody-yet", { op: "ping" }, 300), { ok: false, code: "offline" });
+  // The right key: no code, no stored device.
+  const before = fs.readFileSync(path.join(dir, "bridge.json"), "utf8");
+  const linked = await connect({ key, deviceId: "home-chrome", name: "Home Chrome" });
+  assert.equal(bridge.bridgeStatus("anyone-at-all").connected, true);
+  await respond(linked, "anyone-at-all", "linked");
+  assert.equal(fs.readFileSync(path.join(dir, "bridge.json"), "utf8"), before, "a key-linked browser is not written to the device store");
+  // A user with a browser of their own gets that one, not the shared one.
+  const own = await connect(await pair("has-own"));
+  await respond(own, "has-own", "own");
+  await respond(linked, "someone-else", "linked");
+  // Unlinking a user's devices leaves the key-linked browser alone.
+  bridge.revokeDevices("has-own");
+  assert.equal(bridge.bridgeStatus("has-own").connected, true);
+  linked.terminate();
 });
 
 test("missing hello expires in five seconds", async t => {

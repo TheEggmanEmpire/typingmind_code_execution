@@ -16,6 +16,16 @@ async function load() {
   $("serverUrl").value = s.remoteLink?.url || "";
   $("deviceName").value = s.remoteName || "Chrome on this computer";
   $("unlink").disabled = !s.remoteLink;
+  // Linked by the bundled config file: say so, and keep the manual form out of the way.
+  let file = {};
+  try { const r = await fetch(chrome.runtime.getURL("config.json")); if (r.ok) file = await r.json(); } catch (e) {}
+  const byFile = typeof file.server === "string" && typeof file.key === "string" && (!s.remoteLink || s.remoteAuthRejected);
+  $("autoLink").textContent = byFile
+    ? "Linked by config.json to " + file.server.replace(/^https?:\/\//, "") + ". No pairing needed; the connection state is shown above."
+    : s.remoteLink && s.remoteAuthRejected ? "The link made by hand is no longer accepted by the server (it was made before the server's records were reset). Press Unlink and pair again, or add a config.json (see README) and reload the extension."
+    : s.remoteLink ? "Linked by hand to " + String(s.remoteLink.url || "").replace(/^https?:\/\//, "") + "."
+    : "Not linked yet. Put a config.json with the server address and link key into the extension folder (see README), or link by hand below.";
+  $("manual").open = !byFile;
   await status();
 }
 async function status() {

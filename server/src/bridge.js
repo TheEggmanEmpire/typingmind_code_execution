@@ -36,6 +36,32 @@ function readDeviceToken(token) {
   try { const p = JSON.parse(Buffer.from(body, "base64url").toString("utf8")); return p && typeof p.d === "string" && typeof p.u === "string" ? p : null; } catch { return null; }
 }
 
+// The link key: one fixed credential for the owner's own browser, so the
+// extension connects by itself from a config file and nobody types a pairing
+// code. It is derived from the access key (anyone holding that key controls the
+// server anyway) and a browser linked with it serves every user of this server
+// who has no browser of their own paired: right for a personal deployment.
+// BRIDGE_LINK_KEY=off switches it off; pairing codes still work either way.
+const SHARED_USER = "*";
+export function linkKey() {
+  if (/^(0|off|false|no)$/i.test(process.env.BRIDGE_LINK_KEY || "") || String(config.apiKey || "").length < 16) return "";
+  return crypto.createHmac("sha256", config.apiKey).update("code-runner browser link v1").digest("base64url");
+}
+function sharedDevice(msg) {
+  const want = linkKey();
+  if (!want || typeof msg.key !== "string") return null;
+  const a = hash(msg.key), b = hash(want);
+  if (!crypto.timingSafeEqual(a, b)) return null;
+  const id = "link-" + String(msg.deviceId || "").replace(/[^A-Za-z0-9-]/g, "").slice(0, 40).padEnd(1, "0");
+  return { deviceId: id, tokenHash: "", user: SHARED_USER, name: String(msg.name || "Chrome").replace(/[\x00-\x1f\x7f]/g, "").slice(0, 100), version: "", created: Date.now(), lastSeen: Date.now(), order: ++order, shared: true };
+}
+// A user's own paired browser first; otherwise the owner's linked browser.
+function onlineFor(user) {
+  const open = [...sockets.values()].filter(e => e.ws.readyState === WebSocket.OPEN);
+  const own = open.filter(e => e.device.user === user);
+  return (own.length ? own : open.filter(e => e.device.user === SHARED_USER)).sort((x, y) => y.device.order - x.device.order);
+}
+
 function load() {
   if (loaded) return;
   let data;
@@ -234,7 +260,7 @@ export function attachBridge(httpServer) {
       if (!active) {
         if (authPending) return;
         authPending = true;
-        const d = msg.type === "hello" ? credential(msg.deviceId, msg.token) : null;
+        const d = msg.type === "hello" ? (sharedDevice(msg) || credential(msg.deviceId, msg.token)) : null;
         if (!d) { reject(); return; }
         clearTimeout(authTimer); settled();
         sockets.get(d.deviceId)?.ws.close(4400, "Device reconnected");
@@ -253,7 +279,7 @@ export function attachBridge(httpServer) {
           } };
         active = entry; sockets.set(d.deviceId, entry); entry.touch();
         d.version = String(msg.version || d.version).slice(0, 40);
-        ws.send(JSON.stringify({ type: "ready", user: d.user }));
+        ws.send(JSON.stringify({ type: "ready", user: d.shared ? "this server (linked by key)" : d.user }));
         return;
       }
       active.touch();
@@ -264,7 +290,7 @@ export function attachBridge(httpServer) {
       active.pending.delete(msg.id);
       active.device.lastSeen = Date.now(); active.device.order = ++order;
       // The response remains useful if the volume temporarily becomes unwritable.
-      try { save(); } catch {}
+      if (!active.device.shared) { try { save(); } catch {} }
       pending.resolve(msg.response);
     });
   });
@@ -273,14 +299,13 @@ export function attachBridge(httpServer) {
 
 export function bridgeStatus(user) {
   load();
-  const online = [...sockets.values()].filter(e => e.device.user === user && e.ws.readyState === WebSocket.OPEN);
+  const online = onlineFor(user);
   return { connected: !!online.length, devices: online.map(e => ({ id: e.device.deviceId, name: e.device.name, version: e.device.version, since: e.since })) };
 }
 
 export async function bridgeCall(user, request, timeoutMs = 30_000) {
   load();
-  const entry = [...sockets.values()].filter(e => e.device.user === user && e.ws.readyState === WebSocket.OPEN)
-    .sort((a, b) => b.device.order - a.device.order)[0];
+  const entry = onlineFor(user)[0];
   if (!entry) return { ok: false, code: "offline" };
   return new Promise(resolve => {
     const id = crypto.randomUUID();

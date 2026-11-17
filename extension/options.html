@@ -16,12 +16,17 @@
   <p id="connection" role="status">Checking connection…</p>
   <p class="mut" id="lastError"></p>
   <label><input id="remoteEnabled" type="checkbox"> Remote link enabled</label>
-  <p class="mut">Ask the AI to use a browser tool, then paste the server URL and the one-time pairing code it gives you. HTTPS is required except on localhost or 127.0.0.1.</p>
+  <p class="mut" id="autoLink">This browser links to the server by itself when a <code>config.json</code> with the server address and link key sits in the extension folder. Nothing to enter here.</p>
+  <details id="manual">
+    <summary>Link by hand with a pairing code instead</summary>
+    <p class="mut">Only without a config.json. Ask the AI to use a browser tool, then paste the server URL and the one-time pairing code it gives you. HTTPS is required except on localhost or 127.0.0.1.</p>
+
   <label>Server URL <input id="serverUrl" type="text" placeholder="https://your-server.up.railway.app" autocomplete="off" spellcheck="false"></label>
   <label>Pairing code <input id="pairCode" type="text" placeholder="XXXX-XXXX-XX" autocomplete="off" spellcheck="false"></label>
   <label>Device name <input id="deviceName" type="text" value="Chrome on this computer" maxlength="100"></label>
   <p><button id="pair">Pair</button> <button id="unlink">Unlink</button></p>
   <p id="pairResult" role="status"></p>
+  </details>
   <h3>Local safety controls</h3>
   <p class="mut">These controls apply to remote requests. The server cannot relax them. Host lists accept one host per line, including <code>*.example.com</code>. A plain host also matches its subdomains.</p>
   <label>Allowed sites <textarea id="remoteAllow" rows="3" placeholder="Empty means no local allow restriction"></textarea></label>

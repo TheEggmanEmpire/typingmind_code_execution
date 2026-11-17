@@ -151,13 +151,13 @@ test("status, schedule and browser pairing answer sensibly", async () => {
   assert.match(textOf(r), /ran/);
   r = await call(c, "schedule", { action: "delete", name: "beat" });
   r = await call(c, "browser_tabs", { action: "list" });
-  assert.match(textOf(r), /Pairing code: [A-Z0-9-]+/);
+  assert.match(textOf(r), /pairing code [A-Z0-9-]+/i);
 });
 
 test("the tab list says it is complete, marks browser pages and names ignored parameters", async () => {
   const { default: WebSocket } = await import("ws");
   const c = await client({ "X-User-ID": "tabs-user" });
-  const code = /Pairing code: ([A-Z0-9-]+)/.exec(textOf(await call(c, "browser_tabs", {})))[1];
+  const code = /pairing code ([A-Z0-9-]+)/i.exec(textOf(await call(c, "browser_tabs", {})))[1];
   const dev = await (await fetch(base + "/bridge/pair", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code, name: "stand-in", version: "0.5.2" }) })).json();
   const ws = new WebSocket(base.replace("http", "ws") + "/bridge");
   let seen;

@@ -1233,6 +1233,19 @@ only the MCP client holds the key. Consequences:
 Server side `bridge.js`, browser side `extension/background.js` (service worker), `extension/options.js`
 (options page), `extension/content.js` (TypingMind relay), `extension/page-agent.js` (in-page agent).
 
+**Two ways to link a browser.** (a) *By key*, the normal way for a personal server: the extension reads
+`config.json` in its own folder (`server`, `key`) in `settings()` and sends `{ type: "hello", key, deviceId,
+name }`. The server compares the key with `linkKey()` in `bridge.js` (an HMAC of the access key with the label
+"code-runner browser link v1"; empty when the access key is shorter than 16 characters or `BRIDGE_LINK_KEY=off`)
+and admits the socket as a *shared* device (`user: "*"`, never written to `bridge.json`). `onlineFor(user)`
+returns a user's own paired devices first and otherwise the shared ones, so a key-linked browser answers for
+every user without a pairing of their own. There is nothing to redo after a redeploy or a browser restart; a
+4401 on this path does not set `remoteAuthRejected`, the extension keeps retrying and shows that the key was
+not accepted. (b) *By pairing code*, per user, described in the subsections below; it remains for servers with
+several people and takes precedence when both exist. What the key grants: presenting a browser to the server
+(and so receiving the actions and typed text meant for the user's browser). It does not grant control of the
+user's browser, of the server, or of any workspace.
+
 ### 9.1 Pairing, step by step
 
 1. The model calls a `browser_*` tool. `tools.js` `browserCall()` asks `bridgeStatus(user)` for connected

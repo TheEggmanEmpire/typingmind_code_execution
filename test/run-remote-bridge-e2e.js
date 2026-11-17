@@ -56,6 +56,7 @@ async function cdp(url) {
   fs.cpSync(EXT, ext, { recursive:true }); fs.mkdirSync(profile);
   fs.writeFileSync(path.join(ext, 'config.json'), JSON.stringify({ trustedHosts:['localhost'] }));
   process.env.DATA_DIR = path.join(tmp, 'data');
+  process.env.MCP_API_KEY = 'remote-e2e-access-key-0123456789';
   const bridge = await import(pathToFileURL(path.join(ROOT, 'server/src/bridge.js')));
   const server = http.createServer(async (req,res) => {
     if (await bridge.handleBridgeHttp(req,res,new URL(req.url,'http://localhost'))) return;
@@ -84,7 +85,7 @@ async function cdp(url) {
     let paired;
     await step('pair over HTTP, preseed trusted extension storage, then connect', async () => {
       const {code} = bridge.createPairingCode('remote-e2e');
-      const r = await fetch(base+'/bridge/pair',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code,name:'E2E Chrome',version:'0.5.2'})});
+      const r = await fetch(base+'/bridge/pair',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code,name:'E2E Chrome',version:'0.5.3'})});
       assert.equal(r.status,200); paired = await r.json();
       // Never print this expression: it contains the new device credential.
       await sw.evaluate(`chrome.storage.local.set(${JSON.stringify({remoteLink:{url:base,...paired},remoteEnabled:true,remoteAuthRejected:false,remoteScripts:true,remoteConfirmRisky:true})})`);
@@ -92,7 +93,7 @@ async function cdp(url) {
     });
     const request = req => bridge.bridgeCall('remote-e2e',req,20_000);
     await step('remote ping uses paired authority', async () => {
-      assert.deepEqual(await request({op:'ping'}),{ok:true,version:'0.5.2',trusted:true,remote:true});
+      assert.deepEqual(await request({op:'ping'}),{ok:true,version:'0.5.3',trusted:true,remote:true});
     });
     let tab;
     await step('tabs.list and page.state elements on the real fixture', async () => {
@@ -150,6 +151,17 @@ async function cdp(url) {
       bridge.revokeDevices('remote-e2e');
       await until(()=>sw.evaluate(`chrome.storage.local.get('remoteAuthRejected').then(s=>s.remoteAuthRejected===true)`),'auth rejection persisted');
       const status=await sw.evaluate(`chrome.storage.session.get('remoteStatus').then(s=>s.remoteStatus)`); assert.equal(status.connected,false); assert.match(status.lastError,/pair again/i);
+    });
+    await step('config.json links the browser with no pairing step', async () => {
+      // Remove the hand-made link, then give the extension folder a config file and restart its worker.
+      fs.writeFileSync(path.join(ext, 'config.json'), JSON.stringify({ trustedHosts:['localhost'], server: base, key: bridge.linkKey(), name: 'Config Chrome' }));
+      await sw.evaluate(`chrome.storage.local.remove(['remoteLink','remoteAuthRejected'])`);
+      await until(() => bridge.bridgeStatus('any-user-at-all').connected, 'config-linked socket');
+      const pong = await bridge.bridgeCall('any-user-at-all', {op:'ping'}, 20_000);
+      assert.equal(pong.ok, true); assert.equal(pong.remote, true);
+      const list = await bridge.bridgeCall('any-user-at-all', {op:'tabs.list', allWindows:true}, 20_000);
+      assert.ok(list.ok && list.tabs.length >= 1);
+      assert.equal(bridge.bridgeStatus('any-user-at-all').devices[0].name, 'Config Chrome');
     });
     console.log(`\n${passed} remote Chromium checks passed.`);
   } finally {

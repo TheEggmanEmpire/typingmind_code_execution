@@ -29,6 +29,32 @@ After editing the extension, press its reload icon in `chrome://extensions`, the
 
 ## Remote link (LibreChat, Hermes and other MCP clients)
 
+### No pairing: link by config file
+
+Put a `config.json` next to `manifest.json`:
+
+```json
+{ "server": "https://your-server.up.railway.app", "key": "<link key>", "name": "Home Chrome" }
+```
+
+Reload the extension. From then on it connects to that server by itself whenever Chrome runs: no code to type,
+nothing to do after a redeploy or a Chrome restart. The options page shows "Linked by config.json".
+
+The link key is derived from the server's access key (`MCP_API_KEY` / `MCP_PASSWORD`), so it changes only when
+that does. Print it on any machine that knows the access key:
+
+```sh
+node -e 'console.log(require("crypto").createHmac("sha256", process.argv[1]).update("code-runner browser link v1").digest("base64url"))' "<access key>"
+```
+
+A browser linked this way answers for every user of the server who has not paired a browser of their own. That
+suits a personal server. On a server with several people, either pair per person (below) or set
+`BRIDGE_LINK_KEY=off` on the server. Keep `config.json` private: whoever has the key can present a browser to
+your server and would receive what the AI types into pages. It cannot control your browser or the server.
+
+### Pairing by hand (without a config file)
+
+
 The remote MCP server can reach this extension without a TypingMind page. Pair each browser profile separately:
 
 1. Install the extension as above, then open **Details -> Extension options**.

@@ -13,7 +13,7 @@
 //
 // Every reply is { ok: true, ... } or { ok: false, error, code? }.
 
-const VERSION = "0.5.2";
+const VERSION = "0.5.3";
 // Only socket callbacks hold this identity; no page message can serialize it.
 const REMOTE_SOURCE = Object.freeze({});
 const DEFAULT_TRUSTED = ["typingmind.com", "*.typingmind.com"];
@@ -26,6 +26,16 @@ async function settings() {
   try { const r = await fetch(chrome.runtime.getURL("config.json")); if (r.ok) file = await r.json(); } catch (e) {}
   const s = await chrome.storage.local.get(["trustedHosts", "remoteLink", "remoteEnabled", "remoteAllow", "remoteBlock", "remoteConfirmRisky", "remoteScripts", "remoteChatHosts", "remoteAuthRejected"]);
   const hosts = Array.isArray(s.trustedHosts) && s.trustedHosts.length ? s.trustedHosts : Array.isArray(file.trustedHosts) && file.trustedHosts.length ? file.trustedHosts : DEFAULT_TRUSTED;
+  // A config.json next to the manifest ({ "server": "https://...", "key": "..." })
+  // links this browser to the server without any pairing step. A link made by
+  // hand on the options page takes precedence while it works.
+  // A hand-made link the server has rejected is dead: the config file takes over without anyone pressing Unlink.
+  if ((!s.remoteLink || s.remoteAuthRejected) && typeof file.server === "string" && typeof file.key === "string" && file.key.length >= 20) {
+    let deviceId = (await chrome.storage.local.get("linkDeviceId")).linkDeviceId;
+    if (!deviceId) { deviceId = crypto.randomUUID(); await chrome.storage.local.set({ linkDeviceId: deviceId }); }
+    s.remoteLink = { url: file.server, key: file.key, deviceId, token: file.key, fromFile: true, name: typeof file.name === "string" ? file.name : "Chrome" };
+    s.remoteAuthRejected = false;   // a corrected config.json must be able to connect again
+  }
   settingsCache = { ...s, hosts };
   return settingsCache;
 }
@@ -679,7 +689,9 @@ async function syncRemote() {
   const current = () => remoteSocket === ws;
   ws.onopen = () => {
     if (!current()) return ws.close();
-    ws.send(JSON.stringify({ type: "hello", deviceId: s.remoteLink.deviceId, token: s.remoteLink.token, version: VERSION }));
+    ws.send(JSON.stringify(s.remoteLink.fromFile
+      ? { type: "hello", key: s.remoteLink.key, deviceId: s.remoteLink.deviceId, name: s.remoteLink.name, version: VERSION }
+      : { type: "hello", deviceId: s.remoteLink.deviceId, token: s.remoteLink.token, version: VERSION }));
     remoteHello = setTimeout(() => { if (current() && !ready) ws.close(4400, "Handshake timed out"); }, 10_000);
   };
   ws.onmessage = async event => {
@@ -707,12 +719,12 @@ async function syncRemote() {
   ws.onclose = async event => {
     if (!current()) return;
     remoteSocket = null; stopRemoteTimers();
-    if (event.code === 4401) {
+    if (event.code === 4401 && !s.remoteLink.fromFile) {
       await chrome.storage.local.set({ remoteAuthRejected: true });
       await showRemoteStatus({ connected: false, since: null, lastError: "Pairing rejected, pair again." });
       return;
     }
-    await showRemoteStatus({ connected: false, since: null, lastError: "Connection closed; retrying." });
+    await showRemoteStatus({ connected: false, since: null, lastError: event.code === 4401 ? "The server did not accept the key in config.json; retrying." : "Connection closed; retrying." });
     const delay = Math.max(1000, Math.min(60_000, 1000 * 2 ** Math.min(remoteFailures++, 6) * (0.8 + Math.random() * 0.4)));
     if (!remoteSocket && remoteKey === key) remoteRetry = setTimeout(() => void syncRemote().catch(() => {}), delay);
   };

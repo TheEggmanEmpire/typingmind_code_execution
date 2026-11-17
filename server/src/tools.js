@@ -578,12 +578,10 @@ async function imageTool(editing, args, ctx) {
 function pairingHelp(user) {
   const p = bridge.createPairingCode(user);
   const mins = Math.max(1, Math.round((p.expiresAt - Date.now()) / 60000));
-  return "No browser is linked to this server yet, so tabs cannot be reached. Tell the user these steps:\n" +
-    "1. Install the Code Runner Browser Bridge extension (Chrome desktop: chrome://extensions, Developer mode, Load unpacked, the extension/ folder of the Code Runner repository).\n" +
-    "2. Open the extension's options (Details -> Extension options), section \"Remote link\".\n" +
-    "3. Server: " + config.publicUrl + "\n" +
-    "4. Pairing code: " + p.code + "  (one use, valid " + mins + " minutes)\n" +
-    "Then repeat the request. The code is useless after pairing; nobody should type it anywhere but the extension.";
+  return "The user's browser is not connected to this server right now, so tabs cannot be reached. Tell the user:\n" +
+    "- If the Code Runner Browser Bridge extension is installed with its config.json (server address and link key), it connects by itself whenever Chrome is running: open Chrome, or reload the extension in chrome://extensions, and repeat the request. Its options page shows the connection state.\n" +
+    "- Without a config.json, link it once by hand: extension options -> Server URL " + config.publicUrl + " , pairing code " + p.code + " (one use, valid " + mins + " minutes).\n" +
+    "Do not retry the browser tools until the user confirms the browser is connected.";
 }
 
 async function browserCall(ctx, request, timeoutMs) {
