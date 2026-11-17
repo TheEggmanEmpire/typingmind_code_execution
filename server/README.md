@@ -54,6 +54,8 @@ else that speaks MCP over Streamable HTTP.
 | `MAX_JOBS` / `MAX_PROCS` | 4 / 256 | Concurrent runs and processes per workspace |
 | `BROWSER_ALLOW_SITES` / `BROWSER_BLOCK_SITES` | - | Sites the browser tools may touch (the extension has its own lists as well) |
 | `BROWSER_CONFIRM` | on | Hold buy/pay/delete/send clicks for the user's approval |
+| `RESULT_MAX_CHARS` / `RESULT_IMAGE_MAX_KB` | 60000 / 1024 | Budget of one tool result. Longer text is saved under `results/` in the workspace and shortened; larger images are left out with a note |
+| `CALL_CEILING_S` | 600 | A tool call that has not answered by then returns an error instead of hanging |
 | `SANDBOX` | `auto` | `off` runs code as the server's own user (local testing only) |
 | `SERVER_SECRET` | generated on the volume | Signs links |
 
@@ -196,6 +198,13 @@ Limits you should know:
   service in a project of its own, or set `CODE_NETWORK=off`.
 - Disk use is checked before each run, not enforced by the kernel; one run can overshoot the quota.
 - `X-User-ID` is trusted because only your MCP client holds the API key. Anyone with the key can act as any user.
+
+## When a chat stalls
+
+Every tool call writes one line to the server log: tool, workspace, duration, size of the answer, and whether it
+was cut or failed (never content). A chat client that receives a tool result too large to pass on to the model
+usually just stops, so every result goes through one size guard before it leaves the server, whichever tool
+made it.
 
 ## Develop
 

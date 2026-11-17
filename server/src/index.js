@@ -21,6 +21,7 @@ import { initSandbox, sandboxReport } from "./sandbox.js";
 import { listTools, callTool, INSTRUCTIONS, startScheduler, stopScheduler } from "./tools.js";
 import { attachBridge, handleBridgeHttp } from "./bridge.js";
 import { handleWeb } from "./web.js";
+import { guardedCall } from "./guard.js";
 import { shutdownRunner, localLanguages } from "./runner.js";
 // Auth for every MCP endpoint: Bearer key, HTTP Basic, or OAuth 2.1 (claude.ai-style
 // connectors). Other endpoints reuse checkAuth/requireAuth with { resource: "/their/path" }.
@@ -65,7 +66,8 @@ function mcpServerFor(req) {
   const own = new Set(listTools().map((t) => t.name));
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [...listTools(), ...(await reaListTools(ws, [...own]))] }));
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    if (!own.has(request.params.name) && reaAvailable()) return reaCallTool(ws, request.params, extra);
+    const name = String(request.params.name);
+    if (!own.has(name) && reaAvailable()) return guardedCall(ws, name === "rea_call" ? "rea:" + String((request.params.arguments || {}).tool || "?").slice(0, 60) : name, () => reaCallTool(ws, request.params, extra));
     const token = request.params._meta && request.params._meta.progressToken;
     let n = 0;
     // Output while a run is going, for clients that asked for progress.
@@ -73,7 +75,7 @@ function mcpServerFor(req) {
       if (token === undefined || !message) return;
       extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: ++n, message: String(message).slice(-2000) } }).catch(() => {});
     };
-    return callTool(request.params.name, request.params.arguments, { ws, user: ws.user, secrets, progress, signal: extra.signal });
+    return guardedCall(ws, name, () => callTool(name, request.params.arguments, { ws, user: ws.user, secrets, progress, signal: extra.signal }));
   });
   return server;
 }

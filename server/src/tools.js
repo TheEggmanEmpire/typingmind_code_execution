@@ -20,7 +20,7 @@ const text = (t) => ({ content: [{ type: "text", text: String(t) }] });
 const fail = (t) => ({ content: [{ type: "text", text: String(t) }], isError: true });
 const fmtSize = (n) => legacy.fmtSize(n);
 const isInternal = (p) => String(p).startsWith(".cr/");
-const IMAGE_INLINE_MAX = 4 * 1024 * 1024;   // larger images are linked, not embedded in the result
+const IMAGE_INLINE_MAX = config.resultImageMaxBytes;   // larger images are linked, not embedded in the result
 const TEXT_INLINE_MAX = 20000;
 const BROWSER_OUT_MAX = 24000;
 
@@ -731,7 +731,7 @@ async function browser_state(args, ctx) {
       out += "\n\n(saved to " + s.rel + " in the workspace)";
     } catch (e) { out += "\n\n(not saved: " + (e.message || e) + ")"; }
   }
-  return browserText(ctx, out, Math.max(BROWSER_OUT_MAX, Math.min(Number(args.max_chars) || 0, 200000)));
+  return browserText(ctx, out, Math.max(BROWSER_OUT_MAX, Math.min(Number(args.max_chars) || 0, config.resultMaxChars)));
 }
 
 async function browser_act(args, ctx) {

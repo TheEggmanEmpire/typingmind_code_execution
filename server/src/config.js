@@ -107,6 +107,11 @@ export const config = {
   reaMaxChars: num(env.REA_MAX_CHARS, 20000, 2000, 1000000),   // longer REA results are saved to a file and shortened
   reaCallTimeoutS: num(env.REA_CALL_TIMEOUT_S, 300, 5, 86400), // limit of one forwarded REA call
 
+  // What one tool result may carry back to the chat (see guard.js)
+  resultMaxChars: num(env.RESULT_MAX_CHARS, 60000, 4000, 2000000),
+  resultImageMaxBytes: num(env.RESULT_IMAGE_MAX_KB, 1024, 0, 20480) * 1024,
+  callCeilingS: num(env.CALL_CEILING_S, 600, 30, 86400),     // no tool call is left unanswered longer than this
+
   serveMaxBytes: 20 * 1024 * 1024,
   previewMaxBytes: 15 * 1024 * 1024
 };
