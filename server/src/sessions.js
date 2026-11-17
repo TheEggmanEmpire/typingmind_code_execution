@@ -35,6 +35,7 @@ function uidFor(id) {
   while (used.has(uid)) uid++;
   map[id] = uid;
   const file = path.join(config.dataDir, "uids.json");
+  fs.mkdirSync(config.dataDir, { recursive: true });   // first start without a volume: /data does not exist yet
   fs.writeFileSync(file + ".tmp", JSON.stringify(map), { mode: 0o600 });
   fs.renameSync(file + ".tmp", file);
   return uid;
