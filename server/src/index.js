@@ -102,7 +102,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/health") {
       const rep = sandboxReport();
-      return json(res, 200, { ok: true, version: VERSION, sandbox: rep.refuse ? "unavailable" : rep.mode, layers: rep.layers, network: config.network, languages: Object.keys(localLanguages()), rea: reaAvailable() });
+      return json(res, rep.refuse ? 503 : 200, { ok: !rep.refuse, version: VERSION, sandbox: rep.refuse ? "unavailable" : rep.mode, layers: rep.layers, network: config.network, languages: Object.keys(localLanguages()), rea: reaAvailable() });
     }
     if (url.pathname.startsWith("/bridge") && await handleBridgeHttp(req, res, url)) return;
     if (await handleWeb(req, res, url)) return;

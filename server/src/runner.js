@@ -167,7 +167,7 @@ function readPrivate(directory,name,maxBytes) {
     const fd=fs.openSync(base+'/'+name,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
     try {
       const info=fs.fstatSync(fd);
-      if(!info.isFile()) throw new Error('Expected a regular job file.');
+      if(!info.isFile() || info.nlink!==1) throw new Error('Expected a regular job file.');
       const size=Math.min(info.size,maxBytes);
       const bytes=Buffer.alloc(size);let used=0,n;
       while(used<size && (n=fs.readSync(fd,bytes,used,size-used,null))>0) used+=n;
@@ -426,7 +426,10 @@ function processRun(j,argv,extraEnv={}) {
     child.stderr?.on('data',b=>append(j,err.decode(b,{stream:true})));
     child.stdin?.on('error',()=>{});child.stdin?.end(j.params.stdin||'');
     child.once('error',reject);
-    child.once('close',(code,signal)=>{append(j,out.decode());append(j,err.decode());if(j.child===child) j.child=null;resolve(code??(signal?128:1));});
+    child.once('close',(code,signal)=>{append(j,out.decode());append(j,err.decode());if(j.child===child) j.child=null;
+      // Processes the run left in the background (nohup, &) end with it: nothing may outlive its job and its time limit.
+      try {box.killTree(child);} catch {}
+      resolve(code??(signal?128:1));});
   });
 }
 function compilerArgs(value) {

@@ -10,6 +10,7 @@ import { setTimeout as realDelay } from "node:timers/promises";
 import { WebSocket } from "ws";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-bridge-unit-"));
+process.env.BRIDGE_TRUST_LOCAL_XFF = "1";
 process.env.DATA_DIR = dir;
 const bridge = await import("../src/bridge.js");
 const server = http.createServer(async (req, res) => {

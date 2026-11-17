@@ -104,9 +104,20 @@ function inlineable(mime) {
   return /^(image\/(png|jpeg|gif|webp|svg\+xml|avif|bmp)|audio\/|video\/|text\/|application\/(pdf|json|xml))/.test(mime);
 }
 
+// A served file is read into memory, so both its size and the number of
+// simultaneous reads are bounded: a public share link must not exhaust the server.
+const SERVE_MAX = Math.min(config.maxFileMb, 256) * 1024 * 1024;
+const SERVE_PARALLEL = 4;
+let serving = 0;
+
 async function serveFile(req, res, ws, p) {
+  if (serving >= SERVE_PARALLEL) return send(res, 503, "Busy, try again in a moment.\n", { "Content-Type": "text/plain; charset=utf-8", "Retry-After": "2" });
+  serving++;
+  try { return await serveFileNow(req, res, ws, p); } finally { serving--; }
+}
+async function serveFileNow(req, res, ws, p) {
   let bytes;
-  try { bytes = await wsfs.read(ws, p.p, { maxBytes: config.maxFileMb * 1024 * 1024 }); }
+  try { bytes = await wsfs.read(ws, p.p, { maxBytes: SERVE_MAX }); }
   catch (e) { return plain(res, e.code === "ENOENT" ? 404 : 400, e.code === "ENOENT" ? "This file no longer exists in the workspace." : "The file cannot be served: " + e.message); }
   let mime = legacy.guessMime(p.p);
   if (/^text\//.test(mime) || mime === "application/json") mime += "; charset=utf-8";

@@ -128,6 +128,10 @@ export async function initSandbox() {
       } else state.notes.push('Bubblewrap is not installed; namespaces are unavailable.');
       if (!success(probeRun(command(ws, ['/bin/true'], opts, state), ws))) throw new Error('crbox cannot execute the complete selected sandbox chain.');
       state.networkOff = state.layers.seccomp || netNamespace;
+      // Something must actually separate the code from the server: a user of its
+      // own, Landlock, or namespaces. Warnings alone are not isolation.
+      if (!root && !state.layers.landlock && !state.layers.namespaces) throw new Error('this host offers no separate user, no Landlock and no namespaces.');
+      if (config.network === 'off' && !state.networkOff) throw new Error('CODE_NETWORK=off cannot be enforced on this host (no seccomp, no network namespace).');
       state.notes.push('Shared-kernel defence in depth, not a VM. Memory and aggregate disk use are not bounded by per-job cgroups; file/CPU/process limits are not full resource isolation.');
       if (!root) state.notes.push(state.layers.namespaces ? 'Non-root user mode: no separate workspace UIDs. PID/mount namespaces confine process visibility and files, but this is not a separate host identity; host Unix services may remain reachable.' : 'Non-root user mode: no separate workspace UIDs. Same-UID signalling and non-filesystem IPC can reach sibling jobs and the server.');
       if (!state.layers.namespaces && state.layers.landlock) state.notes.push('Without PID namespaces, /proc is limited to selected system files and the original process; forked children cannot access their own /proc/self.');

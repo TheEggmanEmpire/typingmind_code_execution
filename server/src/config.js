@@ -49,10 +49,13 @@ function publicUrl() {
 function serverSecret() {
   if (env.SERVER_SECRET && env.SERVER_SECRET.length >= 16) return env.SERVER_SECRET;
   const file = path.join(dataDir, ".secret");
-  try { return fs.readFileSync(file, "utf8").trim(); } catch (e) {}
+  // A short or empty file (a failed first write, a stray `touch`) must never
+  // become the signing key: anyone could forge links with it.
+  try { const have = fs.readFileSync(file, "utf8").trim(); if (have.length >= 32) return have; } catch (e) {}
   const s = crypto.randomBytes(32).toString("hex");
   fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(file, s, { mode: 0o600 });
+  fs.writeFileSync(file + ".tmp", s, { mode: 0o600 });
+  fs.renameSync(file + ".tmp", file);
   return s;
 }
 

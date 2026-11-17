@@ -71,7 +71,9 @@ export function createPairingCode(user) {
 }
 
 function limited(req) {
-  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",").pop().trim();
+  // The header is only meaningful behind the platform's proxy; a local caller
+  // (code in the sandbox) could otherwise pick a new address per request.
+  const forwarded = loopback(req.socket.remoteAddress) && !TRUST_LOCAL_XFF ? "" : String(req.headers["x-forwarded-for"] || "").split(",").pop().trim();
   const ip = forwarded || req.socket.remoteAddress || "unknown";
   const now = Date.now();
   for (const [key, v] of attempts) if (v.until <= now) attempts.delete(key);
@@ -157,6 +159,14 @@ export async function handleBridgeHttp(req, res, url) {
   return true;
 }
 
+// Sockets that connected but have not said hello yet: each may buffer a large
+// frame, so only a few are allowed at a time.
+const MAX_WAITING = 16;
+let waiting = 0;
+// Tests reach the server over loopback and stand in for the proxy.
+const TRUST_LOCAL_XFF = process.env.BRIDGE_TRUST_LOCAL_XFF === "1";
+const loopback = a => /^(127\.|::1$|::ffff:127\.)/.test(String(a || ""));
+
 export function attachBridge(httpServer) {
   if (attached.has(httpServer)) return;
   load();
@@ -164,8 +174,10 @@ export function attachBridge(httpServer) {
   attached.set(httpServer, wss);
   httpServer.on("upgrade", (req, socket, head) => {
     let url;
-    try { url = new URL(req.url, "http://localhost"); } catch { return; }
-    if (url.pathname !== "/bridge") return;
+    // Nobody else handles upgrades: a socket we do not answer would stay open forever.
+    try { url = new URL(req.url, "http://localhost"); } catch { socket.destroy(); return; }
+    if (url.pathname !== "/bridge") { socket.destroy(); return; }
+    if (waiting >= MAX_WAITING) { socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n"); return; }
     if (url.search || (req.headers.origin && !extensionOrigin(req.headers.origin))) {
       socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return;
     }
@@ -175,8 +187,10 @@ export function attachBridge(httpServer) {
     let active = null, authPending = false;
     const reject = () => { authPending = true; ws.close(4401, "Pairing rejected, pair again"); };
     const authTimer = setTimeout(reject, 5000); authTimer.unref();
+    let counted = true; waiting++;
+    const settled = () => { if (counted) { counted = false; waiting--; } };
     ws.on("error", () => {}); // ws reports oversized/malformed frames here, then closes.
-    ws.on("close", () => { clearTimeout(authTimer); active?.finish(); });
+    ws.on("close", () => { settled(); clearTimeout(authTimer); active?.finish(); });
     ws.on("message", (raw, binary) => {
       let msg;
       try { if (binary) throw new Error(); msg = JSON.parse(raw.toString()); if (!msg || typeof msg !== "object") throw new Error(); }
@@ -186,7 +200,7 @@ export function attachBridge(httpServer) {
         authPending = true;
         const d = msg.type === "hello" ? credential(msg.deviceId, msg.token) : null;
         if (!d) { reject(); return; }
-        clearTimeout(authTimer);
+        clearTimeout(authTimer); settled();
         sockets.get(d.deviceId)?.ws.close(4400, "Device reconnected");
         sockets.get(d.deviceId)?.finish();
         const entry = { ws, device: d, since: Date.now(), pending: new Map(), silenceTimer: null,

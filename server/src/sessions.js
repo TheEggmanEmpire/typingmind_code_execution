@@ -23,7 +23,13 @@ const clean = (s, d) => {
 
 function loadUids() {
   if (uids) return uids;
-  try { uids = JSON.parse(fs.readFileSync(path.join(config.dataDir, "uids.json"), "utf8")); } catch (e) { uids = {}; }
+  try { uids = JSON.parse(fs.readFileSync(path.join(config.dataDir, "uids.json"), "utf8")); }
+  catch (e) {
+    // Only "not there yet" starts an empty map. Guessing after a read or parse
+    // error would give a new workspace the uid that still owns another one's files.
+    if (e.code !== "ENOENT") throw new Error("uids.json on the volume is unreadable (" + e.message + "); refusing to assign unix users");
+    uids = {};
+  }
   return uids;
 }
 function uidFor(id) {
@@ -86,8 +92,10 @@ class Workspace {
 }
 
 export function getWorkspace(user, name) {
-  user = clean(user, "default");
-  name = clean(name, "main");
+  // The raw values are the identity; cleaning is only for a readable directory name.
+  const raw = (v, d) => { v = String(v == null ? "" : v).trim().slice(0, 256); return v || d; };
+  user = raw(user, "default");
+  name = raw(name, "main");
   const key = user + "\0" + name;
   let ws = cache.get(key);
   if (!ws) {

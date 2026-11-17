@@ -296,7 +296,10 @@ function constantTimeEquals(a, b) {
  * or forge someone else's IP to lock them out.
  */
 function getSourceIp(req) {
-  const forwarded = headerValue(req, "x-forwarded-for");
+  // A caller on loopback (code in the sandbox) did not come through the proxy:
+  // its header is its own invention and must not reset the throttle.
+  const direct = (req.socket && req.socket.remoteAddress) || "";
+  const forwarded = /^(127\.|::1$|::ffff:127\.)/.test(direct) ? "" : headerValue(req, "x-forwarded-for");
   if (forwarded) {
     const hops = forwarded.split(",").map((h) => h.trim()).filter(Boolean);
     if (hops.length) return hops[hops.length - 1];
@@ -669,6 +672,11 @@ export async function handleAuthHttp(req, res, url) {
     catch { sendJson(res, 400, { error: "invalid_client_metadata", error_description: "Body must be JSON" }); return true; }
     if (!parsed || typeof parsed !== "object") parsed = {};
     const redirectUris = Array.isArray(parsed.redirect_uris) ? parsed.redirect_uris : [];
+    // Registration needs no key, and the registry is kept on disk: keep entries small.
+    if (redirectUris.length > 5 || redirectUris.some((u) => typeof u !== "string" || u.length > 2000)) {
+      sendJson(res, 400, { error: "invalid_client_metadata", error_description: "At most 5 redirect_uris of at most 2000 characters" });
+      return true;
+    }
     for (const uri of redirectUris) {
       if (typeof uri !== "string" || !isValidRedirectUri(uri)) {
         sendJson(res, 400, { error: "invalid_client_metadata", error_description: `Invalid redirect_uri: ${uri}` });
@@ -680,7 +688,7 @@ export async function handleAuthHttp(req, res, url) {
       return true;
     }
     const clientId = `mcp-${crypto.randomBytes(16).toString("hex")}`;
-    const clientName = typeof parsed.client_name === "string" ? parsed.client_name : undefined;
+    const clientName = typeof parsed.client_name === "string" ? parsed.client_name.slice(0, 200) : undefined;
     DCR_REGISTRY.set(clientId, { clientId, redirectUris, clientName, registeredAt: Date.now() });
     while (DCR_REGISTRY.size > MAX_DCR_REGISTRATIONS) DCR_REGISTRY.delete(DCR_REGISTRY.keys().next().value);
     // Survive a restart, or the next authorize from this client would be adopted blind.
