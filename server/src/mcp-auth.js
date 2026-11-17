@@ -7,16 +7,14 @@
 //   - OAuth 2.1:      dynamic client registration + PKCE (authorization_code),
 //                     and client_credentials with the key as client_secret
 //
-// After the OAuth dance the server mints an opaque random token (32 bytes,
-// base64url, non-expiring). The raw key is never returned as an access_token.
-// The gate accepts either the key or an issued token.
-//
-// Tokens are non-expiring (expiresAt: null) so that idle connectors (a Railway
-// service that sleeps past any finite TTL) keep a valid credential across cold
-// starts. To survive restarts and redeploys the token store is persisted on the
-// volume (DATA_DIR/mcp-tokens.json, or MCP_TOKEN_STORE): non-expiry is useless
-// if the store is wiped on boot. The key itself stays an always-valid Bearer, so
-// a lost token file is recoverable without re-running OAuth.
+// After the OAuth dance the server issues a signed token ("crt1." + body + HMAC,
+// key derived from MCP_API_KEY; non-expiring by default). It proves itself, so
+// it stays valid when the token store is lost (a redeploy without a volume): a
+// client whose token is refused mid-chat simply stops. The raw key is never
+// returned as an access_token, and changing the key ends every token. The store
+// on disk (MCP_TOKEN_STORE, default DATA_DIR/mcp-tokens.json) keeps client
+// registrations and the revocation lists; revocations are only as durable as
+// that file. The key itself is always accepted as a Bearer.
 //
 // Open mode (no authentication) only with ALLOW_NO_AUTH and no key set.
 //

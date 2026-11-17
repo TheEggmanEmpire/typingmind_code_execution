@@ -74,6 +74,14 @@ test("the code cannot read the server's environment or key", async () => {
   assert.doesNotMatch(textOf(r), /MCP_API_KEY/);
 });
 
+test("package installs are allowed and land in the workspace's hidden folder", async () => {
+  const c = await client();
+  const r = await call(c, "run_code", { language: "bash", code: "env | grep -E '^(PIP_|PYTHONUSERBASE|NPM_CONFIG_PREFIX)' | sort; python3 -m pip --version >/dev/null && echo pip-ok" });
+  assert.match(textOf(r), /PIP_BREAK_SYSTEM_PACKAGES=1/);
+  assert.match(textOf(r), /PYTHONUSERBASE=.*\.cr\/pyuser/);
+  assert.match(textOf(r), /NPM_CONFIG_PREFIX=.*\.cr\/npm/);
+});
+
 test("workspaces are separate per user", async () => {
   const a = await client({ "X-User-ID": "alice" });
   const b = await client({ "X-User-ID": "bob" });

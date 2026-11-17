@@ -44,8 +44,9 @@ function publicUrl() {
   return "http://localhost:" + port;
 }
 
-// Signs file links and pairing codes. Kept on the volume so links survive a
-// redeploy; SERVER_SECRET overrides it.
+// Signs file links and browser device tokens. SERVER_SECRET if set; otherwise
+// derived from the access key (so it survives redeploys without a volume);
+// otherwise a random value kept on the volume.
 function serverSecret() {
   if (env.SERVER_SECRET && env.SERVER_SECRET.length >= 16) return env.SERVER_SECRET;
   // Derived from the access key when there is one: links and browser pairings

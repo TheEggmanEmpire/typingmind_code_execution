@@ -22,7 +22,17 @@ function offReport(note) {
   return { mode: 'off', layers: { uid: false, rlimits: false, noNewPrivs: false, landlock: 0, seccomp: false, namespaces: false }, networkOff: false, notes: [note] };
 }
 function environment(ws, extra = {}) {
-  return { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: ws.dir, TMPDIR: ws.tmp, LANG: 'C.UTF-8', WORKSPACE: ws.dir, USER: 'runner', ...extra };
+  // Package installs must work from any language and land in the workspace (kept
+  // on the volume, out of the user's file list), never in the read-only system:
+  // pip installs as "user" into .cr/pyuser (Debian's Python refuses otherwise),
+  // npm -g into .cr/npm. Both bin folders are on PATH; caches go to the temp dir.
+  const py = path.join(ws.dir, '.cr', 'pyuser'), npm = path.join(ws.dir, '.cr', 'npm');
+  return {
+    PATH: `${py}/bin:${npm}/bin:/usr/local/bin:/usr/bin:/bin`, HOME: ws.dir, TMPDIR: ws.tmp, LANG: 'C.UTF-8', WORKSPACE: ws.dir, USER: 'runner',
+    PIP_USER: '1', PYTHONUSERBASE: py, PIP_BREAK_SYSTEM_PACKAGES: '1', PIP_DISABLE_PIP_VERSION_CHECK: '1', PIP_CACHE_DIR: path.join(ws.tmp, 'pip-cache'),
+    NPM_CONFIG_PREFIX: npm, NPM_CONFIG_CACHE: path.join(ws.tmp, 'npm-cache'), NPM_CONFIG_UPDATE_NOTIFIER: 'false', NODE_PATH: `${npm}/lib/node_modules`,
+    ...extra
+  };
 }
 function beneath(base, file) {
   const rel = path.relative(base, file);

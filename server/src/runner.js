@@ -225,10 +225,16 @@ async function finish(j,exitCode) {
   persistJob(j);
   for(const key of ['logFd','metaFd']) if(j[key]!==undefined) {try {fs.closeSync(j[key]);} catch {} delete j[key];}
   try {
-    j.ws.meta.history ||= [];
+    if(j.recordHistory!==false) {j.ws.meta.history ||= [];
     j.ws.meta.history.push({language:j.language,code:replaceSecrets(j.params.code,j.pairs),output:snapshot(j).text.slice(0,2000),time:j.started});
-    j.ws.meta.history=j.ws.meta.history.slice(-200);j.ws.saveMeta();
+    j.ws.meta.history=j.ws.meta.history.slice(-200);j.ws.saveMeta();}
   } catch {}
+  // The run's scratch folder (scripts, compiled programs) is done with, unless a
+  // live Python session was started from it and still needs its files. Removed
+  // as the workspace's own user: the folder's contents are the code's to plant.
+  if(j.runDir && ![...kernels.values()].some(k=>k.home===j.runDir && !k.closed)) {
+    try {const rm=box.spawnInWorkspace(j.ws,['rm','-rf','--',j.runDir],{stdin:'ignore',network:'off'});rm.on('error',()=>{});rm.stdout?.resume();rm.stderr?.resume();} catch {}
+  }
   // Finished jobs retain only the bounded output and public status.
   j.params={};j.secrets={};j.pairs=[];j.hooks={};j.kernel=null;
   j.resolve();
@@ -289,20 +295,14 @@ async function ensureKernel(j) {
   await privateFile(j,'helpers.py',await fsp.readFile(path.join(pyDir,'helpers.py')));
   const chartFile=await privateFile(j,'chart.html',legacy.CHART_HTML);
   if(j.cancelReason) throw new Error('Job cancelled.');
-  let child=box.spawnInWorkspace(j.ws,[descriptors.python.executable,'-u',kernelFile],{
-    env:{...pipEnv(j.ws),CR_CHART_HTML:chartFile},stdio:['ignore','pipe','pipe','pipe','pipe']
+  // The sandbox launcher closes every descriptor above 2, so requests go in on
+  // stdin and events come back on stderr, each line marked with a prefix that is
+  // random per kernel (user output never carries it by accident).
+  const controlPrefix='__CR_'+crypto.randomBytes(24).toString('hex')+'__';
+  const child=box.spawnInWorkspace(j.ws,[descriptors.python.executable,'-u',kernelFile],{
+    env:{...pipEnv(j.ws),CR_CHART_HTML:chartFile,CR_CONTROL_STDIO:'1',CR_CONTROL_PREFIX:controlPrefix},stdin:'pipe'
   });
-  let controlPrefix=null;
-  if(!child.stdio[3] || !child.stdio[4]) {
-    // Older sandbox launchers close every inherited extra fd. Fall back to a
-    // per-kernel authenticated marker on the original stderr, never user stderr.
-    child.on('error',()=>{});box.killTree(child);child.stdout?.resume();child.stderr?.resume();
-    controlPrefix='__CR_'+crypto.randomBytes(24).toString('hex')+'__';
-    child=box.spawnInWorkspace(j.ws,[descriptors.python.executable,'-u',kernelFile],{
-      env:{...pipEnv(j.ws),CR_CHART_HTML:chartFile,CR_CONTROL_STDIO:'1',CR_CONTROL_PREFIX:controlPrefix},stdin:'pipe'
-    });
-  }
-  k={child,ws:j.ws,pending:new Map(),busy:j.id,closed:false,requests:controlPrefix?child.stdin:child.stdio[3]};kernels.set(j.ws.id,k);
+  k={child,ws:j.ws,pending:new Map(),busy:j.id,closed:false,requests:child.stdin,home:j.runDir};kernels.set(j.ws.id,k);
   k.ready=new Promise((resolve,reject)=>{k.readyResolve=resolve;k.readyReject=reject;});
   k.exited=new Promise(resolve=>{k.exitResolve=resolve;});
   const startupTimer=setTimeout(()=>{box.killTree(child);k.readyReject(new Error('Python kernel did not start within 15 s.'));},15000);
@@ -339,6 +339,8 @@ async function ensureKernel(j) {
   child.once('close',(code,signal)=>{
     k.closed=true;clearTimeout(k.idleTimer);k.exitResolve();
     if(kernels.get(j.ws.id)===k) kernels.delete(j.ws.id);
+    // The session is over: its scratch folder can go (as the workspace's own user).
+    if(k.home) {try {const rm=box.spawnInWorkspace(k.ws,['rm','-rf','--',k.home],{stdin:'ignore',network:'off'});rm.on('error',()=>{});rm.stdout?.resume();rm.stderr?.resume();} catch {}}
     if(k.busy && !k.saving) lostKernels.add(j.ws.id);
     fail(new Error('Python kernel stopped'+(signal?' ('+signal+')':' (exit '+code+')')+'. Variables were lost; the next run starts a fresh kernel.'));
   });
@@ -546,9 +548,47 @@ async function nodeRun(j) {
     'registerHooks({resolve(specifier,context,nextResolve){ return nextResolve(specifier,context.parentURL===entry?{...context,parentURL:workspace}:context); }});\n');
   return processRun(j,[process.execPath,'--import',pathToFileURL(resolver).href,script]);
 }
+// A Python run that shares nothing with the live session: its own process, no
+// kept variables, and it does not wait for (or disturb) a busy kernel. Used by
+// schedules. Helpers, the echo of a last expression and figure saving work as in
+// the session; top-level await does not.
+const PYTHON_ONCE = String.raw`
+import ast, builtins, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import helpers
+for _n in ('chart', 'share_table', 'get_table', 'list_tables', 'read_text'):
+    setattr(builtins, _n, getattr(helpers, _n))
+_src = open(sys.argv[1], encoding='utf-8').read()
+_tree = ast.parse(_src, '<run>')
+_last = ast.Expression(_tree.body.pop().value) if _tree.body and isinstance(_tree.body[-1], ast.Expr) else None
+_g = {'__name__': '__main__', '__builtins__': builtins}
+try:
+    exec(compile(_tree, '<run>', 'exec'), _g)
+    if _last is not None:
+        _v = eval(compile(_last, '<run>', 'eval'), _g)
+        if _v is not None:
+            print(repr(_v))
+finally:
+    _plt = sys.modules.get('matplotlib.pyplot')
+    if _plt is not None:
+        _n = 1
+        for _num in _plt.get_fignums():
+            while os.path.exists('figure_%d.png' % _n):
+                _n += 1
+            _plt.figure(_num).savefig('figure_%d.png' % _n, bbox_inches='tight')
+            print('(saved figure_%d.png)' % _n)
+        _plt.close('all')
+`;
+async function pythonOnce(j) {
+  await privateFile(j,'helpers.py',await fsp.readFile(path.join(pyDir,'helpers.py')));
+  const chartFile=await privateFile(j,'chart.html',legacy.CHART_HTML);
+  const driver=await privateFile(j,'once.py',PYTHON_ONCE);
+  const code=await privateFile(j,'run.py',j.params.code);
+  return processRun(j,[descriptors.python.executable,'-u',driver,code],{...pipEnv(j.ws),CR_CHART_HTML:chartFile});
+}
 async function localRun(j) {
   const d=descriptors[j.language];
-  if(j.language==='python') return pythonRun(j);
+  if(j.language==='python') return j.params.fresh ? pythonOnce(j) : pythonRun(j);
   if(j.language==='javascript'||j.language==='typescript') return nodeRun(j);
   if(j.language==='sql'||j.language==='duckdb') {
     const script=await privateFile(j,'sqlrun.py',await fsp.readFile(path.join(pyDir,'sqlrun.py')));
@@ -622,7 +662,7 @@ export async function runCode(ws,params,hooks={}) {
   if(stopping) return {text:'The server is shutting down. Retry after it restarts.',running:false,exitCode:1};
   const map=workspaceJobs(ws);
   const busy=[...map.values()].find(j=>!j.finished && j.language==='python');
-  if(language==='python' && busy) return {text:'python is busy with job '+busy.id+'. Use the job tool to follow or kill it.',running:false,exitCode:1};
+  if(language==='python' && busy && !params.fresh) return {text:'python is busy with job '+busy.id+'. Use the job tool to follow or kill it.',running:false,exitCode:1};
   if([...map.values()].filter(j=>!j.finished).length>=config.maxJobs) return {text:'Too many running jobs (limit '+config.maxJobs+'). Use the job tool to wait or kill a job.',running:false,exitCode:1};
   const seconds=Number(params.timeout ?? config.runTimeoutS);
   const timeout=Math.min(config.maxTimeoutS,Math.max(0.1,Number.isFinite(seconds)?seconds:config.runTimeoutS));
@@ -630,7 +670,7 @@ export async function runCode(ws,params,hooks={}) {
   const bank=secretBanks.get(ws.id)||new Map();for(const [form,name] of secretPairs(secrets)) bank.set(form,name);secretBanks.set(ws.id,bank);
   const pairs=[...bank].sort((a,b)=>b[0].length-a[0].length);
   const j={id:'j'+crypto.randomBytes(5).toString('hex'),ws,params,language,timeout,secrets,pairs,hooks,state:'running',started:Date.now(),ended:null,exitCode:null,
-    label:replaceSecrets(params.code,pairs).slice(0,60),head:'',tail:'',total:0,notify:'',lastNotify:0,logBytes:0,redactor:new StreamRedactor(pairs),finished:false,preparing:true};
+    label:replaceSecrets(params.code,pairs).slice(0,60),head:'',tail:'',total:0,notify:'',lastNotify:0,logBytes:0,redactor:new StreamRedactor(pairs),finished:false,preparing:true,recordHistory:params.record!==false};
   j.done=new Promise(resolve=>{j.resolve=resolve;});map.set(j.id,j);
   j.timeoutTimer=setTimeout(()=>abortJob(j,'timeout'),timeout*1000);
   void execute(j);

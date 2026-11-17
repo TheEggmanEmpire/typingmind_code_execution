@@ -9,8 +9,9 @@
 // Protocol (page -> here):  { __crbReq: true, id, request }
 //          (here -> page):  { __crbRes: true, id, response }
 //
-// The service worker only acts for pages on its trusted hosts (TypingMind by
-// default) that also send the pairing key, so a random website cannot use it.
+// The service worker only acts for frames inside pages on its trusted hosts
+// (TypingMind by default), so a random website cannot use it. The remote link
+// (LibreChat, Hermes) does not pass through this script at all.
 
 (function () {
   if (window.__crbBridgeInstalled) return;      // all_frames can re-run on some navigations

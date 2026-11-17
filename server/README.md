@@ -5,6 +5,8 @@ you the results, and can operate your own browser tabs through the companion Chr
 container, built from this repository's root, made for Railway. Clients: LibreChat, Hermes Agent, and anything
 else that speaks MCP over Streamable HTTP.
 
+How it works inside: [ARCHITECTURE.md](ARCHITECTURE.md)
+
 ## What changed compared with the TypingMind plugin
 
 | Plugin (in the browser) | Server |

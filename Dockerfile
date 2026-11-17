@@ -12,7 +12,7 @@ ARG WITH_RUST=0
 ARG WITH_JAVA=0
 ARG EXTRA_APT=""
 ARG EXTRA_PIP=""
-# REA (reverse engineering MCP server, served at /rea/mcp), pinned. Static
+# REA (reverse engineering MCP server, offered as tools on /mcp), pinned. Static
 # JavaScript/Electron/web-bundle/.NET analysis needs nothing else; native
 # engines (Ghidra + JDK, JADX, radare2, binwalk ...) can be added via EXTRA_APT.
 ARG WITH_REA=1

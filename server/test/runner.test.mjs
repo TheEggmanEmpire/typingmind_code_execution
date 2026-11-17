@@ -182,3 +182,15 @@ test('secret redaction includes URL form encoding and regexp characters',()=>{
   const secret='alpha b/c?d.*';const text=[secret,encodeURIComponent(secret),encodeURIComponent(secret).replace(/%20/g,'+'),Buffer.from(secret).toString('base64')].join('\n');
   assert.equal(runner.redact(text,{API_KEY:secret}),'[secret API_KEY]\n'.repeat(3)+'[secret API_KEY]');
 });
+
+test('fresh python runs outside the session and leaves it untouched', async () => {
+  const w = getWorkspace('test', 'fresh');
+  await runCode(w, { language: 'python', code: 'kept = 123' });
+  const once = await runCode(w, { language: 'python', fresh: true, record: false, code: "try:\n    print(kept)\nexcept NameError:\n    print('not visible')\nopen('once.txt','w').write('x')\n1 + 1" });
+  assert.match(once.text, /not visible/);
+  assert.match(once.text, /^2$/m);
+  assert.match(once.text, /once\.txt/);
+  const again = await runCode(w, { language: 'python', code: 'kept' });
+  assert.match(again.text, /123/);
+  assert.equal((w.meta.history || []).some(h => /not visible/.test(h.code)), false);
+});

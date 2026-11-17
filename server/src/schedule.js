@@ -50,7 +50,8 @@ async function runOnce(ws, s) {
     // A scheduled run only ever sees the operator's secrets: per-request ones are not stored.
     const first = await runner.runCode(ws, { language: s.language, code: s.code, timeout: s.timeout, background: true, fresh: true, record: false, secrets: {} });
     let body = first.text || "";
-    let state = "done";
+    // No job id means the run was refused (too many jobs, quota, shutting down): that is not "done".
+    let state = first.jobId ? "done" : "refused";
     if (first.jobId) {
       const limit = Date.now() + (s.timeout || config.runTimeoutS) * 1000 + 15000;
       for (;;) {
