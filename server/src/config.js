@@ -26,6 +26,14 @@ export function parseSecrets(raw) {
   return out;
 }
 
+export const OMNIROUTE_OPS = ["speech", "transcribe", "embeddings", "rerank", "moderations"];
+export function parseOps(raw) {
+  const want = String(raw || "").toLowerCase().split(/[\s,;]+/).filter(Boolean);
+  if (want.includes("all")) return OMNIROUTE_OPS.slice();
+  const alias = { tts: "speech", stt: "transcribe", transcription: "transcribe", transcriptions: "transcribe", embedding: "embeddings", moderation: "moderations" };
+  return OMNIROUTE_OPS.filter((op) => want.some((w) => (alias[w] || w) === op));
+}
+
 // "node /opt/rea/rea.mjs mcp" -> argv; double or single quotes keep spaces inside one argument.
 export function splitCommand(raw) {
   const out = [];
@@ -95,6 +103,9 @@ export const config = {
   // Images (make_image / edit_image)
   omnirouteKey: env.OMNIROUTE_API_KEY || "",
   omnirouteBase: (env.OMNIROUTE_BASE_URL || "").replace(/\/+$/, ""),
+  // Non-chat OmniRoute endpoints offered by the `omniroute` tool, e.g. "speech,transcribe,embeddings"
+  // or "all". Empty: the tool is not listed. Chat is never offered (OmniRoute's own MCP does chat).
+  omnirouteOps: parseOps(env.OMNIROUTE_ENDPOINTS),
 
   // Browser bridge defaults (the extension's own lists always apply as well)
   browserAllow: String(env.BROWSER_ALLOW_SITES || "").split(/[\s,;]+/).filter(Boolean),

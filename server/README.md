@@ -51,6 +51,7 @@ How it works inside: [ARCHITECTURE.md](ARCHITECTURE.md)
 | `CODE_NETWORK` | `open` | `off` removes network access from the code |
 | `CODE_SECRETS` | - | `NAME=value; NAME2=value`: environment variables for the code, replaced by `[secret NAME]` in everything the AI reads |
 | `OMNIROUTE_API_KEY` | - | Enables `make_image` / `edit_image` (`OMNIROUTE_BASE_URL` overrides the endpoint) |
+| `OMNIROUTE_ENDPOINTS` | - | Lists the `omniroute` tool for non-chat endpoints: `speech,transcribe,embeddings,rerank,moderations` or `all`. Speech/voice models go there, never to OmniRoute's chat-only `omniroute_route_request` |
 | `RUN_TIMEOUT_S` / `MAX_TIMEOUT_S` | 120 / 3600 | Default and highest time limit of one run |
 | `WAIT_BUDGET_S` | 45 | A run still going after this many seconds becomes a background job. Keep it below the client's tool timeout |
 | `KERNEL_IDLE_MIN` | 30 | An idle Python session is saved and stopped after this |

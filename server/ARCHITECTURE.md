@@ -1536,6 +1536,7 @@ All variables read anywhere in `server/src`. Numbers are clamped to the range sh
 | `CODE_SECRETS` | | | `NAME=value; …` for the code, redacted in output |
 | `OMNIROUTE_API_KEY` | | | enables `make_image` / `edit_image` (a secret named `OMNIROUTE_API_KEY` in the request overrides it) |
 | `OMNIROUTE_BASE_URL` | the plugin's `IMAGE_API_BASE` | | image API base |
+| `OMNIROUTE_ENDPOINTS` | (empty: tool not listed) | `speech`, `transcribe`, `embeddings`, `rerank`, `moderations`, `all` | non-chat OmniRoute endpoints offered by the `omniroute` tool; chat is never offered there (OmniRoute's own MCP `omniroute_route_request` is chat-only, and a speech model sent to it fails and puts the credential on cooldown) |
 
 Fixed in code: output head 30,000 and tail 10,000 characters per job; job log 5 MB; `wsfs` read default 20 MB;
 preview limit 15 MB.

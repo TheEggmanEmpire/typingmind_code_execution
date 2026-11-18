@@ -15,6 +15,23 @@ const port = 20000 + Math.floor(Math.random() * 20000);
 const base = "http://127.0.0.1:" + port;
 const KEY = "e2e-key-0123456789abcdef";
 let proc, log = "";
+// A stand-in OmniRoute for the omniroute tool.
+import http from "node:http";
+const omniPort = port + 1;
+const omniSeen = [];
+const omni = http.createServer((req, res) => {
+  let b = []; req.on("data", (d) => b.push(d)); req.on("end", () => {
+    const body = Buffer.concat(b).toString("utf8");
+    omniSeen.push({ url: req.url, auth: req.headers.authorization, body });
+    if (req.url.endsWith("/audio/speech")) {
+      if (body.includes("cooling")) { res.writeHead(429, { "retry-after": "109" }); return res.end("credentials_cooling: 1"); }
+      res.writeHead(200, { "content-type": "audio/mpeg" }); return res.end(Buffer.from("ID3fakeaudio"));
+    }
+    if (req.url.endsWith("/audio/transcriptions")) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ text: "hello world" })); }
+    if (req.url.endsWith("/embeddings")) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] })); }
+    res.writeHead(404); res.end("no route");
+  });
+});
 
 async function client(headers = {}) {
   const c = new Client({ name: "e2e", version: "1" });
@@ -25,7 +42,7 @@ const textOf = (r) => r.content.filter((c) => c.type === "text").map((c) => c.te
 const call = async (c, name, args) => c.callTool({ name, arguments: args }, undefined, { timeout: 120000 });
 
 function boot() {
-  return spawn(process.execPath, ["src/index.js"], { cwd: root, env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, MCP_API_KEY: KEY, PUBLIC_URL: base, WAIT_BUDGET_S: "5", CODE_SECRETS: "E2E_TOKEN=supersecretvalue123", REA: "0" }, stdio: ["ignore", "pipe", "pipe"] });
+  return spawn(process.execPath, ["src/index.js"], { cwd: root, env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, MCP_API_KEY: KEY, PUBLIC_URL: base, WAIT_BUDGET_S: "5", CODE_SECRETS: "E2E_TOKEN=supersecretvalue123", REA: "0", OMNIROUTE_API_KEY: "omni-test-key-123", OMNIROUTE_BASE_URL: "http://127.0.0.1:" + omniPort + "/api/v1", OMNIROUTE_ENDPOINTS: "speech,transcribe,embeddings" }, stdio: ["ignore", "pipe", "pipe"] });
 }
 async function start() {
   proc = boot();
@@ -36,8 +53,8 @@ async function start() {
   }
   throw new Error("server did not start:\n" + log);
 }
-before(start);
-after(() => { proc && proc.kill("SIGTERM"); fs.rmSync(dataDir, { recursive: true, force: true }); });
+before(async () => { await new Promise((r) => omni.listen(omniPort, "127.0.0.1", r)); await start(); });
+after(() => { omni.close(); proc && proc.kill("SIGTERM"); fs.rmSync(dataDir, { recursive: true, force: true }); });
 
 test("health reports an active sandbox", async () => {
   const h = await (await fetch(base + "/health")).json();
@@ -202,4 +219,25 @@ test("a restart on the same data directory comes up and keeps files, sign-ins an
   const c2 = await client();
   assert.match(textOf(await call(c2, "run_code", { language: "bash", code: "cat keep.txt" })), /survives/);
   assert.match(textOf(await call(c2, "schedule", { action: "list" })), /keeper/);
+});
+
+test("omniroute: speech, cooldown, transcription, embeddings; chat refused", async () => {
+  const c = await client();
+  const t = (await c.listTools()).tools.find((x) => x.name === "omniroute");
+  assert.deepEqual(t.inputSchema.properties.op.enum, ["speech", "transcribe", "embeddings"]);
+  let r = await call(c, "omniroute", { op: "speech", model: "Lauren Ezzo", input: "Hi there" });
+  assert.ok(!r.isError, textOf(r));
+  assert.match(textOf(r), /saved as `speech_1\.mp3`/);
+  const sp = omniSeen.find((x) => x.url === "/api/v1/audio/speech");
+  assert.equal(sp.auth, "Bearer omni-test-key-123");
+  assert.equal(JSON.parse(sp.body).model, "Lauren Ezzo");
+  r = await call(c, "omniroute", { op: "speech", model: "Lauren Ezzo", input: "cooling" });
+  assert.ok(r.isError); assert.match(textOf(r), /429[\s\S]*retry after 109 s[\s\S]*Do not retry/);
+  r = await call(c, "omniroute", { op: "transcribe", model: "whisper", src: "speech_1.mp3" });
+  assert.ok(!r.isError, textOf(r)); assert.match(textOf(r), /hello world/);
+  r = await call(c, "omniroute", { op: "embeddings", model: "emb", input: ["a"] });
+  assert.match(textOf(r), /dimension 3/);
+  r = await call(c, "omniroute", { op: "chat", model: "x" });
+  assert.ok(r.isError); assert.match(textOf(r), /omniroute_route_request/);
+  assert.ok(!textOf(r).includes("omni-test-key-123"));
 });

@@ -263,7 +263,8 @@ function specs() {
           allWindows: { type: "boolean", description: "list: false limits the list to the current window. Default: every window." }
         }
       }
-    }
+    },
+    ...(config.omnirouteOps.length ? [omnirouteSpec(config.omnirouteOps)] : [])
   ].map((t) => ({ ...t, annotations: ANNOTATIONS[t.name] }));
 }
 
@@ -279,7 +280,8 @@ const ANNOTATIONS = {
   browser_state: { title: "Read a browser tab", readOnlyHint: true, openWorldHint: true },
   browser_act: { title: "Operate a browser tab", destructiveHint: true, openWorldHint: true },
   browser_run: { title: "Run script in a browser tab", destructiveHint: true, openWorldHint: true },
-  browser_tabs: { title: "Browser tabs", openWorldHint: true }
+  browser_tabs: { title: "Browser tabs", openWorldHint: true },
+  omniroute: { title: "OmniRoute (speech, transcription, embeddings)", openWorldHint: true }
 };
 
 // Built on first use: the language list depends on what is installed.
@@ -566,6 +568,165 @@ async function imageTool(editing, args, ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// omniroute: OmniRoute's non-chat HTTP endpoints. OmniRoute's own MCP tool
+// (omniroute_route_request) is chat-only; a speech model sent there fails and
+// puts its credential on cooldown. OMNIROUTE_ENDPOINTS picks what is offered.
+// ---------------------------------------------------------------------------
+const OP_HELP = {
+  speech: "speech: text to speech. `model` is the speech model or voice ID (e.g. a wrapper voice such as \"Lauren Ezzo\"), `input` the text. Saves an audio file and returns a link.",
+  transcribe: "transcribe: speech to text. `src` is an audio file in the workspace (uploads/talk.mp3) or an https URL, `model` the transcription model.",
+  embeddings: "embeddings: `input` is a string or a list of strings. Vectors are saved to a JSON file; the result gives the count and dimension.",
+  rerank: "rerank: `query` plus `documents` (list of strings). Returns the ranked indices and scores.",
+  moderations: "moderations: `input` text. Returns the flags."
+};
+
+function omniroutePaths(op) {
+  return { speech: "/audio/speech", transcribe: "/audio/transcriptions", embeddings: "/embeddings", rerank: "/rerank", moderations: "/moderations" }[op];
+}
+
+function omnirouteSpec(ops) {
+  return {
+    name: "omniroute",
+    description: "Call OmniRoute endpoints other than chat. Use this, never omniroute_route_request, for any speech/voice model, transcription, embeddings, rerank or moderation model. " +
+      "omniroute_route_request is chat-only: a voice or speech model sent there fails and blocks the model's credential for minutes. " +
+      ops.map((o) => OP_HELP[o]).join(" ") +
+      " On HTTP 429 (cooldown or quota) do not retry in a loop: each failure can restart the timer; tell the user the wait.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        op: { type: "string", enum: ops },
+        model: { type: "string", description: "The exact OmniRoute model ID (or voice ID for a speech wrapper)." },
+        input: { description: "speech / moderations: text. embeddings: a string or a list of strings.", anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
+        voice: { type: "string", description: "speech: optional voice, for models that take one besides the model ID." },
+        format: { type: "string", description: "speech: audio format (mp3 default, wav, opus, flac). transcribe: response_format (json default, text, srt, vtt, verbose_json)." },
+        src: { type: "string", description: "transcribe: audio file in the workspace or an https URL." },
+        language: { type: "string", description: "transcribe: optional ISO language code." },
+        query: { type: "string", description: "rerank: the query." },
+        documents: { type: "array", items: { type: "string" }, description: "rerank: the texts to rank." },
+        out: { type: "string", description: "Optional output file name in the workspace." },
+        options: { type: "object", description: "Optional extra JSON fields passed to the endpoint unchanged (e.g. speed, dimensions, top_n)." }
+      },
+      required: ["op", "model"]
+    }
+  };
+}
+
+async function freeName(ws, stem, ext, want) {
+  let rel = wsfs.safeRel(want);
+  if (rel && !isInternal(rel)) return /\.[A-Za-z0-9]{1,5}$/.test(rel) ? rel : rel + "." + ext;
+  const have = new Set((await existing(ws)).map((f) => f.path));
+  let n = 1;
+  while (have.has(stem + "_" + n + "." + ext)) n++;
+  return stem + "_" + n + "." + ext;
+}
+
+async function omnirouteFailure(r, op, model) {
+  let body = "";
+  try { body = (await r.text()).slice(0, 1500); } catch (e) {}
+  const after = r.headers.get("retry-after");
+  let why = "OmniRoute answered HTTP " + r.status + (body ? ": " + body : "") + ".";
+  if (r.status === 429) why += " The model is rate limited or its credential is cooling down" + (after ? "; retry after " + after + " s" : "") + ". Do not retry in a loop; tell the user how long to wait.";
+  else if (r.status === 404 || r.status === 400 || r.status === 405) why += " `" + model + "` may not support " + op + ", or the ID is wrong. Check the ID; do not send it to omniroute_route_request.";
+  return why;
+}
+
+async function omniroute(args, ctx) {
+  const op = String(args.op || "").toLowerCase();
+  const stop = (why) => fail(runner.redact("**omniroute " + (op || "") + " failed.** " + why, ctx.secrets));
+  const ops = config.omnirouteOps;
+  if (op === "chat") return stop("Chat is not offered here; use omniroute_route_request for chat models.");
+  if (!ops.includes(op)) return stop("`op` must be one of: " + ops.join(", ") + ". Others are switched off by OMNIROUTE_ENDPOINTS on the server.");
+  const model = String(args.model == null ? "" : args.model).trim();
+  if (!model) return stop("No `model` was given.");
+  const key = ctx.secrets.OMNIROUTE_API_KEY || config.omnirouteKey;
+  if (!key) return stop("OMNIROUTE_API_KEY is not configured on the server. Tell the user.");
+  const base = config.omnirouteBase || legacy.IMAGE_API_BASE;
+  const url = base + omniroutePaths(op);
+  const extra = args.options && typeof args.options === "object" && !Array.isArray(args.options) ? args.options : {};
+  const auth = { Authorization: "Bearer " + key };
+  const timeout = AbortSignal.timeout(Math.min(config.callCeilingS, 600) * 1000);
+
+  try {
+    if (op === "transcribe") {
+      const raw = String(args.src == null ? "" : args.src).trim();
+      if (!raw) return stop("No `src` audio file was given.");
+      let bytes, name;
+      if (/^https?:\/\//i.test(raw)) {
+        const r = await fetch(raw, { signal: AbortSignal.timeout(60000) });
+        if (!r.ok) return stop("the source URL answered HTTP " + r.status + ".");
+        bytes = Buffer.from(await r.arrayBuffer()); name = raw.split("?")[0].split("/").pop() || "audio";
+      } else {
+        const rel = wsfs.safeRel(raw);
+        const st = rel && await wsfs.stat(ctx.ws, rel);
+        if (!st || st.dir) return stop(await missingNote(ctx.ws, rel || raw));
+        if (st.size > 100 * 1024 * 1024) return stop("`" + rel + "` is larger than 100 MB.");
+        bytes = await wsfs.read(ctx.ws, rel, { maxBytes: 100 * 1024 * 1024 }); name = rel.split("/").pop();
+      }
+      const form = new FormData();
+      form.append("file", new Blob([bytes], { type: legacy.guessMime(name) || "application/octet-stream" }), name);
+      form.append("model", model);
+      if (args.language) form.append("language", String(args.language));
+      if (args.format) form.append("response_format", String(args.format));
+      for (const [k, v] of Object.entries(extra)) form.append(k, typeof v === "string" ? v : JSON.stringify(v));
+      const r = await fetch(url, { method: "POST", headers: auth, body: form, signal: timeout });
+      if (!r.ok) return stop(await omnirouteFailure(r, op, model));
+      const t = await r.text();
+      let out = t;
+      try { const j = JSON.parse(t); if (typeof j.text === "string" && !args.format) out = j.text; } catch (e) {}
+      const rel = await freeName(ctx.ws, "transcript", /^(srt|vtt)$/i.test(args.format || "") ? args.format.toLowerCase() : "txt", args.out);
+      await wsfs.write(ctx.ws, rel, Buffer.from(out));
+      const shown = out.length > TEXT_INLINE_MAX ? out.slice(0, TEXT_INLINE_MAX) + "\n... (" + (out.length - TEXT_INLINE_MAX) + " more characters in the file)" : out;
+      return text("Transcribed with `" + model + "`; saved as `" + rel + "` ([download](" + fileUrl(ctx.ws, rel, { download: true }) + ")).\n\n" + shown);
+    }
+
+    let body;
+    if (op === "speech") {
+      const input = typeof args.input === "string" ? args.input.trim() : "";
+      if (!input) return stop("No `input` text was given.");
+      body = { model, input, ...(args.voice ? { voice: String(args.voice) } : {}), response_format: String(args.format || "mp3"), ...extra };
+    } else if (op === "rerank") {
+      if (!args.query || !Array.isArray(args.documents) || !args.documents.length) return stop("rerank needs `query` and a non-empty `documents` list.");
+      body = { model, query: String(args.query), documents: args.documents.map(String), ...extra };
+    } else {
+      if (args.input == null || args.input === "" || (Array.isArray(args.input) && !args.input.length)) return stop("No `input` was given.");
+      body = { model, input: args.input, ...extra };
+    }
+    const r = await fetch(url, { method: "POST", headers: { ...auth, "Content-Type": "application/json" }, body: JSON.stringify(body), signal: timeout });
+    if (!r.ok) return stop(await omnirouteFailure(r, op, model));
+    const ctype = (r.headers.get("content-type") || "").toLowerCase();
+    const bytes = Buffer.from(await r.arrayBuffer());
+
+    if (op === "speech") {
+      let audio = bytes, ext = String(body.response_format).replace(/[^a-z0-9]/gi, "") || "mp3";
+      if (ctype.includes("json")) {
+        // Some wrappers answer with base64 audio or a job instead of bytes.
+        let j; try { j = JSON.parse(bytes.toString("utf8")); } catch (e) { return stop("OmniRoute answered with unreadable JSON."); }
+        const b64 = [j.audio && j.audio.data, j.audio, j.data, j.b64_json].find((v) => typeof v === "string");
+        if (typeof b64 === "string" && b64.length > 100) audio = Buffer.from(b64.replace(/^data:[^,]+,/, ""), "base64");
+        else return text("OmniRoute returned JSON instead of audio (possibly a job to poll):\n\n```json\n" + JSON.stringify(j, null, 2).slice(0, 4000) + "\n```");
+      } else if (/audio\/(wav|x-wav)/.test(ctype)) ext = "wav";
+      else if (/audio\/(mpeg|mp3)/.test(ctype)) ext = "mp3";
+      else if (/audio\/ogg|opus/.test(ctype)) ext = "opus";
+      const rel = await freeName(ctx.ws, "speech", ext, args.out);
+      await wsfs.write(ctx.ws, rel, audio);
+      return text("Spoken with `" + model + "`; saved as `" + rel + "` (" + fmtSize(audio.length) + ").\n\n[" + legacy.mdEscape(rel) + "](" + fileUrl(ctx.ws, rel, { download: true }) + ")\n\n(Put the link above into your answer unchanged.)");
+    }
+
+    let j; try { j = JSON.parse(bytes.toString("utf8")); } catch (e) { return stop("OmniRoute answered with something other than JSON (" + (ctype || "no type") + ")."); }
+    if (op === "embeddings") {
+      const data = Array.isArray(j.data) ? j.data : [];
+      const dim = data[0] && Array.isArray(data[0].embedding) ? data[0].embedding.length : 0;
+      const rel = await freeName(ctx.ws, "embeddings", "json", args.out);
+      await wsfs.write(ctx.ws, rel, Buffer.from(JSON.stringify(j)));
+      return text("Embedded " + data.length + " input" + (data.length === 1 ? "" : "s") + " with `" + model + "` (dimension " + dim + "); saved as `" + rel + "`. Load it with run_code (json.load) instead of printing the vectors.");
+    }
+    return text("```json\n" + JSON.stringify(j, null, 2).slice(0, TEXT_INLINE_MAX) + "\n```");
+  } catch (e) {
+    return stop(String(e && e.message || e) + ".");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Browser tools (through the paired Chrome extension)
 // ---------------------------------------------------------------------------
 function pairingHelp(user) {
@@ -755,6 +916,7 @@ async function browser_act(args, ctx) {
 const HANDLERS = {
   run_code, job, serve_file, preview_file, manage_files,
   schedule: (args, ctx) => schedule.tool(args, ctx, { text, fail }),
+  omniroute,
   make_image: (args, ctx) => imageTool(false, args, ctx),
   edit_image: (args, ctx) => imageTool(true, args, ctx),
   browser_state, browser_act, browser_run, browser_tabs
