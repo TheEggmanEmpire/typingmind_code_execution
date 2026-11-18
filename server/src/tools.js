@@ -178,6 +178,7 @@ function specs() {
           prompt: { type: "string", description: "What the image should show: subject, style, composition, text to render." },
           src: { type: "string", description: "Optional reference image: a workspace path (uploads/photo.jpg) or an https URL. \"none\" forces generation from the prompt alone." },
           out: { type: "string", description: "Optional file name in the workspace (default image_N.png)." },
+          size: { type: "string", description: "Optional shape: an aspect ratio such as 16:9, 9:16, 1:1, or a size such as 1792x1024. Mapped to the nearest size the model accepts (16:9 -> 1792x1024). Seedream always answers 1024x1024." },
           model: { type: "string", description: "Optional. Only when the user names an image model or a style needs one: its full OmniRoute ID, e.g. heretic-venice-web/wai-illu (anime), cx/gpt-6.1-sol, chatgpt_web/chatgpt_image. Paid models (heretic-venice-api/seedream-v5-5, venice-api-image-edits/seedream-v5-5-edit) only when the user asks for one. That model alone is used, with no fallback. Omit for the default order: Venice web, then Codex, then ChatGPT." }
         },
         required: ["prompt"]
@@ -537,7 +538,7 @@ async function imageTool(editing, args, ctx) {
 
     const base = config.omnirouteBase || legacy.IMAGE_API_BASE;
     const model = String(args.model == null ? "" : args.model).trim();
-    const { made, failed } = await legacy.imageMake(base, key, prompt, source, { model, onRoute: (r) => ctx.progress("image route: " + r + "\n") });
+    const { made, failed } = await legacy.imageMake(base, key, prompt, source, { model, size: editing ? "" : args.size, onRoute: (r) => ctx.progress("image route: " + r + "\n") });
     if (!made) return stop(legacy.imageFailText(failed, model));
 
     const bytes = Buffer.from(made.bytes);

@@ -3591,7 +3591,62 @@ async function imageViaChatgpt(base, key, prompt, source, model) {
 // Any other OmniRoute image model, on the image endpoints. A source goes to
 // /images/edits only: /images/generations answers 200 and ignores an image, and a
 // picture made without the source must never pass for an edit of it.
-async function imageViaEndpoint(base, key, prompt, source, model) {
+// Sizes OmniRoute's OpenAI-compatible image handler accepts. "16:9", "1920x1080" and the
+// like map to the nearest of the large ones; "" (or "auto") leaves the model's default.
+const IMAGE_SIZES = ["1024x1024", "1536x1024", "1024x1536", "1792x1024", "1024x1792", "512x512", "256x256"];
+function imageSize(raw) {
+  const s = String(raw == null ? "" : raw).trim().toLowerCase().replace(/\s+/g, "").replace("×", "x");
+  if (!s || s === "auto") return "";
+  if (IMAGE_SIZES.includes(s)) return s;
+  const m = /^(\d+(?:\.\d+)?)[x:*](\d+(?:\.\d+)?)$/.exec(s);
+  if (!m || !(Number(m[1]) > 0 && Number(m[2]) > 0)) return "";
+  const want = Math.log(Number(m[1]) / Number(m[2]));
+  let best = "1024x1024", gap = Infinity;
+  for (const size of IMAGE_SIZES.slice(0, 5)) {
+    const [w, h] = size.split("x").map(Number);
+    const d = Math.abs(Math.log(w / h) - want);
+    if (d < gap - 1e-9) { best = size; gap = d; }
+  }
+  return best;
+}
+
+// True for a PNG whose every colour value is zero: the placeholder some providers return
+// instead of an error when their content filter refuses a prompt (Venice's Seedream sends
+// the same 1024x1024 black PNG every time). Works on the filtered scanlines: with all
+// colour samples zero, every PNG filter leaves zero residuals, and only then.
+async function blankPng(bytes) {
+  try {
+    if (!bytes || bytes.length < 45 || bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4e || bytes[3] !== 0x47) return false;
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const width = dv.getUint32(16), depth = bytes[24], type = bytes[25];
+    const bpp = { 0: 1, 2: 3, 4: 2, 6: 4 }[type], colour = { 0: 1, 2: 3, 4: 1, 6: 3 }[type];
+    if (depth !== 8 || !bpp || bytes[28] !== 0) return false;   // 8-bit, not interlaced
+    const parts = [];
+    for (let i = 8; i + 8 <= bytes.length;) {
+      const n = dv.getUint32(i), tag = String.fromCharCode(bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]);
+      if (tag === "IDAT") parts.push(bytes.subarray(i + 8, i + 8 + n));
+      if (tag === "IEND") break;
+      i += 12 + n;
+    }
+    if (!parts.length) return false;
+    const raw = new Uint8Array(await new Response(new Blob(parts).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer());
+    const stride = width * bpp + 1;
+    if (!raw.length || raw.length % stride) return false;
+    for (let k = 0; k < raw.length; k++) {
+      const c = k % stride;
+      if (c && (c - 1) % bpp < colour && raw[k] !== 0) return false;
+    }
+    return true;
+  } catch (e) { return false; }
+}
+
+function refusedText(model) {
+  return "REFUSED by " + model + ": it sent back a blank black placeholder instead of an image, which is how its content filter refuses a prompt " +
+    "(Seedream does this for named or copyrighted characters and some themes). This is a refusal, not a fault: do not retry the same prompt. " +
+    "Tell the user; they can rephrase it or choose another model (e.g. heretic-venice-api/z-image-turbo)";
+}
+
+async function imageViaEndpoint(base, key, prompt, source, model, size) {
   let reply;
   if (source) {
     await sourceBytes(source);
@@ -3602,22 +3657,25 @@ async function imageViaEndpoint(base, key, prompt, source, model) {
       throw e;
     }
   } else {
-    reply = await imagePost(base, key, "/images/generations", { model, prompt, response_format: "b64_json" }, 200000);
+    reply = await imagePost(base, key, "/images/generations", { model, prompt, response_format: "b64_json", ...(imageSize(size) ? { size: imageSize(size) } : {}) }, 200000);
   }
   const first = (JSON.parse(reply).data || [])[0] || {};
-  if (first.b64_json) return { bytes: base64ToBytes(first.b64_json), model };
-  if (first.url) {
+  let bytes = null;
+  if (first.b64_json) bytes = base64ToBytes(first.b64_json);
+  else if (first.url) {
     const r = await netFetch(first.url);
     if (!r.ok) throw new Error("the image link answered HTTP " + r.status);
-    return { bytes: new Uint8Array(await r.arrayBuffer()), model };
+    bytes = new Uint8Array(await r.arrayBuffer());
   }
-  throw new Error("no image in the reply");
+  if (!bytes) throw new Error("no image in the reply");
+  if (await blankPng(bytes)) throw new Error(refusedText(model));
+  return { bytes, model };
 }
 
 // The Venice web route: its image model for a new picture; with a source its edit
 // models, the second when the first fails.
-async function imageViaVenice(base, key, prompt, source) {
-  if (!source) return imageViaEndpoint(base, key, prompt, null, IMAGE_VENICE_MODEL);
+async function imageViaVenice(base, key, prompt, source, model, size) {
+  if (!source) return imageViaEndpoint(base, key, prompt, null, IMAGE_VENICE_MODEL, size);
   const errors = [];
   for (const model of IMAGE_VENICE_EDIT_MODELS) {
     try { return await imageViaEndpoint(base, key, prompt, source, model); }
@@ -3646,7 +3704,7 @@ async function resolveImageModel(base, key, raw) {
 async function imageMake(base, key, prompt, source, opts) {
   opts = opts || {};
   const failed = [];
-  const note = (label, e) => failed.push(label + ": " + (isAbort(e) ? "timed out" : String(e && e.message || e)).slice(0, 260));
+  const note = (label, e) => failed.push(label + ": " + (isAbort(e) ? "timed out" : String(e && e.message || e)).slice(0, 600));
   const usable = (made) => { if (!made || made.bytes.length < 100) throw new Error("the image came back empty"); return made; };
   const say = (what) => { if (opts.onRoute) opts.onRoute(what); };
   if (opts.model) {
@@ -3654,7 +3712,7 @@ async function imageMake(base, key, prompt, source, opts) {
       const model = await resolveImageModel(base, key, opts.model);
       say(model);
       const way = /^cx\//.test(model) ? imageViaCodex : /^chatgpt_web\//.test(model) ? imageViaChatgpt : imageViaEndpoint;
-      return { made: usable(await way(base, key, prompt, source, model)), failed };
+      return { made: usable(await way(base, key, prompt, source, model, opts.size)), failed };
     } catch (e) { note(opts.model, e); return { made: null, failed }; }
   }
   const ways = { venice: imageViaVenice, codex: imageViaCodex, chatgpt: imageViaChatgpt };
@@ -3662,14 +3720,19 @@ async function imageMake(base, key, prompt, source, opts) {
     try {
       if (!ways[route]) throw new Error("unknown route");
       say(route);
-      return { made: usable(await ways[route](base, key, prompt, source)), failed };
+      return { made: usable(await ways[route](base, key, prompt, source, null, opts.size)), failed };
     } catch (e) { note(route, e); }
   }
   return { made: null, failed };
 }
 function imageFailText(failed, model) {
-  return (model ? "The requested model failed and no other was tried:\n" : "Every route failed:\n") + failed.map((f) => "- " + f).join("\n") +
-    "\n\nStop here. Do not try other image tools, models or MCP routes. Tell the user these errors.";
+  const all = failed.join("\n");
+  const refused = /REFUSED by /.test(all);
+  const paid = /not explicitly free/i.test(all)
+    ? "\n\nheretic-venice-web/* serves only Venice's free models. Paid ones such as Seedream are heretic-venice-api/<model> for a new image and venice-api-image-edits/<model>-edit for an edit; use those only if the user asked for the paid model."
+    : "";
+  return (refused ? "The model refused the prompt; no image was made:\n" : model ? "The requested model failed and no other was tried:\n" : "Every route failed:\n") + failed.map((f) => "- " + f).join("\n") + paid +
+    "\n\nStop here. Do not try other image tools, models or MCP routes. Tell the user " + (refused ? "the model refused, and why." : "these errors.");
 }
 
 function nextImageName(files) {
@@ -3715,7 +3778,7 @@ async function imageTool(editing, params, userSettings, resources) {
     const base = (String(userSettings && userSettings.imageApiBase || "").trim() || IMAGE_API_BASE).replace(/\/+$/, "");
     const wanted = String(userSettings && userSettings.imageRoutes || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
     const model = String(params.model == null ? "" : params.model).trim();
-    const { made, failed } = await imageMake(base, key, prompt, source, { model, routes: wanted });
+    const { made, failed } = await imageMake(base, key, prompt, source, { model, routes: wanted, size: params.size });
     if (!made) return stop(imageFailText(failed, model));
 
     const mime = sniffImage(made.bytes) || "image/png";

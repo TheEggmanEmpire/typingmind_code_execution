@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 const ctx = vm.createContext({
   fetch, URL, URLSearchParams, TextEncoder, TextDecoder, AbortController, AbortSignal,
   setTimeout, clearTimeout, console, crypto: crypto.webcrypto, Blob, FormData,
-  Response, Request, Headers, atob, btoa, performance, Uint8Array, ArrayBuffer,
+  Response, Request, Headers, DecompressionStream, atob, btoa, performance, Uint8Array, ArrayBuffer,
   __crRealFetch: fetch, __crFetchTimeout: 30000, __crNoPublicProxies: true,
   __crCorsProxy: '', __crSecrets: {}
 });

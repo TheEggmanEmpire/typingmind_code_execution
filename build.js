@@ -189,6 +189,7 @@ const imageParams = (srcDoc) => ({
     src: { type: "string", description: srcDoc },
     out: { type: "string", description: "Optional /workspace file name for the result. Default image_N.png." },
     model: { type: "string", description: "Optional. Only when the user names an image model or a style needs one: its full OmniRoute ID, e.g. heretic-venice-web/wai-illu (anime), cx/gpt-6.1-sol, chatgpt_web/chatgpt_image. Paid models (heretic-venice-api/seedream-v5-5, venice-api-image-edits/seedream-v5-5-edit) only when the user asks for one. That model alone is used, with no fallback. Omit for the default order: Venice web, then Codex, then ChatGPT." },
+    size: { type: "string", description: "Optional shape of a new image: an aspect ratio such as 16:9, 9:16, 1:1, 3:2, or a size such as 1792x1024. It is mapped to the nearest size the model accepts (16:9 -> 1792x1024). Some models (Seedream) always answer 1024x1024." },
     share: { type: "string", enum: ["auto", "catbox", "gofile", "litterbox"], description: "Optional: also upload the result to a public host and show a link. Only when the user asks for a link." }
   },
   required: ["prompt"]
