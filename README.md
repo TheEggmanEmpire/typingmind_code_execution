@@ -115,6 +115,18 @@ The source is `src` (a `/workspace` or `uploads/` file, or an https URL), otherw
 falls back to the last generated image or the last upload, and refuses when there is nothing to edit. A route that reports it
 received no source image counts as failed, so a picture made without your photo is never passed off as an edit.
 
+`make_image` takes `size`: an aspect ratio (`16:9`, `9:16`, `1:1`, `3:2`) or a size (`1920x1080`), mapped to the nearest size
+OmniRoute's image handler accepts (`16:9` -> `1792x1024`); an unsupported size used to fail with HTTP 400. Seedream always answers
+1024x1024.
+
+Paid Venice models: `heretic-venice-api/<model>` makes a new image (e.g. `seedream-v5-5`), `venice-api-image-edits/<model>-edit`
+edits one. `heretic-venice-web/*` serves only Venice's free models, and its "not explicitly free" error now says so.
+
+A refused prompt is reported as a refusal. Seedream answers a prompt its content filter rejects (named or copyrighted
+characters, some themes) with the same 1024x1024 black PNG instead of an error. Both tools detect an all-black PNG exactly and
+return `REFUSED by <model> ... do not retry` instead of showing the black picture; the OmniRoute MCP patch and the Venice edit
+translator do the same (`Config/omniroute` in skill_collection).
+
 ### Secrets
 
 Put API keys the code may use into the **Secrets** setting (`NAME=value; NAME2=value`). They become environment
