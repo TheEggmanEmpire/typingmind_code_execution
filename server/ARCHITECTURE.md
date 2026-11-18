@@ -1534,7 +1534,7 @@ All variables read anywhere in `server/src`. Numbers are clamped to the range sh
 | `KERNEL_IDLE_MIN` | 30 | 1-1440 | idle Python kernels are saved and stopped |
 | `MAX_JOBS` | 4 | 1-64 | unfinished jobs per workspace |
 | `CODE_SECRETS` | | | `NAME=value; …` for the code, redacted in output |
-| `OMNIROUTE_API_KEY` | | | enables `make_image` / `edit_image` (a secret named `OMNIROUTE_API_KEY` in the request overrides it) |
+| `OMNIROUTE_API_KEY` | | | enables `make_image` / `edit_image` (a secret named `OMNIROUTE_API_KEY` in the request overrides it). Image routing is the plugin's `imageMake` (`implementation.js`, loaded by `legacy.js`): `size` maps to the nearest OpenAI size (`16:9` -> `1792x1024`), and an all-black PNG (Seedream's refusal placeholder) is reported as `REFUSED by <model>`, never saved |
 | `OMNIROUTE_BASE_URL` | the plugin's `IMAGE_API_BASE` | | image API base |
 | `OMNIROUTE_ENDPOINTS` | (empty: tool not listed) | `speech`, `transcribe`, `embeddings`, `rerank`, `moderations`, `all` | non-chat OmniRoute endpoints offered by the `omniroute` tool; chat is never offered there (OmniRoute's own MCP `omniroute_route_request` is chat-only, and a speech model sent to it fails and puts the credential on cooldown) |
 
