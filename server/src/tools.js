@@ -573,7 +573,7 @@ async function imageTool(editing, args, ctx) {
 // puts its credential on cooldown. OMNIROUTE_ENDPOINTS picks what is offered.
 // ---------------------------------------------------------------------------
 const OP_HELP = {
-  speech: "speech: text to speech. `model` is the speech model or voice ID (e.g. a wrapper voice such as \"Lauren Ezzo\"), `input` the text. Saves an audio file and returns a link.",
+  speech: "speech: text to speech. `model` is the speech model or voice ID (full provider/model ID, e.g. \"er/Lauren Ezzo\"), `input` the text. Saves an audio file and returns a link.",
   transcribe: "transcribe: speech to text. `src` is an audio file in the workspace (uploads/talk.mp3) or an https URL, `model` the transcription model.",
   embeddings: "embeddings: `input` is a string or a list of strings. Vectors are saved to a JSON file; the result gives the count and dimension.",
   rerank: "rerank: `query` plus `documents` (list of strings). Returns the ranked indices and scores.",
