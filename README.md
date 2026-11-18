@@ -98,15 +98,17 @@ shared file (`manage_files` with `unshare`); `manage_files` with `shares` lists 
 ### Images
 
 `make_image` creates an image and `edit_image` changes one. Add `OMNIROUTE_API_KEY=<key>` to **Secrets**; nothing else is needed, and
-no Workspace store is required, because the source is read inside the same call. Routes, in order: OmniRoute Codex, then ChatGPT web.
+no Workspace store is required, because the source is read inside the same call. Routes, in order: Venice web (free; `z-image-turbo` for a new image, `qwen-edit-uncensored` then `firered-image-edit` for an edit), then OmniRoute Codex, then ChatGPT web. The plugin setting **Images: route order** changes it, e.g. `codex,chatgpt`.
 The caption names the model that made the image and any route that failed first.
 
 Any other image model OmniRoute offers can be named per call with `model`, for example `heretic-venice-api/seedream-v5-5`. A bare
 name (`seedream-v5-5`) is looked up in OmniRoute's catalogue; a name that exists under two providers is refused with the full IDs
 to choose from. A named model is used alone: if it fails, nothing else is tried and the error is shown. `cx/...` IDs run on the
 Responses route, `chatgpt_web/...` on the chat route, everything else on `/images/generations`, or on `/images/edits` when there
-is a source image. A source is never sent to `/images/generations`, which accepts it and then ignores it. Today OmniRoute answers
-404 on `/images/edits` for the Venice edit models (`...-edit`), so those cannot edit yet; edits work with the default routes.
+is a source image. A source is never sent to `/images/generations`, which accepts it and then ignores it. Whether a named model
+can edit depends on its provider: `venice-api-image-edits/seedream-v5-5-edit` and `heretic-venice-web/qwen-edit-uncensored` edit,
+while the same models under `heretic-venice-api/...-edit` answer 404, because Venice's API has no `/images/edits`. Use the full
+ID for these: the bare name exists under two providers. Edits always work with the default routes.
 
 The source is `src` (a `/workspace` or `uploads/` file, or an https URL), otherwise the image attached to the latest message.
 `make_image` with no source generates from the prompt; `src: "none"` forces that even when a photo is attached. `edit_image` also

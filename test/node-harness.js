@@ -155,10 +155,15 @@ routes.push(async (url, init) => {
   }
   if (url.endsWith("/api/v1/images/generations")) {
     count("img:gen"); IMG.last.gen = JSON.parse(init.body);
+    if (IMG.last.gen.model.startsWith("heretic-venice-web/") && IMG.venice !== "ok") return text("venice down", 503);
     return text(JSON.stringify({ data: [IMG.gen === "url" ? { url: "https://wrapper.test/s/signed" } : { b64_json: imgB64 }] }));
   }
   if (url.endsWith("/api/v1/images/edits")) {
     count("img:edits"); IMG.last.edits = JSON.parse(init.body);
+    if (IMG.last.edits.model.startsWith("heretic-venice-web/")) {
+      if (IMG.venice !== "ok" && !(IMG.venice === "second" && /firered/.test(IMG.last.edits.model))) return text("venice down", 503);
+      return text(JSON.stringify({ data: [{ b64_json: imgB64 }] }));
+    }
     if (IMG.last.edits.model.endsWith("-edit") && IMG.edits !== "ok") return text(JSON.stringify({ error: { message: "Not found" } }), 404);
     return text(JSON.stringify({ data: [{ b64_json: imgB64 }] }));
   }
@@ -559,7 +564,7 @@ const big = { stateLimitKB: "500" };   // keep test workspaces inline unless a t
     check("src none ignores the attachment", 1, () => IMG.last.codex.input[0].content.length === 1);
     await img(edit_image, { prompt: "now blue" });
     check("edit_image follows up on the last result", 1, () => IMG.last.codex.input[0].content.length === 2);
-    await img(edit_image, { prompt: "x", src: "https://files.test/photo.png" });
+    await img(edit_image, { prompt: "x", src: "https://files.test/photo.png" }, { ...ok, imageRoutes: "codex,chatgpt" });   // after a failed Venice try the source is already bytes
     check("an https source goes to codex as a URL", 1, () => IMG.last.codex.input[0].content[1].image_url === "https://files.test/photo.png");
     check("unknown src does not generate", await img(edit_image, { prompt: "x", src: "nope.png" }), (s) => /nope\.png` was not found/.test(s) && !shown(s));
     IMG.codex = "down";
@@ -573,6 +578,18 @@ const big = { stateLimitKB: "500" };   // keep test workspaces inline unless a t
     IMG.codex = "ok"; IMG.chatgpt = "down";
     check("route order setting", await img(make_image, { prompt: "y" }, { ...ok, imageRoutes: "broken,codex" }), (s) => shown(s) && /broken: unknown route/.test(s));
     IMG.chatgpt = "ok"; prev = undefined;
+
+    // Venice web is the first default route; Codex and ChatGPT follow.
+    IMG.venice = "ok"; let v = { codex: hits["img:codex"] || 0 };
+    check("a new image is made by Venice web first", await img(make_image, { prompt: "a fox" }), (s) => shown(s) && /heretic-venice-web\/z-image-turbo`/.test(s) && !("image" in IMG.last.gen) && (hits["img:codex"] || 0) === v.codex);
+    check("an edit goes to the Venice web edit model with the source", await img(edit_image, { prompt: "x", src: "https://files.test/photo.png" }),
+      (s) => shown(s) && /Edited/.test(s) && /heretic-venice-web\/qwen-edit-uncensored`/.test(s) && IMG.last.edits.image.startsWith("data:image/png;base64,") && (hits["img:codex"] || 0) === v.codex);
+    IMG.venice = "second";
+    check("the second Venice edit model takes over", await img(edit_image, { prompt: "x", src: "https://files.test/photo.png" }), (s) => shown(s) && /heretic-venice-web\/firered-image-edit`/.test(s) && (hits["img:codex"] || 0) === v.codex);
+    IMG.venice = "";
+    check("Venice down falls back to codex and says why", await img(edit_image, { prompt: "x", src: "https://files.test/photo.png" }), (s) => shown(s) && /cx\/gpt-6\.1-sol/.test(s) && /venice: qwen-edit-uncensored HTTP 503/.test(s) && /firered-image-edit HTTP 503/.test(s));
+    check("the route order setting can leave Venice out", await img(make_image, { prompt: "y", src: "none" }, { ...ok, imageRoutes: "codex,chatgpt" }), (s) => shown(s) && !/venice/.test(s));
+    prev = undefined;
 
     // A named model: that model only, on the image endpoints.
     const before = () => ({ codex: hits["img:codex"] || 0, chatgpt: hits["img:chatgpt"] || 0, gen: hits["img:gen"] || 0 });

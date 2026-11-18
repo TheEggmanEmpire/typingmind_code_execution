@@ -188,7 +188,7 @@ const imageParams = (srcDoc) => ({
     prompt: { type: "string", description: "What the image should show. For an edit write: Change: <what to change>. Preserve: <what must stay the same>." },
     src: { type: "string", description: srcDoc },
     out: { type: "string", description: "Optional /workspace file name for the result. Default image_N.png." },
-    model: { type: "string", description: "Optional. Only when the user names an image model: its OmniRoute ID, e.g. heretic-venice-api/seedream-v5-5 (a bare name such as seedream-v5-5 is looked up). That model alone is used, with no fallback. Omit for the default routes." },
+    model: { type: "string", description: "Optional. Only when the user names an image model or a style needs one: its full OmniRoute ID, e.g. heretic-venice-web/wai-illu (anime), cx/gpt-6.1-sol, chatgpt_web/chatgpt_image. Paid models (heretic-venice-api/seedream-v5-5, venice-api-image-edits/seedream-v5-5-edit) only when the user asks for one. That model alone is used, with no fallback. Omit for the default order: Venice web, then Codex, then ChatGPT." },
     share: { type: "string", enum: ["auto", "catbox", "gofile", "litterbox"], description: "Optional: also upload the result to a public host and show a link. Only when the user asks for a link." }
   },
   required: ["prompt"]
@@ -198,6 +198,7 @@ const makeImageSpec = {
   name: "make_image",
   description:
     "Use this for ANY request to create, draw or generate an image, including with a text-only model. One call does everything: it reads any attached photo, makes the image and shows it in the chat. " +
+    "It tries Venice web first, then Codex, then ChatGPT, and the caption names the model that made it. " +
     "If the user's latest message has an attached image, that image is edited; to ignore it and create something new, pass src: \"none\". For changing an existing image prefer edit_image. " +
     "Do not view or describe an image first. Do not use MCP tools, other models or run_code for images. Do not call it again after a failure: report the error to the user.",
   parameters: imageParams("Optional source image to edit: a file such as uploads/photo.jpg, or an https URL. Omit to use the image attached to the latest message, if any. \"none\" forces a new image from the prompt alone.")
@@ -207,6 +208,7 @@ const editImageSpec = {
   name: "edit_image",
   description:
     "Use this for ANY request to edit, change, retouch, clean up, restyle or remove something from an existing image, including with a text-only model. One call does everything: it finds the image, edits it and shows it in the chat. " +
+    "It tries the Venice web edit models first (Qwen Edit Uncensored, then FireRed Image Edit), then Codex, then ChatGPT. " +
     "With no src it uses the image attached to the latest message, otherwise the last generated image or last upload, so follow-ups such as 'now make it blue' need no src. " +
     "Do not view or describe the image first. Do not use MCP tools, other models or run_code for images. Do not call it again after a failure: report the error to the user.",
   parameters: imageParams("Optional image to edit: a file such as uploads/photo.jpg, or an https URL. Omit to use the attached image, or the last result.")
@@ -310,7 +312,7 @@ const userSettings = [
   { name: "publicProxies", label: "Allow public CORS proxies", description: "Default on. Requests to sites that block browsers are retried through public CORS proxies (never requests carrying keys, tokens or passwords). Set \"off\" for a private-only setup: only your personal proxy is used.", placeholder: "on", required: false },
   { name: "keepVariables", label: "Keep variables between calls", description: "Default on. Python and R variables, functions and imports, and DuckDB tables are saved with the workspace and restored in the next call. Set \"off\" to start every call with a clean interpreter (files still persist).", placeholder: "on", required: false },
   { name: "secrets", label: "Secrets (API keys for code)", type: "password", description: "Optional. API keys the code may use, as NAME=value pairs separated by semicolons (or a JSON object). They become environment variables (os.environ in Python, Sys.getenv in R, ENV in Ruby, `env` in JavaScript), are replaced by [secret NAME] in anything the AI reads, are never saved with the workspace, and requests carrying them never go through public proxies.", placeholder: "OPENAI_API_KEY=sk-...; GITHUB_TOKEN=ghp_...", required: false },
-  { name: "imageRoutes", label: "Images: route order", description: "Optional. Default codex,chatgpt: which OmniRoute routes make_image and edit_image try, in order. They need the secret OMNIROUTE_API_KEY.", placeholder: "codex,chatgpt", required: false },
+  { name: "imageRoutes", label: "Images: route order", description: "Optional. Default venice,codex,chatgpt: which OmniRoute routes make_image and edit_image try, in order (venice = the free Venice web image and edit models). They need the secret OMNIROUTE_API_KEY.", placeholder: "venice,codex,chatgpt", required: false },
   { name: "imageApiBase", label: "Images: OmniRoute API base", description: "Optional. Base URL of the OmniRoute API used by make_image and edit_image.", placeholder: "https://omniroute.example/api/v1", required: false },
   { name: "browserAllowSites", label: "Browser: allowed sites", description: "Optional. If set, the browser tools may only read or operate tabs on these sites (comma-separated, subdomains included, e.g. github.com, *.wikipedia.org).", required: false },
   { name: "browserBlockSites", label: "Browser: blocked sites", description: "Optional. The browser tools never read or operate tabs on these sites (comma-separated, e.g. mybank.com, mail.google.com).", required: false },

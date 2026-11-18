@@ -3447,7 +3447,10 @@ async function serve_file(params, userSettings, resources) {
 // a photo too big to carry between calls still works without a Workspace store.
 // ---------------------------------------------------------------------------
 const IMAGE_API_BASE = "https://omniroute-production-601d.up.railway.app/api/v1";
-const IMAGE_ROUTES_DEFAULT = ["codex", "chatgpt"];
+const IMAGE_ROUTES_DEFAULT = ["venice", "codex", "chatgpt"];
+// Venice web (free): one model makes new images, two edit a source.
+const IMAGE_VENICE_MODEL = "heretic-venice-web/z-image-turbo";
+const IMAGE_VENICE_EDIT_MODELS = ["heretic-venice-web/qwen-edit-uncensored", "heretic-venice-web/firered-image-edit"];
 const IMAGE_SENTINEL = "NO REFERENCE IMAGE";
 const IMAGE_CODEX_MODEL = "cx/gpt-6.1-sol";
 const IMAGE_CHATGPT_MODEL = "chatgpt_web/chatgpt_image";
@@ -3611,6 +3614,18 @@ async function imageViaEndpoint(base, key, prompt, source, model) {
   throw new Error("no image in the reply");
 }
 
+// The Venice web route: its image model for a new picture; with a source its edit
+// models, the second when the first fails.
+async function imageViaVenice(base, key, prompt, source) {
+  if (!source) return imageViaEndpoint(base, key, prompt, null, IMAGE_VENICE_MODEL);
+  const errors = [];
+  for (const model of IMAGE_VENICE_EDIT_MODELS) {
+    try { return await imageViaEndpoint(base, key, prompt, source, model); }
+    catch (e) { errors.push(model.split("/")[1] + " " + (isAbort(e) ? "timed out" : String(e && e.message || e).replace(/, so a source image[\s\S]*$/, "")).slice(0, 110)); }
+  }
+  throw new Error(errors.join("; "));
+}
+
 // "seedream-v5-5" -> "heretic-venice-api/seedream-v5-5". An ID with a provider is used as given.
 async function resolveImageModel(base, key, raw) {
   if (raw.includes("/")) return raw;
@@ -3642,7 +3657,7 @@ async function imageMake(base, key, prompt, source, opts) {
       return { made: usable(await way(base, key, prompt, source, model)), failed };
     } catch (e) { note(opts.model, e); return { made: null, failed }; }
   }
-  const ways = { codex: imageViaCodex, chatgpt: imageViaChatgpt };
+  const ways = { venice: imageViaVenice, codex: imageViaCodex, chatgpt: imageViaChatgpt };
   for (const route of opts.routes && opts.routes.length ? opts.routes : IMAGE_ROUTES_DEFAULT) {
     try {
       if (!ways[route]) throw new Error("unknown route");

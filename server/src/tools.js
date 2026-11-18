@@ -178,7 +178,7 @@ function specs() {
           prompt: { type: "string", description: "What the image should show: subject, style, composition, text to render." },
           src: { type: "string", description: "Optional reference image: a workspace path (uploads/photo.jpg) or an https URL. \"none\" forces generation from the prompt alone." },
           out: { type: "string", description: "Optional file name in the workspace (default image_N.png)." },
-          model: { type: "string", description: "Optional. Only when the user names an image model: its OmniRoute ID, e.g. heretic-venice-api/seedream-v5-5 (a bare name such as seedream-v5-5 is looked up). That model alone is used, with no fallback. Omit for the default routes." }
+          model: { type: "string", description: "Optional. Only when the user names an image model or a style needs one: its full OmniRoute ID, e.g. heretic-venice-web/wai-illu (anime), cx/gpt-6.1-sol, chatgpt_web/chatgpt_image. Paid models (heretic-venice-api/seedream-v5-5, venice-api-image-edits/seedream-v5-5-edit) only when the user asks for one. That model alone is used, with no fallback. Omit for the default order: Venice web, then Codex, then ChatGPT." }
         },
         required: ["prompt"]
       }
@@ -192,7 +192,7 @@ function specs() {
           prompt: { type: "string", description: "The change to make, and what must stay as it is." },
           src: { type: "string", description: "The image to edit: a workspace path or an https URL." },
           out: { type: "string", description: "Optional file name in the workspace." },
-          model: { type: "string", description: "Optional. Only when the user names an image model: its OmniRoute ID, e.g. heretic-venice-api/seedream-v5-5 (a bare name such as seedream-v5-5 is looked up). That model alone is used, with no fallback. Omit for the default routes." }
+          model: { type: "string", description: "Optional. Only when the user names an image model or a style needs one: its full OmniRoute ID, e.g. heretic-venice-web/wai-illu (anime), cx/gpt-6.1-sol, chatgpt_web/chatgpt_image. Paid models (heretic-venice-api/seedream-v5-5, venice-api-image-edits/seedream-v5-5-edit) only when the user asks for one. That model alone is used, with no fallback. Omit for the default order: Venice web, then Codex, then ChatGPT." }
         },
         required: ["prompt"]
       }
